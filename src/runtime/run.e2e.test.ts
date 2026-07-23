@@ -161,6 +161,32 @@ describe("runProgram e2e", () => {
     expect(result.error?.code).toBe("NO_ANSWER");
   });
 
+  test("budget exhaustion returns a catchable CallResult, not a throw", async () => {
+    const model = new MockModelClient(() => "ok");
+    const controller = new MockController([
+      {
+        reasoning: "two distinct calls under a 1-call budget",
+        code: `
+          const a = await llm({ key: 'k1', prompt: 'one' });
+          const b = await llm({ key: 'k2', prompt: 'two' });
+          answer({ answer: (a.ok ? 'ok' : 'a?') + ':' + (b.ok ? 'ok' : b.error.code) });
+          'x'`,
+      },
+    ]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "c" },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+      profile: { ...DEFAULT_PROFILE, maxLogicalCalls: 1 },
+    });
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "ok:BUDGET_CALLS" });
+    expect(model.callCount).toBe(1);
+  });
+
   test("invalid answer is recoverable; the controller corrects on the next turn", async () => {
     const model = new MockModelClient(() => "ok");
     const controller = new MockController([
