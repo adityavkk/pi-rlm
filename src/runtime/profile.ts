@@ -1,0 +1,61 @@
+/** Resolved execution profile: budgets, interpreter limits, preview sizes,
+ * trajectory projection, and abstract model routes. Deadlines are relative to
+ * run start so they can be resolved against an injected clock. */
+
+import type { BudgetLimits } from "../core/budget.ts";
+import type { ProjectionOptions } from "../core/trajectory.ts";
+
+export interface Profile {
+  readonly name: string;
+  readonly maxDepth: number;
+  readonly maxFrames: number;
+  readonly maxLogicalCalls: number;
+  readonly maxAttempts: number;
+  readonly maxControllerTurns: number;
+  readonly maxConcurrency: number;
+  readonly tokenLimit?: number;
+  readonly storedByteLimit: number;
+  readonly wallMs: number;
+  readonly cellWallMs: number;
+  readonly memoryBytes: number;
+  readonly previewHeadBytes: number;
+  readonly previewTailBytes: number;
+  readonly trajectory: ProjectionOptions;
+  readonly models: { readonly small: string; readonly medium: string; readonly large: string };
+}
+
+export const DEFAULT_PROFILE: Profile = {
+  name: "default",
+  maxDepth: 3,
+  maxFrames: 32,
+  maxLogicalCalls: 200,
+  maxAttempts: 400,
+  maxControllerTurns: 40,
+  maxConcurrency: 4,
+  storedByteLimit: 64 * 1024 * 1024,
+  wallMs: 10 * 60 * 1000,
+  cellWallMs: 30 * 1000,
+  memoryBytes: 128 * 1024 * 1024,
+  previewHeadBytes: 1024,
+  previewTailBytes: 512,
+  trajectory: {
+    headEntries: 2,
+    tailEntries: 6,
+    codeHeadBytes: 1200,
+    codeTailBytes: 400,
+    reasoningMaxBytes: 800,
+  },
+  models: { small: "small", medium: "medium", large: "large" },
+};
+
+export const resolveLimits = (profile: Profile, startMs: number): BudgetLimits => ({
+  maxDepth: profile.maxDepth,
+  maxFrames: profile.maxFrames,
+  maxLogicalCalls: profile.maxLogicalCalls,
+  maxAttempts: profile.maxAttempts,
+  maxControllerTurns: profile.maxControllerTurns,
+  maxConcurrency: profile.maxConcurrency,
+  ...(profile.tokenLimit !== undefined ? { tokenLimit: profile.tokenLimit } : {}),
+  storedByteLimit: profile.storedByteLimit,
+  deadlineMs: startMs + profile.wallMs,
+});

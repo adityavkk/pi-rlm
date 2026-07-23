@@ -20,7 +20,7 @@ export interface CellGlobals {
 }
 
 /** Async bridge for value-returning calls (llm, agent, recurse, tools, ...). */
-export type HostDispatch = (name: string, args: JsonValue) => Promise<JsonValue>;
+export type HostDispatch = (name: string, args: JsonValue) => Promise<unknown>;
 
 /** Synchronous effect for progress and answer recording (never awaited). */
 export type HostEffect = (name: string, args: JsonValue) => void;

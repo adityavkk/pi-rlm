@@ -8,6 +8,7 @@ export * from "./usage.ts";
 export * from "./program.ts";
 export * from "./workspace.ts";
 export * from "./cell.ts";
+export * from "./schema.ts";
 export * from "./budget.ts";
 export * from "./grant.ts";
 export * from "./trajectory.ts";
