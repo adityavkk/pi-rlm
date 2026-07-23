@@ -49,6 +49,7 @@
   "dependencies": {
     "@jitl/quickjs-singlefile-mjs-release-asyncify": "0.32.0",
     "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
+    "acorn": "^8.14.0",
     "quickjs-emscripten": "^0.32.0"
   },
   "peerDependencies": {
