@@ -53,10 +53,10 @@
     "quickjs-emscripten": "^0.32.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-agent-core": {
@@ -74,6 +74,10 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10"
   }
 }
