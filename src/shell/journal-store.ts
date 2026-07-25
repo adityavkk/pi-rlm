@@ -96,12 +96,21 @@ export class JournalAppendError extends Error {
   }
 }
 
-export interface JournalAppendOutcome {
-  readonly event: "committed" | "deduplicated" | "ignored_after_terminal";
+export type JournalAppendDisposition = "committed" | "deduplicated" | "ignored_after_terminal";
+
+interface JournalStatusCacheOutcome {
   readonly statusCache:
     | { readonly state: "refreshed" }
     | { readonly state: "skipped" }
     | { readonly state: "failed"; readonly error: JournalAppendError };
+}
+
+export interface JournalAppendOutcome extends JournalStatusCacheOutcome {
+  readonly event: JournalAppendDisposition;
+}
+
+export interface JournalBatchAppendOutcome extends JournalStatusCacheOutcome {
+  readonly events: readonly JournalAppendDisposition[];
 }
 
 export class JournalStore {
@@ -118,12 +127,22 @@ export class JournalStore {
     this.statusPath = join(dir, "status.json");
   }
 
-  /** Repair any torn tail, append one event durably, then refresh status. Serialized. */
-  append(event: RlmEvent): Promise<JournalAppendOutcome> {
-    const run = async (): Promise<JournalAppendOutcome> => {
-      const line = `${JSON.stringify(event)}\n`;
+  /** Append one event through the same authoritative queue used by batches. */
+  async append(event: RlmEvent): Promise<JournalAppendOutcome> {
+    const outcome = await this.appendBatch([event]);
+    return { event: outcome.events[0] as JournalAppendDisposition, statusCache: outcome.statusCache };
+  }
+
+  /**
+   * Repair any torn tail, append a contiguous event batch durably, then refresh
+   * status. The queue slot is acquired synchronously when this method is called;
+   * that acquisition order defines global journal order.
+   */
+  appendBatch(batch: readonly RlmEvent[]): Promise<JournalBatchAppendOutcome> {
+    if (batch.length === 0) throw new RangeError("journal batch must contain at least one event");
+    const run = async (): Promise<JournalBatchAppendOutcome> => {
       let eventDurable = false;
-      let disposition: JournalAppendOutcome["event"] = "committed";
+      const dispositions: JournalAppendDisposition[] = [];
       let finalEvents: RlmEvent[] = [];
       let refreshStatus = true;
       let handle: JournalFileHandle | undefined;
@@ -132,27 +151,36 @@ export class JournalStore {
         const raw = await handle.readFile();
         const scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
-        const events = scanned.value.events;
+        const existingEvents = scanned.value.events;
         if (scanned.value.verifiedBytes !== raw.length) {
           await handle.truncate(scanned.value.verifiedBytes);
           await handle.sync();
         }
-        // The first run terminal is authoritative. This also drops callbacks
-        // that were queued after finalization without creating late events.
-        if (events.some(isTerminal)) {
-          disposition = "ignored_after_terminal";
-          finalEvents = events;
-          refreshStatus = isTerminal(event);
-        } else if (isProgress(event) && events.some((existing) =>
-          isProgress(existing) && sameProgressIdentity(existing, event))) {
-          disposition = "deduplicated";
-          finalEvents = events;
-          refreshStatus = false;
-        } else {
-          await handle.appendFile(line, "utf8");
+
+        let terminalSeen = existingEvents.some(isTerminal);
+        const progressIdentities = existingEvents.filter(isProgress);
+        const accepted: RlmEvent[] = [];
+        for (const event of batch) {
+          // The first run terminal remains authoritative within a batch too.
+          if (terminalSeen) {
+            dispositions.push("ignored_after_terminal");
+          } else if (isProgress(event) && progressIdentities.some((existing) =>
+            sameProgressIdentity(existing, event))) {
+            dispositions.push("deduplicated");
+          } else {
+            dispositions.push("committed");
+            accepted.push(event);
+            if (isProgress(event)) progressIdentities.push(event);
+            if (isTerminal(event)) terminalSeen = true;
+          }
+        }
+
+        finalEvents = [...existingEvents, ...accepted];
+        refreshStatus = accepted.length > 0 || batch.some(isTerminal);
+        if (accepted.length > 0) {
+          await handle.appendFile(accepted.map((event) => `${JSON.stringify(event)}\n`).join(""), "utf8");
           await handle.sync();
           eventDurable = true;
-          finalEvents = [...events, event];
         }
       } catch (error) {
         throw error instanceof JournalAppendError
@@ -168,14 +196,14 @@ export class JournalStore {
         }
       }
 
-      if (!refreshStatus) return { event: disposition, statusCache: { state: "skipped" } };
+      if (!refreshStatus) return { events: dispositions, statusCache: { state: "skipped" } };
       try {
         await this.writeStatus(reduceStatus(finalEvents));
-        return { event: disposition, statusCache: { state: "refreshed" } };
+        return { events: dispositions, statusCache: { state: "refreshed" } };
       } catch (cause) {
         const error = new JournalAppendError("status_cache", eventDurable, cause);
         this.cacheFailures.push(error);
-        return { event: disposition, statusCache: { state: "failed", error } };
+        return { events: dispositions, statusCache: { state: "failed", error } };
       }
     };
     const queued = this.queue.then(run, run);

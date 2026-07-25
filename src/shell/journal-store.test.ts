@@ -197,6 +197,34 @@ describe("JournalStore", () => {
     await expect(new JournalStore(dir, fileSystem).readEvents()).rejects.toBe(denied);
   });
 
+  test("appends a deduplicated batch contiguously and enforces its first terminal", async () => {
+    const { fileSystem, operations } = instrumentedFileSystem(dir);
+    const store = new JournalStore(dir, fileSystem);
+    await store.append(started);
+    operations.length = 0;
+
+    const outcome = await store.appendBatch([
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "first" },
+      { type: "emit", frameId: "f0", iteration: 1, ordinal: 0, message: "duplicate identity" },
+      { type: "emit", frameId: "f0", iteration: 1, ordinal: 1, message: "second" },
+      completed,
+      { type: "frame_closed", frameId: "f0", state: "closed" },
+    ]);
+
+    expect(outcome.events).toEqual([
+      "committed",
+      "deduplicated",
+      "committed",
+      "committed",
+      "ignored_after_terminal",
+    ]);
+    expect(operations.filter((operation) => operation === "events append")).toHaveLength(1);
+    const journal = await store.readEvents();
+    expect(journal.ok).toBe(true);
+    if (journal.ok) expect(journal.value.map((event) => event.type))
+      .toEqual(["run_started", "phase", "emit", "run_completed"]);
+  });
+
   test("syncs status content before rename and the containing directory after", async () => {
     const { fileSystem, operations } = instrumentedFileSystem(dir);
     await new JournalStore(dir, fileSystem).append(started);

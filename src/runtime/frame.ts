@@ -80,11 +80,10 @@ const hasErrorCode = (error: unknown, code: string): boolean =>
 
 type ProgressEvent = Extract<RlmEvent, { type: "phase" | "emit" }>;
 
-const appendProgressEvents = async (state: RunState, events: readonly ProgressEvent[]): Promise<void> => {
-  for (const event of events) {
-    const outcome = await state.journal.append(event);
-    if (outcome.event === "ignored_after_terminal") throw new Error("progress journal event ignored after terminal");
-  }
+const appendCellBatch = async (state: RunState, events: readonly RlmEvent[]): Promise<void> => {
+  const outcome = await state.journal.appendBatch(events);
+  if (outcome.events.some((event) => event === "ignored_after_terminal"))
+    throw new Error("cell journal batch ignored after terminal");
 };
 
 export const runFrame = async (
@@ -327,8 +326,6 @@ export const runFrame = async (
       }
     }
 
-    if (!error) await appendProgressEvents(state, progressEffects);
-
     entries = appendEntry(entries, {
       iteration,
       reasoning: cell.reasoning,
@@ -341,7 +338,7 @@ export const runFrame = async (
       ...(error ? { error } : {}),
       ...(answerCandidate ? { answerCandidate } : {}),
     });
-    await state.journal.append({
+    await appendCellBatch(state, [...(!error ? progressEffects : []), {
       type: "cell_committed",
       frameId: frame.frameId,
       iteration,
@@ -353,7 +350,7 @@ export const runFrame = async (
       outputOmittedBytes,
       usage: controllerUsage,
       ...(error ? { error: errorInfo(error) } : {}),
-    });
+    }]);
     if (signal?.aborted) return cancelled();
     lastOutcome = error ? { kind: "error", message: error.message } : { kind: "value", preview };
   }

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
@@ -7,7 +7,9 @@ import { normalizeProgram } from "../core/program.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import {
   JournalAppendError,
-  type JournalAppendOutcome,
+  type JournalBatchAppendOutcome,
+  type JournalFileHandle,
+  type JournalFileSystem,
   JournalStore,
 } from "../shell/journal-store.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
@@ -53,31 +55,31 @@ const run = (dir: string, controller: MockController, options: {
   ...(options.journal ? { journal: options.journal } : {}),
 });
 
-class FailingProgressJournal extends JournalStore {
+class FailingCellBatchJournal extends JournalStore {
   private failed = false;
 
-  constructor(dir: string, private readonly failedOrdinal: number) {
+  constructor(dir: string, private readonly failedPosition: number) {
     super(dir);
   }
 
-  override append(event: RlmEvent): Promise<JournalAppendOutcome> {
-    if (!this.failed && (event.type === "phase" || event.type === "emit") && event.ordinal === this.failedOrdinal) {
+  override appendBatch(events: readonly RlmEvent[]): Promise<JournalBatchAppendOutcome> {
+    if (!this.failed && events.some((event) => event.type === "cell_committed") && events[this.failedPosition]) {
       this.failed = true;
-      return Promise.reject(new JournalAppendError("event", false, new Error("injected progress disk failure")));
+      return Promise.reject(new JournalAppendError("event", false, new Error("injected cell batch disk failure")));
     }
-    return super.append(event);
+    return super.appendBatch(events);
   }
 }
 
 class RefreshFailureJournal extends JournalStore {
   private readonly failures: JournalAppendError[] = [];
 
-  override async append(event: RlmEvent): Promise<JournalAppendOutcome> {
-    const outcome = await super.append(event);
-    if (this.failures.length === 0 && (event.type === "phase" || event.type === "emit")) {
+  override async appendBatch(events: readonly RlmEvent[]): Promise<JournalBatchAppendOutcome> {
+    const outcome = await super.appendBatch(events);
+    if (this.failures.length === 0 && events.some((event) => event.type === "phase" || event.type === "emit")) {
       const error = new JournalAppendError("status_cache", true, new Error("injected progress cache refresh failure"));
       this.failures.push(error);
-      return { event: outcome.event, statusCache: { state: "failed", error } };
+      return { events: outcome.events, statusCache: { state: "failed", error } };
     }
     return outcome;
   }
@@ -86,6 +88,36 @@ class RefreshFailureJournal extends JournalStore {
     return this.failures;
   }
 }
+
+const delayedFirstCellBatchFileSystem = (dir: string): {
+  readonly fileSystem: JournalFileSystem;
+  readonly delayed: () => boolean;
+} => {
+  const eventsPath = join(dir, "events.jsonl");
+  let delayed = false;
+  const wrap = (path: string, handle: JournalFileHandle): JournalFileHandle => ({
+    appendFile: async (data, encoding) => {
+      if (path === eventsPath && !delayed && data.includes('"type":"cell_committed"')) {
+        delayed = true;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await handle.appendFile(data, encoding);
+    },
+    close: () => handle.close(),
+    readFile: () => handle.readFile(),
+    sync: () => handle.sync(),
+    truncate: (length) => handle.truncate(length),
+    writeFile: (data, encoding) => handle.writeFile(data, encoding),
+  });
+  return {
+    delayed: () => delayed,
+    fileSystem: {
+      open: async (path, flags) => wrap(path, await open(path, flags)),
+      readFile: async (path) => readFile(path),
+      rename,
+    },
+  };
+};
 
 describe("authoritative progress journal effects", () => {
   test("awaits phase and emit in within-cell order before answer commit", async () => {
@@ -132,18 +164,21 @@ describe("authoritative progress journal effects", () => {
     expect((await events(dir)).filter((event) => event.type === "phase" || event.type === "emit")).toHaveLength(0);
   });
 
-  for (const ordinal of [0, 1]) {
-    test(`fails closed when authoritative progress append ${ordinal + 1} fails`, async () => {
+  for (const position of [0, 1, 2, 3]) {
+    test(`rolls back answer bytes when cell batch position ${position + 1} faults`, async () => {
       const dir = await tmp();
-      const journal = new FailingProgressJournal(dir, ordinal);
+      const journal = new FailingCellBatchJournal(dir, position);
       const result = await run(dir, new MockController([{
         reasoning: "two effects",
         code: "phase('one'); emit({ message: 'two' }); answer({ answer: 'must-not-complete' }); 'ok'",
       }]), { journal });
 
       expect(result).toMatchObject({ status: "failed", error: { code: "JOURNAL_FAILED" } });
+      expect(result.ledger.usage.storedBytes).toBe(0);
       const journalEvents = await events(dir);
-      expect(journalEvents.some((event) => event.type === "cell_committed" || event.type === "answer_committed")).toBe(false);
+      expect(journalEvents.some((event) =>
+        event.type === "phase" || event.type === "emit" || event.type === "cell_committed" ||
+        event.type === "answer_committed")).toBe(false);
       expect(journalEvents.filter((event) =>
         event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled")).toHaveLength(1);
       expect(reduceStatus(journalEvents).state).toBe("failed");
@@ -175,24 +210,41 @@ describe("authoritative progress journal effects", () => {
     expect((await events(dir)).filter((event) => event.type === "phase" || event.type === "emit")).toEqual([first]);
   });
 
-  test("keeps child and parent progress identities independent", async () => {
+  test("keeps overlapping child cell batches contiguous under append delay", async () => {
     const dir = await tmp();
+    const delayed = delayedFirstCellBatchFileSystem(dir);
+    const journal = new JournalStore(dir, delayed.fileSystem);
     const controller = new MockController(
       [{
         reasoning: "parent",
-        code: "const child = await recurse({ key: 'child', objective: 'child' }); phase('parent'); answer({ answer: child.value }); 'ok'",
+        code: "await Promise.all([recurse({ key: 'a', objective: 'A' }), recurse({ key: 'b', objective: 'B' })]); answer({ answer: 'done' }); 'ok'",
       }],
-      () => new MockController([{
-        reasoning: "child",
-        code: "phase('child'); emit({ message: 'child emit' }); answer('done'); 'ok'",
+      (objective) => new MockController([{
+        reasoning: objective,
+        code: `phase('${objective}'); emit({ message: '${objective}-emit' }); answer('${objective}-answer'); 'ok'`,
       }]),
     );
-    const result = await run(dir, controller);
+    const result = await run(dir, controller, { journal });
 
     expect(result.status).toBe("completed");
-    const progress = (await events(dir)).filter((event) => event.type === "phase" || event.type === "emit");
-    expect(progress.map((event) => [event.frameId.endsWith(":f0") ? "parent" : "child", event.iteration, event.ordinal]))
-      .toEqual([["child", 1, 0], ["child", 1, 1], ["parent", 1, 0]]);
+    expect(delayed.delayed()).toBe(true);
+    const journalEvents = await events(dir);
+    const childFrames = new Map(journalEvents
+      .filter((event): event is Extract<RlmEvent, { type: "phase" }> => event.type === "phase" && (event.name === "A" || event.name === "B"))
+      .map((event) => [event.frameId, event.name]));
+    expect([...childFrames.values()].sort()).toEqual(["A", "B"]);
+    const childBatchEvents = journalEvents.filter((event) =>
+      "frameId" in event && childFrames.has(event.frameId) &&
+      (event.type === "phase" || event.type === "emit" || event.type === "cell_committed" || event.type === "answer_committed"));
+    for (const [frameId] of childFrames) {
+      const positions = childBatchEvents
+        .map((event, index) => "frameId" in event && event.frameId === frameId ? index : -1)
+        .filter((index) => index >= 0);
+      expect(positions).toHaveLength(4);
+      expect(positions.at(-1)! - positions[0]!).toBe(3);
+      expect(positions.map((index) => childBatchEvents[index]?.type))
+        .toEqual(["phase", "emit", "cell_committed", "answer_committed"]);
+    }
   });
 
   test("terminal fold applies only committed progress and keeps the first replay identity", () => {

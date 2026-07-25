@@ -92,17 +92,18 @@ export const persistAnswer = async (
     const descriptor = transaction.value;
     const journalEvents = events(descriptor.id, descriptor.bytes, descriptor.sha256);
     if (journalEvents.length === 0) throw new Error("answer persistence requires a journal reference");
-    for (const event of journalEvents) {
-      throwIfAborted(signal);
-      try {
-        const outcome = await state.journal.append(event);
-        if (outcome.event === "ignored_after_terminal") throw new Error("answer journal event ignored after terminal");
-        if (outcome.event === "committed" && "outputRef" in event && event.outputRef === descriptor.id) referenced = true;
-      } catch (error) {
-        if (error instanceof JournalAppendError && error.eventDurable && "outputRef" in event && event.outputRef === descriptor.id)
-          referenced = true;
-        throw error;
-      }
+    throwIfAborted(signal);
+    try {
+      const outcome = await state.journal.appendBatch(journalEvents);
+      if (outcome.events.some((event) => event === "ignored_after_terminal"))
+        throw new Error("answer journal batch ignored after terminal");
+      referenced = journalEvents.some((event, index) =>
+        "outputRef" in event && event.outputRef === descriptor.id && outcome.events[index] === "committed");
+      if (!referenced) throw new Error("answer journal batch did not commit its artifact reference");
+    } catch (error) {
+      if (error instanceof JournalAppendError && error.eventDurable)
+        referenced = journalEvents.some((event) => "outputRef" in event && event.outputRef === descriptor.id);
+      throw error;
     }
     transaction.commit();
     transaction = undefined;
