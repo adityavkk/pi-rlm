@@ -51,6 +51,23 @@ const isolatedEnv = (root: string): Record<string, string> => ({
 });
 
 const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
+const ADAPTER_TEST_TIMEOUT_MS = 15_000;
+const LIFECYCLE_TIMEOUT_MS = 5_000;
+
+const bounded = async <T>(work: Promise<T>, label: string): Promise<T> => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} exceeded ${LIFECYCLE_TIMEOUT_MS}ms`)),
+          LIFECYCLE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
 
 const runPrintFixture = async (mode: "text" | "json") => {
   const root = await mkdtemp(join(tmpdir(), `pi-rlm-${mode}-mode-`));
@@ -80,7 +97,8 @@ describe("public Pi SDK extension integration", () => {
     "%s emits one observable custom result lifecycle and one session entry",
     async (mode: BoundMode) => {
       const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-${mode}-`));
-      const { runtime, sessionManager, captured } = await createPublicRuntimeFixture(root);
+      const { runtime, sessionManager, captured } = await bounded(
+        createPublicRuntimeFixture(root), `${mode} fixture creation`);
       const events: AgentSessionEvent[] = [];
       let resolveEnd!: () => void;
       const ended = new Promise<void>((resolve) => { resolveEnd = resolve; });
@@ -89,10 +107,10 @@ describe("public Pi SDK extension integration", () => {
         if (isRlmMessageEvent(event, "message_end")) resolveEnd();
       });
       try {
-        await runtime.session.bindExtensions({ mode, uiContext: ui });
-        await runtime.session.prompt(PUBLIC_FIXTURE_COMMAND, {
+        await bounded(runtime.session.bindExtensions({ mode, uiContext: ui }), `${mode} extension binding`);
+        await bounded(runtime.session.prompt(PUBLIC_FIXTURE_COMMAND, {
           source: mode === "rpc" ? "rpc" : "interactive",
-        });
+        }), `${mode} command prompt`);
         let timeout: ReturnType<typeof setTimeout> | undefined;
         try {
           await Promise.race([
@@ -119,13 +137,13 @@ describe("public Pi SDK extension integration", () => {
         expect(messageContent(starts[0]!)).toBe(entries[0]?.type === "custom_message" && entries[0].content);
       } finally {
         unsubscribe();
-        // InteractiveMode owns terminal teardown; this headless binding owns only
-        // the public AgentSession/ExtensionRunner lifecycle.
-        if (mode === "tui") runtime.session.dispose();
-        else await runtime.dispose();
-        await rm(root, { recursive: true, force: true });
+        // This is a headless binding test, not an AgentSessionRuntime ownership
+        // test. Dispose its bound public session directly in every synthetic mode.
+        runtime.session.dispose();
+        await bounded(rm(root, { recursive: true, force: true }), `${mode} fixture cleanup`);
       }
     },
+    ADAPTER_TEST_TIMEOUT_MS,
   );
 
   test.each(["text", "json"] as const)("actual runPrintMode %s adapter output is captured", async (mode) => {
@@ -147,7 +165,7 @@ describe("public Pi SDK extension integration", () => {
       expect(ends).toHaveLength(1);
       expect(messageContent(starts[0]!)).toBe(messageContent(ends[0]!));
     }
-  });
+  }, ADAPTER_TEST_TIMEOUT_MS);
 
   test("actual runRpcMode uses public JSON stdin/stdout and shuts down on stdin end", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-rpc-mode-"));
@@ -195,12 +213,15 @@ describe("public Pi SDK extension integration", () => {
         }
       }
     };
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const timeout = new Promise<never>((_, reject) => setTimeout(() => {
-        process.kill();
-        reject(new Error("runRpcMode shutdown timeout"));
-      }, 3_000));
-      await Promise.race([Promise.all([readOutput(), process.exited]), timeout]);
+      const timeoutFailure = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          process.kill();
+          reject(new Error("runRpcMode shutdown timeout"));
+        }, 3_000);
+      });
+      await Promise.race([Promise.all([readOutput(), process.exited]), timeoutFailure]);
       expect(await stderr).toBe("");
       expect(process.exitCode).toBe(0);
       expect(requestedEntries).toBe(true);
@@ -217,8 +238,9 @@ describe("public Pi SDK extension integration", () => {
         entry["type"] === "custom_message" && entry["customType"] === "pi-rlm-result");
       expect(entries).toHaveLength(1);
     } finally {
+      if (timeout) clearTimeout(timeout);
       if (process.exitCode === null) process.kill();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, ADAPTER_TEST_TIMEOUT_MS);
 });
