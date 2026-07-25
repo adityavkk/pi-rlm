@@ -33,7 +33,7 @@ export const validateWorkspace = (
   raw: Record<string, unknown>,
 ): Result<Record<string, WorkspaceValue>, WorkspaceError[]> => {
   const errors: WorkspaceError[] = [];
-  const out: Record<string, WorkspaceValue> = {};
+  const out = Object.create(null) as Record<string, WorkspaceValue>;
   for (const key of Object.keys(raw)) {
     const value = raw[key];
     const handle = asHandle(value);
@@ -56,7 +56,7 @@ const singleKey = (value: WorkspaceValue, key: string): boolean =>
   value !== null &&
   !Array.isArray(value) &&
   Object.keys(value).length === 1 &&
-  key in value &&
+  Object.prototype.hasOwnProperty.call(value, key) &&
   typeof (value as Record<string, unknown>)[key] === "string";
 
 export const isContextHandle = (value: WorkspaceValue): value is { contextId: string } =>

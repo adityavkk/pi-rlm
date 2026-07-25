@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canonicalize, canonicalStringify, isJsonObject, parseJsonValue } from "./json.ts";
+import { canonicalize, canonicalStringify, isJsonObject, MAX_JSON_DEPTH, parseJsonValue, type JsonValue } from "./json.ts";
 
 describe("json canonicalization", () => {
   test("sorts keys recursively and is order-independent", () => {
@@ -23,6 +23,14 @@ describe("json canonicalization", () => {
     expect(canonicalize("x")).toBe("x");
     expect(canonicalize(null)).toBe(null);
   });
+
+  test("preserves special own keys without changing prototypes", () => {
+    const hostile = JSON.parse('{"constructor":{"b":2},"__proto__":{"a":1}}') as JsonValue;
+    const canonical = canonicalize(hostile) as Record<string, JsonValue>;
+    expect(Object.getPrototypeOf(canonical)).toBeNull();
+    expect(Object.hasOwn(canonical, "__proto__")).toBe(true);
+    expect(canonicalStringify(hostile)).toBe('{"__proto__":{"a":1},"constructor":{"b":2}}');
+  });
 });
 
 describe("parseJsonValue", () => {
@@ -43,5 +51,40 @@ describe("parseJsonValue", () => {
     const o: Record<string, unknown> = {};
     o["self"] = o;
     expect(parseJsonValue(o)).toMatchObject({ ok: false, reason: "cyclic reference" });
+  });
+
+  test("copies only own values into prototype-free records", () => {
+    const input = Object.assign(Object.create({ inherited: true }) as Record<string, unknown>, { own: 1 });
+    const parsed = parseJsonValue(input);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && isJsonObject(parsed.value)) {
+      expect(Object.getPrototypeOf(parsed.value)).toBeNull();
+      expect(Object.hasOwn(parsed.value, "inherited")).toBe(false);
+      expect(parsed.value["own"]).toBe(1);
+    }
+  });
+
+  test("rejects accessors without invoking them", () => {
+    let invoked = false;
+    const input = Object.defineProperty({}, "value", {
+      enumerable: true,
+      get: () => {
+        invoked = true;
+        return 1;
+      },
+    });
+    expect(parseJsonValue(input)).toMatchObject({ ok: false, reason: "accessor properties are not JSON" });
+    expect(invoked).toBe(false);
+  });
+
+  test("bounds deeply nested input and canonicalization", () => {
+    const nested = (depth: number): unknown => {
+      let value: unknown = 0;
+      for (let i = 0; i < depth; i++) value = [value];
+      return value;
+    };
+    expect(parseJsonValue(nested(MAX_JSON_DEPTH)).ok).toBe(true);
+    expect(parseJsonValue(nested(MAX_JSON_DEPTH + 1))).toMatchObject({ ok: false, reason: expect.stringContaining("maximum JSON depth") });
+    expect(() => canonicalize(nested(MAX_JSON_DEPTH + 1) as JsonValue)).toThrow("maximum JSON depth");
   });
 });

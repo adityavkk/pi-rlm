@@ -204,4 +204,22 @@ describe("runProgram e2e", () => {
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "fixed" });
   });
+
+  test("inherited output values do not satisfy the answer contract", async () => {
+    const model = new MockModelClient(() => "ok");
+    const controller = new MockController([
+      { reasoning: "missing own value", code: "answer({}); 'first'" },
+      { reasoning: "own value", code: "answer({ toString: 'fixed' }); 'second'" },
+    ]);
+    const result = await runProgram({
+      program: program({ outputs: [{ name: "toString", schema: { type: "string" } }] }),
+      sources: { context: "c" },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+    });
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ toString: "fixed" });
+  });
 });

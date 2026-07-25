@@ -9,6 +9,7 @@
 
 import { type JsonObject, type JsonValue, parseJsonValue } from "./json.ts";
 import { err, ok, type Result } from "./result.ts";
+import { normalizeJsonSchema } from "./schema.ts";
 
 /** Reserved guest globals an input name must not shadow. */
 export const RESERVED_NAMES = new Set<string>([
@@ -32,6 +33,7 @@ export const RESERVED_NAMES = new Set<string>([
 ]);
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const UNSAFE_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface RlmInput {
   readonly name: string;
@@ -77,12 +79,21 @@ const reqString = (
   return trimmed;
 };
 
-const validateName = (name: string, path: string, errors: ProgramError[]): void => {
+const validateName = (
+  name: string,
+  path: string,
+  errors: ProgramError[],
+  { allowReserved = false } = {},
+): void => {
   if (!IDENTIFIER.test(name)) {
     errors.push({ path, message: `"${name}" is not a valid identifier` });
     return;
   }
-  if (RESERVED_NAMES.has(name)) errors.push({ path, message: `"${name}" is a reserved name` });
+  if (UNSAFE_NAMES.has(name)) {
+    errors.push({ path, message: `"${name}" is not a safe identifier` });
+    return;
+  }
+  if (!allowReserved && RESERVED_NAMES.has(name)) errors.push({ path, message: `"${name}" is a reserved name` });
 };
 
 const normalizeInput = (raw: unknown, index: number, errors: ProgramError[]): RlmInput => {
@@ -107,13 +118,16 @@ const normalizeOutput = (raw: unknown, index: number, errors: ProgramError[]): R
     return { name: "", schema: {} };
   }
   const name = reqString(raw["name"], `${path}.name`, errors);
-  const schemaValue = raw["schema"];
-  const parsed = parseJsonValue(schemaValue);
+  if (name) validateName(name, `${path}.name`, errors, { allowReserved: true });
+  const normalized = normalizeJsonSchema(raw["schema"]);
   let schema: JsonObject = {};
-  if (!parsed.ok) errors.push({ path: `${path}.schema`, message: `invalid JSON schema: ${parsed.reason}` });
-  else if (typeof parsed.value !== "object" || parsed.value === null || Array.isArray(parsed.value))
-    errors.push({ path: `${path}.schema`, message: "schema must be a JSON object" });
-  else schema = parsed.value;
+  if (!normalized.ok)
+    for (const schemaError of normalized.error)
+      errors.push({
+        path: `${path}.schema${schemaError.path.startsWith("$schema") ? schemaError.path.slice(7) : schemaError.path.slice(1)}`,
+        message: schemaError.message,
+      });
+  else schema = normalized.value;
   const description = raw["description"];
   const base: RlmOutputField = { name, schema };
   return typeof description === "string" ? { ...base, description: description.trim() } : base;

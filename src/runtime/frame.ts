@@ -52,7 +52,7 @@ const validateAnswer = (candidate: JsonValue, frame: FrameRef): string[] => {
   if (!isJsonObject(candidate)) return ["answer must be an object containing every declared output"];
   const errors: string[] = [];
   for (const field of frame.outputs) {
-    if (!(field.name in candidate)) {
+    if (!Object.prototype.hasOwnProperty.call(candidate, field.name)) {
       errors.push(`${field.name}: required output missing`);
       continue;
     }
