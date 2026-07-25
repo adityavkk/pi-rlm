@@ -14,7 +14,7 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { ManualClock } from "../shell/clock.ts";
 import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
-import { dispatchCall } from "./broker.ts";
+import { dispatchCall, tokenReservation } from "./broker.ts";
 import type { GuestCallResult } from "./call-result.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
@@ -68,6 +68,19 @@ const brokerState = async (model: ModelClient, runId: string): Promise<RunState>
 
 const testFrame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };
 const noRecurse = async (): Promise<GuestCallResult> => { throw new Error("unexpected recurse"); };
+
+describe("tokenReservation", () => {
+  test("counts system, prompt, every context, and output allowance", () => {
+    const request: ModelRequest = {
+      system: "s".repeat(400_002),
+      prompt: "p".repeat(400_001),
+      context: ["a".repeat(400_003), "b".repeat(400_004)],
+      maxOutputTokens: 2_048,
+    };
+
+    expect(tokenReservation(request)).toBe(Math.ceil(1_600_010 / 4) + 2_048);
+  });
+});
 
 describe("dispatchCall cancellation ownership", () => {
   test("releases a timed-out holder and aborted waiter, then admits an independent call", async () => {

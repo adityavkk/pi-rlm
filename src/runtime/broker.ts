@@ -536,11 +536,17 @@ const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject)
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 512;
 
-const tokenReservation = (prompt: string, contexts: readonly string[], maxOutputTokens: number): number | undefined => {
-  let inputCharacters = prompt.length;
-  for (const context of contexts) {
-    if (inputCharacters > Number.MAX_SAFE_INTEGER - context.length) return undefined;
-    inputCharacters += context.length;
+type TokenReservationRequest = Pick<ModelRequest, "prompt" | "system" | "context" | "maxOutputTokens">;
+
+export const tokenReservation = (request: TokenReservationRequest): number | undefined => {
+  const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  let inputCharacters = request.prompt.length;
+  const inputs = request.system === undefined
+    ? (request.context ?? [])
+    : [request.system, ...(request.context ?? [])];
+  for (const input of inputs) {
+    if (inputCharacters > Number.MAX_SAFE_INTEGER - input.length) return undefined;
+    inputCharacters += input.length;
   }
   const inputTokens = Math.ceil(inputCharacters / 4);
   return inputTokens <= MAX_CALL_TOKENS - maxOutputTokens ? inputTokens + maxOutputTokens : undefined;
@@ -602,7 +608,7 @@ const llm = async (
         maxOutputTokens,
         signal,
       };
-      const reserveTokens = tokenReservation(prompt, contexts, maxOutputTokens);
+      const reserveTokens = tokenReservation(request);
       if (reserveTokens === undefined)
         return errResult(callId, callError("INVALID_REQUEST", "call token reservation exceeds per-call maximum"), usage, false);
       const limits = usageLimits(state);
@@ -629,17 +635,15 @@ const llm = async (
         if (candidate === undefined || errors.length > 0) {
           throwIfAborted(signal);
           const repairPrompt = `${prompt}\n\nReturn ONLY a JSON value that matches the required schema. Previous output was invalid (${errors.join("; ")}):\n${first.text}`;
-          const repairReserveTokens = tokenReservation(repairPrompt, contexts, maxOutputTokens);
+          const repairRequest = { ...request, prompt: repairPrompt };
+          const repairReserveTokens = tokenReservation(repairRequest);
           const repairReserve = repairReserveTokens === undefined
             ? undefined
             : reserveAttempt(state.ledger.current, now(state), repairReserveTokens);
           if (repairReserve?.ok && repairReserveTokens !== undefined) {
             state.ledger.current = repairReserve.value;
             pendingTokenReservation = repairReserveTokens;
-            const repairRaw = await waitForAbort(state.model.complete({
-              ...request,
-              prompt: repairPrompt,
-            }), signal);
+            const repairRaw = await waitForAbort(state.model.complete(repairRequest), signal);
             throwIfAborted(signal);
             const repair = normalizeModelResponse(repairRaw, limits);
             if (!repair) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
