@@ -4,7 +4,8 @@
  * `events.jsonl` is the durable source of truth. `RunStatus` is a rebuildable
  * projection produced by folding the ordered event list. The fold is idempotent
  * for the identifiers that matter on restart replay: duplicate committed calls
- * (by callId) and duplicate cells (by frame + iteration) fold once.
+ * (by callId), duplicate cells (by frame + iteration), and duplicate progress
+ * effects (by frame + iteration + within-cell ordinal) fold once.
  */
 
 import type { BudgetLimits } from "./budget.ts";
@@ -12,6 +13,7 @@ import type { CallKind } from "./ids.ts";
 import type { CallUsage } from "./usage.ts";
 
 export type ProviderOperationKind = "controller" | "llm" | "extractor";
+export const PROVIDER_REQUEST_IDENTITY_VERSION = "pi-rlm.provider-request.v1";
 
 export type CompletionMode = "answer" | "fallback_extract";
 export type RunState = "running" | "completed" | "failed" | "cancelled";
@@ -32,8 +34,8 @@ export type RlmEvent =
       readonly inputRefs?: readonly { readonly name: string; readonly id: string; readonly sha256: string; readonly bytes: number }[];
     }
   | { readonly type: "frame_opened"; readonly frameId: string; readonly parentFrameId: string | null; readonly depth: number; readonly objective: string }
-  | { readonly type: "phase"; readonly frameId: string; readonly ordinal: number; readonly name: string }
-  | { readonly type: "emit"; readonly frameId: string; readonly ordinal: number; readonly message: string }
+  | { readonly type: "phase"; readonly frameId: string; readonly iteration: number; readonly ordinal: number; readonly name: string }
+  | { readonly type: "emit"; readonly frameId: string; readonly iteration: number; readonly ordinal: number; readonly message: string }
   | {
       readonly type: "key_bound";
       readonly frameId: string;
@@ -183,8 +185,20 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
   const frameOrder: string[] = [];
   const committedCallIds = new Set<string>();
   const keyBindings = new Map<string, KeyBindingStatus>();
+  const committedCells = new Set<string>();
+  const seenProgress = new Set<string>();
+  const pendingPhases = new Map<string, { ordinal: number; name: string }[]>();
 
   const frame = (id: string): MutableFrame | undefined => frames.get(id);
+  const cellKey = (frameId: string, iteration: number): string => `${frameId}\u0000${iteration}`;
+  const applyPendingPhase = (frameId: string, iteration: number): void => {
+    const f = frame(frameId);
+    if (!f) return;
+    const pending = pendingPhases.get(cellKey(frameId, iteration));
+    if (!pending) return;
+    for (const phase of pending.sort((a, b) => a.ordinal - b.ordinal)) f.phase = phase.name;
+    pendingPhases.delete(cellKey(frameId, iteration));
+  };
 
   for (const event of events) {
     switch (event.type) {
@@ -208,11 +222,25 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         }
         break;
       case "phase": {
-        const f = frame(event.frameId);
-        if (f) f.phase = event.name;
+        const cell = cellKey(event.frameId, event.iteration);
+        const progress = `${cell}\u0000${event.ordinal}`;
+        if (seenProgress.has(progress)) break;
+        seenProgress.add(progress);
+        if (committedCells.has(cell)) {
+          const f = frame(event.frameId);
+          if (f) f.phase = event.name;
+        } else {
+          const pending = pendingPhases.get(cell) ?? [];
+          pending.push({ ordinal: event.ordinal, name: event.name });
+          pendingPhases.set(cell, pending);
+        }
         break;
       }
-      case "emit":
+      case "emit": {
+        const progress = `${cellKey(event.frameId, event.iteration)}\u0000${event.ordinal}`;
+        if (!seenProgress.has(progress)) seenProgress.add(progress);
+        break;
+      }
       case "workspace_committed":
       case "fallback_evidence_projected":
       case "fallback_evidence_cited":
@@ -232,8 +260,10 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         const f = frame(event.frameId);
         if (f && !f.seenIterations.has(event.iteration)) {
           f.seenIterations.add(event.iteration);
+          committedCells.add(cellKey(event.frameId, event.iteration));
           f.iterations += 1;
           f.lastOutputPreview = event.outputPreview;
+          applyPendingPhase(event.frameId, event.iteration);
         }
         break;
       }

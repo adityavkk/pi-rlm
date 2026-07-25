@@ -26,10 +26,14 @@ let backend: QuickJsBackend;
 beforeAll(async () => { backend = await QuickJsBackend.create(); });
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-fallback-"));
-const events = async (dir: string): Promise<RlmEvent[]> =>
-  (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").filter(Boolean)
-    .map((line) => JSON.parse(line) as RlmEvent);
-const terminals = (journal: readonly RlmEvent[]) => journal.filter((event) =>
+const events = async (dir: string): Promise<RlmEvent[]> => {
+  const { JournalStore } = await import("../shell/journal-store.ts");
+  const result = await new JournalStore(dir).readEvents();
+  if (!result.ok) throw result.error;
+  return result.value;
+};
+
+const terminals = (events: readonly RlmEvent[]): RlmEvent[] => events.filter((event) =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled");
 
 const program = (withInput = true): RlmProgram => {

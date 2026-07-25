@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { createLedger } from "../core/budget.ts";
 import { normalizeProgram } from "../core/program.ts";
 import { ZERO_CALL_USAGE } from "../core/usage.ts";
-import { systemClock } from "../shell/clock.ts";
+import { type Clock, ManualClock, systemClock } from "../shell/clock.ts";
 import { ContextStore } from "../shell/context-store.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
@@ -13,7 +13,6 @@ import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
-import { ManualClock } from "../shell/clock.ts";
 import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
 import { dispatchCall, retainCallResult, tokenReservation } from "./broker.ts";
 import { type GuestCallResult, okResult } from "./call-result.ts";
@@ -38,7 +37,7 @@ const within = async <T>(promise: Promise<T>, timeoutMs = 250): Promise<T> => {
   }
 };
 
-const brokerState = async (model: ModelClient, runId: string): Promise<RunState> => {
+const brokerState = async (model: ModelClient, runId: string, clock: Clock = systemClock): Promise<RunState> => {
   const normalized = normalizeProgram({
     objective: "broker error boundary",
     profile: "default",
@@ -47,12 +46,12 @@ const brokerState = async (model: ModelClient, runId: string): Promise<RunState>
   });
   if (!normalized.ok) throw new Error("invalid test program");
   const dir = await mkdtemp(join(tmpdir(), "pi-rlm-broker-"));
-  const startMs = Date.now();
+  const startMs = clock.now();
   return {
     runId,
     startMs,
     profile: DEFAULT_PROFILE,
-    clock: systemClock,
+    clock,
     hasher: sha256,
     program: normalized.value,
     ledger: { current: createLedger(resolveLimits(DEFAULT_PROFILE, startMs)) },
@@ -280,7 +279,11 @@ describe("dispatchCall cancellation ownership", () => {
         throw new Error("sensitive runtime failure");
       },
     } as unknown as ModelRuntime;
-    const state = await brokerState(new PiModelClient(runtime, "test-provider/test-model", clock), "run_runtime_failure");
+    const state = await brokerState(
+      new PiModelClient(runtime, "test-provider/test-model", clock),
+      "run_runtime_failure",
+      clock,
+    );
     const result = await dispatchCall(
       state,
       testFrame,
@@ -288,7 +291,7 @@ describe("dispatchCall cancellation ownership", () => {
       { key: "runtime-failure", prompt: "fail", model: { model: "test-provider/test-model" } },
       noRecurse,
       new AbortController().signal,
-      Date.now() + 5_000,
+      clock.now() + 5_000,
     ) as GuestCallResult;
 
     expect(result).toMatchObject({

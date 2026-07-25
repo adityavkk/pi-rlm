@@ -1,12 +1,15 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdtemp, open, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { BudgetLimits } from "../core/budget.ts";
-import type { RlmEvent } from "../core/journal.ts";
+import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
+import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import {
   JournalAppendError,
   JournalStore,
+  parseRlmEvent,
   type JournalFileHandle,
   type JournalFileSystem,
 } from "./journal-store.ts";
@@ -16,8 +19,21 @@ const limits: BudgetLimits = {
   maxControllerTurns: 10, maxConcurrency: 2, storedByteLimit: 1000, deadlineMs: 1000,
 };
 
-const started: RlmEvent = { type: "run_started", runId: "r1", manifestHash: "m", limits };
+const digestA = "a".repeat(64);
+const digestB = "b".repeat(64);
+const refA = `ctx_${digestA}`;
+const started: RlmEvent = { type: "run_started", runId: "r1", manifestHash: digestA, limits };
 const completed: RlmEvent = { type: "run_completed", runId: "r1", completionMode: "answer" };
+const cell = (iteration = 1): RlmEvent => ({
+  type: "cell_committed", frameId: "f0", iteration, reasoning: "done", codeHash: digestB,
+  hasResult: true, outputPreview: "done",
+});
+const batchLine = (events: readonly RlmEvent[]): string => {
+  const checksum = createHash("sha256").update(canonicalStringify(events as unknown as JsonValue)).digest("hex");
+  return canonicalStringify({
+    type: "journal_batch", version: 1, batchId: `batch_${checksum}`, checksum, events,
+  } as unknown as JsonValue);
+};
 
 const nodeFileSystem: JournalFileSystem = {
   open: async (path, flags) => open(path, flags),
@@ -195,6 +211,265 @@ describe("JournalStore", () => {
       readFile: async () => { throw denied; },
     };
     await expect(new JournalStore(dir, fileSystem).readEvents()).rejects.toBe(denied);
+  });
+
+  test("appends one valid cell transaction contiguously", async () => {
+    const { fileSystem, operations } = instrumentedFileSystem(dir);
+    const store = new JournalStore(dir, fileSystem);
+    await store.append(started);
+    operations.length = 0;
+
+    const batch: RlmEvent[] = [
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "first" },
+      { type: "emit", frameId: "f0", iteration: 1, ordinal: 1, message: "second" },
+      cell(),
+    ];
+    const outcome = await store.appendBatch(batch);
+
+    expect(outcome.events).toEqual(["committed", "committed", "committed"]);
+    expect(operations.filter((operation) => operation === "events append")).toHaveLength(1);
+    const journal = await store.readEvents();
+    expect(journal.ok).toBe(true);
+    if (journal.ok) expect(journal.value.map((event) => event.type))
+      .toEqual(["run_started", "phase", "emit", "cell_committed"]);
+    const replay = await store.appendBatch(batch);
+    expect(replay.events).toEqual(["deduplicated", "deduplicated", "deduplicated"]);
+  });
+
+  test("makes every rejected batch-write prefix non-authoritative except the exact checksummed line", async () => {
+    const batch: RlmEvent[] = [
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "working" },
+      {
+        type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "done", codeHash: digestB,
+        hasResult: true, outputPreview: "done", outputRef: refA, outputRefSha256: digestA, outputRefBytes: 4,
+      },
+      { type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA, outputSha256: digestA, outputBytes: 4 },
+    ];
+    const completeDir = await mkdtemp(join(tmpdir(), "pi-rlm-journal-complete-"));
+    const completeStore = new JournalStore(completeDir);
+    await completeStore.append(started);
+    await completeStore.appendBatch(batch);
+    const completeRaw = await readFile(join(completeDir, "events.jsonl"), "utf8");
+    const completeLine = `${completeRaw.trimEnd().split("\n").at(-1)}\n`;
+    const completeRecord = JSON.parse(completeLine) as Record<string, unknown>;
+    expect(completeRecord["type"]).toBe("journal_batch");
+    expect(completeRecord["version"]).toBe(1);
+    expect(completeRecord["batchId"]).toMatch(/^batch_[a-f0-9]{64}$/);
+    expect(completeRecord["checksum"]).toMatch(/^[a-f0-9]{64}$/);
+
+    const replay = await completeStore.appendBatch(batch);
+    expect(replay.events).toEqual(["deduplicated", "deduplicated", "deduplicated"]);
+    expect(await readFile(join(completeDir, "events.jsonl"), "utf8")).toBe(completeRaw);
+
+    const lineBytes = Buffer.byteLength(completeLine, "utf8");
+    for (let prefixBytes = 0; prefixBytes <= lineBytes; prefixBytes++) {
+      const faultDir = await mkdtemp(join(tmpdir(), "pi-rlm-journal-prefix-"));
+      const eventsPath = join(faultDir, "events.jsonl");
+      await writeFile(eventsPath, `${JSON.stringify(started)}\n`);
+      let rejected = false;
+      const fileSystem: JournalFileSystem = {
+        ...nodeFileSystem,
+        open: async (path, flags) => {
+          const handle = await nodeFileSystem.open(path, flags);
+          if (path !== eventsPath) return handle;
+          return {
+            appendFile: async (data, encoding) => {
+              if (rejected || !data.includes('"type":"journal_batch"')) {
+                await handle.appendFile(data, encoding);
+                return;
+              }
+              rejected = true;
+              const prefix = Buffer.from(data, "utf8").subarray(0, prefixBytes).toString("utf8");
+              if (prefix.length > 0) await handle.appendFile(prefix, encoding);
+              throw new Error(`injected rejection after ${prefixBytes} bytes`);
+            },
+            close: () => handle.close(),
+            readFile: () => handle.readFile(),
+            sync: () => handle.sync(),
+            truncate: (length) => handle.truncate(length),
+            writeFile: (data, encoding) => handle.writeFile(data, encoding),
+          };
+        },
+      };
+      const store = new JournalStore(faultDir, fileSystem);
+      let failure: unknown;
+      try {
+        await store.appendBatch(batch);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(JournalAppendError);
+      expect((failure as JournalAppendError).eventDurable).toBe(prefixBytes === lineBytes);
+
+      const read = await store.readEvents();
+      expect(read.ok).toBe(true);
+      if (read.ok) {
+        const committed = read.value.filter((event) =>
+          event.type === "phase" || event.type === "cell_committed" || event.type === "answer_committed");
+        expect(committed).toHaveLength(prefixBytes === lineBytes ? 3 : 0);
+        expect(committed.filter((event) => "outputRef" in event)).toHaveLength(prefixBytes === lineBytes ? 2 : 0);
+      }
+      const records = (await readFile(eventsPath, "utf8")).trim().split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(records.filter((record) => record["type"] === "journal_batch"))
+        .toHaveLength(prefixBytes === lineBytes ? 1 : 0);
+    }
+  }, 30_000);
+
+  test("rejects a complete batch record whose checksum was changed", async () => {
+    const store = new JournalStore(dir);
+    await store.appendBatch([cell()]);
+    const path = join(dir, "events.jsonl");
+    const record = JSON.parse((await readFile(path, "utf8")).trim()) as Record<string, unknown>;
+    record["checksum"] = "0".repeat(64);
+    await writeFile(path, `${JSON.stringify(record)}\n`);
+    const read = await store.readEvents();
+    expect(read.ok).toBe(false);
+    if (!read.ok) expect(read.error.code).toBe("JOURNAL_CORRUPT");
+  });
+
+  test("strictly parses every legacy event without invoking hostile objects", () => {
+    const valid = { type: "frame_opened", frameId: "f0", parentFrameId: null, depth: 0, objective: "root" };
+    expect(parseRlmEvent(valid).ok).toBe(true);
+    for (const malformed of [null, {}, { ...valid, type: "unknown" }, { ...valid, extra: true }])
+      expect(parseRlmEvent(malformed).ok).toBe(false);
+
+    const inherited = Object.assign(Object.create({ inherited: true }), valid);
+    expect(parseRlmEvent(inherited).ok).toBe(false);
+    let getterCalls = 0;
+    const accessor = { ...valid } as Record<string, unknown>;
+    Object.defineProperty(accessor, "objective", { enumerable: true, get: () => { getterCalls++; return "bad"; } });
+    expect(parseRlmEvent(accessor).ok).toBe(false);
+    expect(getterCalls).toBe(0);
+    expect(parseRlmEvent(new Proxy(valid, {})).ok).toBe(false);
+
+    const providerAttempt = {
+      type: "provider_attempted", frameId: "f0", operationId: "op", kind: "llm", key: "k", attempt: 1,
+      outcome: "ok", usage: { attempts: 1, durationMs: 0 },
+    } as const;
+    // Omission remains valid for opaque external operations; provider requests require a complete supported identity pair.
+    expect(parseRlmEvent(providerAttempt).ok).toBe(true);
+    expect(parseRlmEvent({ ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION }).ok).toBe(false);
+    expect(parseRlmEvent({ ...providerAttempt, requestSha256: digestA }).ok).toBe(false);
+    expect(parseRlmEvent({ ...providerAttempt, requestIdentityVersion: "arbitrary", requestSha256: digestA }).ok).toBe(false);
+    expect(parseRlmEvent({
+      ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: "A".repeat(64),
+    }).ok).toBe(false);
+    expect(parseRlmEvent({
+      ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: digestA,
+    }).ok).toBe(true);
+    expect(parseRlmEvent({
+      type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: "ctx_short",
+      outputSha256: digestA, outputBytes: 1,
+    }).ok).toBe(false);
+
+    // Version-1 batches are stricter, but legacy single records remain ref-only compatible.
+    expect(parseRlmEvent({ ...cell(), outputRef: refA }).ok).toBe(true);
+    expect(parseRlmEvent({
+      type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA,
+    }).ok).toBe(true);
+  });
+
+  test("requires complete identical answer metadata in exact answer transactions", async () => {
+    const fullCell = {
+      ...cell(), outputRef: refA, outputRefSha256: digestA, outputRefBytes: 4,
+    } as Extract<RlmEvent, { type: "cell_committed" }>;
+    const refOnlyCell = { ...cell(), outputRef: refA } as Extract<RlmEvent, { type: "cell_committed" }>;
+    const fullAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      type: "answer_committed", frameId: "f0", completionMode: "answer",
+      outputRef: refA, outputSha256: digestA, outputBytes: 4,
+    };
+    const fallbackCitation: RlmEvent = {
+      type: "fallback_evidence_cited", frameId: "f0", evidenceRefs: ["evidence-1"], evidenceRefsHash: digestA,
+    };
+    const refOnlyAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA,
+    };
+    const fallbackAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      ...fullAnswer, completionMode: "fallback_extract",
+    };
+
+    await expect(new JournalStore(dir).appendBatch([fullCell, fullAnswer])).resolves.toMatchObject({
+      events: ["committed", "committed"],
+    });
+    const fallbackDir = await mkdtemp(join(tmpdir(), "pi-rlm-fallback-batch-"));
+    await expect(new JournalStore(fallbackDir).appendBatch([fallbackCitation, fallbackAnswer])).resolves.toMatchObject({
+      events: ["committed", "committed"],
+    });
+
+    const digestC = "c".repeat(64);
+    const refC = `ctx_${digestC}`;
+    const invalid: readonly (readonly RlmEvent[])[] = [
+      [fullCell, refOnlyAnswer],
+      [refOnlyCell, fullAnswer],
+      [{ ...fullCell, outputRef: refC, outputRefSha256: digestC }, fullAnswer],
+      [{ ...fullCell, outputRefBytes: 5 }, fullAnswer],
+      [fullCell, { ...fullAnswer, frameId: "other" }],
+      [fullCell, { ...fullAnswer, completionMode: "fallback_extract" }],
+      [fullAnswer, fullCell],
+      [fullCell, fullAnswer, fallbackCitation],
+      [fullCell, fullAnswer, fullAnswer],
+      [fallbackCitation, { ...refOnlyAnswer, completionMode: "fallback_extract" }],
+      [fallbackCitation, fallbackAnswer, completed],
+      [fallbackCitation, fallbackAnswer, fallbackAnswer],
+    ];
+    for (const [index, events] of invalid.entries()) {
+      const target = await mkdtemp(join(tmpdir(), `pi-rlm-invalid-answer-batch-${index}-`));
+      try {
+        await new JournalStore(target).appendBatch(events);
+        throw new Error("expected invalid answer batch rejection");
+      } catch (error) {
+        expect(error).toBeInstanceOf(JournalAppendError);
+        expect((error as JournalAppendError).phase).toBe("event");
+        expect((error as JournalAppendError).cause).toEqual(expect.objectContaining({ code: "JOURNAL_CORRUPT" }));
+      }
+    }
+  });
+
+  test("rejects malformed, noncanonical, and non-cell batches before expansion", async () => {
+    const variants: string[] = [];
+    const valid = [cell()];
+    const parsed = JSON.parse(batchLine(valid)) as Record<string, unknown>;
+    variants.push(batchLine([]));
+    variants.push(batchLine([cell(1), cell(2)]));
+    variants.push(batchLine([
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "x" },
+      { ...cell(1), frameId: "other" } as RlmEvent,
+    ]));
+    variants.push(batchLine([
+      { ...cell(), outputRef: refA, outputRefSha256: digestA, outputRefBytes: 4 } as RlmEvent,
+      { type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA, outputSha256: digestA, outputBytes: 4 },
+      { type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA, outputSha256: digestA, outputBytes: 4 },
+    ]));
+    variants.push(JSON.stringify({ type: parsed["type"], version: parsed["version"], batchId: parsed["batchId"], checksum: parsed["checksum"], events: parsed["events"] }));
+    variants.push(canonicalStringify({ ...parsed, extra: true } as unknown as JsonValue));
+    variants.push(canonicalStringify({ ...parsed, version: 2 } as unknown as JsonValue));
+
+    for (const [index, line] of variants.entries()) {
+      const target = await mkdtemp(join(tmpdir(), `pi-rlm-bad-batch-${index}-`));
+      await writeFile(join(target, "events.jsonl"), `${line}\n`);
+      const store = new JournalStore(target);
+      const read = await store.readEvents();
+      expect(read.ok).toBe(false);
+      if (!read.ok) expect(read.error.code).toBe("JOURNAL_CORRUPT");
+      const status = await store.status();
+      expect(status.ok).toBe(false);
+      if (!status.ok) expect(status.error.code).toBe("JOURNAL_CORRUPT");
+    }
+  });
+
+  test("fuzzes small malformed JSON records as typed corruption", async () => {
+    let seed = 0x12345678;
+    const random = (): number => (seed = (seed * 1664525 + 1013904223) >>> 0);
+    for (let index = 0; index < 64; index++) {
+      const value = index % 4 === 0 ? null : index % 4 === 1 ? random() : index % 4 === 2
+        ? { type: `unknown_${random()}`, value: random() } : [random(), { x: random() }];
+      const target = await mkdtemp(join(tmpdir(), "pi-rlm-fuzz-journal-"));
+      await writeFile(join(target, "events.jsonl"), `${JSON.stringify(value)}\n`);
+      const result = await new JournalStore(target).status();
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("JOURNAL_CORRUPT");
+    }
   });
 
   test("syncs status content before rename and the containing directory after", async () => {
