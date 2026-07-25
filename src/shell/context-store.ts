@@ -66,6 +66,24 @@ const backwardBoundary = (bytes: Uint8Array, index: number): number => {
   return i;
 };
 
+interface ByteLine {
+  readonly start: number;
+  readonly end: number;
+}
+
+const byteLines = (bytes: Uint8Array): ByteLine[] => {
+  const lines: ByteLine[] = [];
+  let start = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] !== 0x0a) continue;
+    const end = i > start && bytes[i - 1] === 0x0d ? i - 1 : i;
+    lines.push({ start, end });
+    start = i + 1;
+  }
+  lines.push({ start, end: bytes.length });
+  return lines;
+};
+
 export class ContextStore {
   private readonly entries = new Map<string, Entry>();
   private readonly contentDir: string;
@@ -137,15 +155,28 @@ export class ContextStore {
     };
   }
 
+  /**
+   * Return a 1-based line window with half-open UTF-8 byte offsets. LF and CRLF
+   * delimiters are excluded from the last selected line; delimiters between
+   * selected lines retain their original bytes. A trailing delimiter creates a
+   * final empty line. Requests below line 1 clamp to it; requests past the last
+   * line return an empty slice at EOF.
+   */
   lines(id: string, options: { startLine: number; count: number }): ContextRead {
     const { bytesArray } = this.entryOrThrow(id);
-    const full = decoder.decode(bytesArray);
-    const allLines = full.split("\n");
-    const startIndex = Math.max(1, options.startLine) - 1;
-    const slice = allLines.slice(startIndex, startIndex + Math.max(0, options.count));
-    const text = slice.join("\n");
-    const startByte = byteLength(allLines.slice(0, startIndex).join("\n"));
-    return { text, startByte, endByte: startByte + byteLength(text), truncated: startIndex + options.count < allLines.length };
+    const lines = byteLines(bytesArray);
+    const requestedStart = Math.trunc(options.startLine) || 1;
+    const startIndex = Math.min(lines.length, Math.max(0, requestedStart - 1));
+    const count = Math.max(0, Math.trunc(options.count) || 0);
+    const endIndex = Math.min(lines.length, startIndex + count);
+    const startByte = lines[startIndex]?.start ?? bytesArray.length;
+    const endByte = count > 0 ? (lines[endIndex - 1]?.end ?? startByte) : startByte;
+    return {
+      text: decoder.decode(bytesArray.subarray(startByte, endByte)),
+      startByte,
+      endByte,
+      truncated: endIndex < lines.length,
+    };
   }
 
   grep(

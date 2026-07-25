@@ -25,10 +25,96 @@ describe("ContextStore", () => {
     expect(r.truncated).toBe(true);
   });
 
-  test("lines returns a 1-based window", async () => {
-    const d = await store.ingestText("l", "l1\nl2\nl3\nl4");
-    const r = store.lines(d.id, { startLine: 2, count: 2 });
-    expect(r.text).toBe("l2\nl3");
+  test("lines returns exact LF byte ranges for first, middle, final, and empty lines", async () => {
+    const d = await store.ingestText("l", "first\n\nmé\nfinal");
+    const cases = [
+      { startLine: 1, text: "first", startByte: 0, endByte: 5, truncated: true },
+      { startLine: 2, text: "", startByte: 6, endByte: 6, truncated: true },
+      { startLine: 3, text: "mé", startByte: 7, endByte: 10, truncated: true },
+      { startLine: 4, text: "final", startByte: 11, endByte: 16, truncated: false },
+    ];
+
+    for (const expected of cases) {
+      const result = store.lines(d.id, { startLine: expected.startLine, count: 1 });
+      expect(result).toEqual({
+        text: expected.text,
+        startByte: expected.startByte,
+        endByte: expected.endByte,
+        truncated: expected.truncated,
+      });
+      expect(store.read(d.id, {
+        offsetBytes: result.startByte,
+        lengthBytes: result.endByte - result.startByte,
+      }).text).toBe(result.text);
+    }
+
+    expect(store.lines(d.id, { startLine: 2, count: 2 })).toEqual({
+      text: "\nmé",
+      startByte: 6,
+      endByte: 10,
+      truncated: true,
+    });
+  });
+
+  test("lines preserves CRLF inside windows and excludes line delimiters at window end", async () => {
+    const d = await store.ingestText("crlf", "one\r\n\r\ntwø\r\nlast");
+    const result = store.lines(d.id, { startLine: 2, count: 2 });
+    expect(result).toEqual({
+      text: "\r\ntwø",
+      startByte: 5,
+      endByte: 11,
+      truncated: true,
+    });
+    expect(store.read(d.id, {
+      offsetBytes: result.startByte,
+      lengthBytes: result.endByte - result.startByte,
+    }).text).toBe(result.text);
+    expect(store.lines(d.id, { startLine: 4, count: 1 })).toEqual({
+      text: "last",
+      startByte: 13,
+      endByte: 17,
+      truncated: false,
+    });
+  });
+
+  test("lines represents a trailing newline as a final empty line", async () => {
+    const lf = await store.ingestText("lf-trailing", "a\n");
+    expect(store.lines(lf.id, { startLine: 2, count: 1 })).toEqual({
+      text: "",
+      startByte: 2,
+      endByte: 2,
+      truncated: false,
+    });
+
+    const crlf = await store.ingestText("crlf-trailing", "é\r\n");
+    const result = store.lines(crlf.id, { startLine: 2, count: 1 });
+    expect(result).toEqual({ text: "", startByte: 4, endByte: 4, truncated: false });
+    expect(store.read(crlf.id, {
+      offsetBytes: result.startByte,
+      lengthBytes: result.endByte - result.startByte,
+    }).text).toBe(result.text);
+  });
+
+  test("lines bounds clamp to the current 1-based API", async () => {
+    const d = await store.ingestText("bounds", "a\nb");
+    expect(store.lines(d.id, { startLine: 0, count: 1 })).toEqual({
+      text: "a",
+      startByte: 0,
+      endByte: 1,
+      truncated: true,
+    });
+    expect(store.lines(d.id, { startLine: 2, count: -1 })).toEqual({
+      text: "",
+      startByte: 2,
+      endByte: 2,
+      truncated: true,
+    });
+    expect(store.lines(d.id, { startLine: 3, count: 1 })).toEqual({
+      text: "",
+      startByte: 3,
+      endByte: 3,
+      truncated: false,
+    });
   });
 
   test("grep literal, case-insensitive, bounded", async () => {
