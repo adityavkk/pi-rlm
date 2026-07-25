@@ -8,9 +8,9 @@
 
 import { releaseBytes, releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
 import { callError } from "../core/errors.ts";
-import { deriveCallId } from "../core/ids.ts";
+import { deriveCallId, identityHash, type CallKind } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
-import { isJsonObject } from "../core/json.ts";
+import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
@@ -75,6 +75,118 @@ const strictJson = (text: string): { ok: true; value: JsonValue } | { ok: false 
 };
 
 const now = (state: RunState): number => state.clock.now();
+
+interface KeyClaim {
+  readonly frame: FrameRef;
+  readonly kind: CallKind;
+  readonly key: string;
+  readonly identity: JsonValue;
+}
+
+const keyRegistryId = (kind: CallKind, key: string): string => `${kind}\u0000${key}`;
+
+/** Atomically validate and bind stable keys before any reservation or effect. */
+export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Promise<void> => {
+  const requested = new Map<string, KeyClaim & { canonicalIdentity: string; identityHash: string }>();
+  for (const claim of claims) {
+    const canonicalIdentity = canonicalStringify(claim.identity);
+    const normalized = { ...claim, canonicalIdentity, identityHash: identityHash(state.hasher, claim.identity) };
+    const id = keyRegistryId(claim.kind, claim.key);
+    const prior = requested.get(id);
+    if (prior && prior.canonicalIdentity !== canonicalIdentity)
+      throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
+    if (!prior) requested.set(id, normalized);
+  }
+
+  const existingReady: Promise<void>[] = [];
+  const additions: Array<KeyClaim & { canonicalIdentity: string; identityHash: string }> = [];
+  for (const [id, claim] of requested) {
+    const bound = state.keyIdentities.get(id);
+    if (bound && bound.canonicalIdentity !== claim.canonicalIdentity)
+      throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
+    if (bound) existingReady.push(bound.ready);
+    else additions.push(claim);
+  }
+
+  if (additions.length === 0) {
+    await Promise.all(existingReady);
+    return;
+  }
+
+  let resolveReady!: () => void;
+  let rejectReady!: (error: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  for (const claim of additions) {
+    state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), {
+      canonicalIdentity: claim.canonicalIdentity,
+      identityHash: claim.identityHash,
+      ready,
+    });
+  }
+  void (async () => {
+    for (const claim of additions) {
+      await state.journal.append({
+        type: "key_bound",
+        frameId: claim.frame.frameId,
+        kind: claim.kind,
+        key: claim.key,
+        identityHash: claim.identityHash,
+      });
+    }
+  })().then(resolveReady, rejectReady);
+  await Promise.all([...existingReady, ready]);
+};
+
+interface NormalizedLlmSpec {
+  readonly key: string;
+  readonly prompt: string;
+  readonly model: string;
+  readonly thinking?: ThinkingLevel;
+  readonly contextIds: string[];
+  readonly schema?: JsonObject;
+  readonly maxOutputTokens?: number;
+  readonly identity: JsonValue;
+}
+
+const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec => {
+  const key = reqStr(spec, "key");
+  const prompt = reqStr(spec, "prompt");
+  const { model, thinking } = resolveModel(state, spec["model"]);
+  const ctxIds = contextIds(spec["context"]);
+  const schemaValue = spec["schema"];
+  let schema: JsonObject | undefined;
+  if (schemaValue !== undefined) {
+    const normalized = normalizeJsonSchema(schemaValue);
+    if (!normalized.ok)
+      throw new DslError(
+        "INVALID_SPEC",
+        `invalid JSON schema: ${normalized.error.map((error) => `${error.path}: ${error.message}`).join("; ")}`,
+      );
+    schema = normalized.value;
+  }
+  const maxOutputTokens = typeof spec["maxOutputTokens"] === "number" ? spec["maxOutputTokens"] : undefined;
+  const identity: JsonValue = {
+    prompt,
+    model,
+    ...(thinking ? { thinking } : {}),
+    ...(schema ? { schema } : {}),
+    contexts: ctxIds.map((id) => state.store.get(id)?.sha256 ?? id),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+  };
+  return {
+    key,
+    prompt,
+    model,
+    ...(thinking ? { thinking } : {}),
+    contextIds: ctxIds,
+    ...(schema ? { schema } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+    identity,
+  };
+};
 
 /** Handle one value-returning guest call. */
 export const dispatchCall = async (
@@ -143,12 +255,25 @@ export const dispatchCall = async (
     }
     case "context.provenance":
       return [] as unknown as JsonValue;
-    case "contexts.derive":
+    case "contexts.derive": {
+      const spec = deriveSpec(asObject(args));
+      const identity: JsonValue = { operation: "derive", value: spec.value, label: spec.label ?? `derived:${spec.key}` };
+      await bindKeys(state, [{ frame, kind: "context", key: spec.key, identity }]);
       return withContextMutation(state, () =>
-        state.store.derive(deriveSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
-    case "contexts.concat":
+        state.store.derive(spec, contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+    }
+    case "contexts.concat": {
+      const spec = concatSpec(asObject(args));
+      const identity: JsonValue = {
+        operation: "concat",
+        refs: spec.refs.map((ref) => state.store.get(ref.id)?.sha256 ?? ref.id),
+        separator: spec.separator ?? "\n",
+        label: spec.label ?? `concat:${spec.key}`,
+      };
+      await bindKeys(state, [{ frame, kind: "context", key: spec.key, identity }]);
       return withContextMutation(state, () =>
-        state.store.concat(concatSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+        state.store.concat(spec, contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+    }
     case "contexts.open": {
       const id = reqStr(asObject(args), "id");
       const desc = state.store.get(id);
@@ -156,7 +281,7 @@ export const dispatchCall = async (
       return desc as unknown as JsonValue;
     }
     case "artifacts.write":
-      return writeArtifact(state, asObject(args)) as unknown as JsonValue;
+      return writeArtifact(state, frame, asObject(args)) as unknown as JsonValue;
     case "artifacts.open": {
       const id = reqStr(asObject(args), "id");
       const entry = state.artifacts.get(id);
@@ -244,50 +369,36 @@ export const withContextMutation = async <T>(
   }
 };
 
-const writeArtifact = async (state: RunState, spec: JsonObject) => {
+const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject) => {
   const key = reqStr(spec, "key");
   const name = reqStr(spec, "name");
   const value = spec["value"] as JsonValue;
-  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
+  const identity: JsonValue = { name, value, mimeType };
+  await bindKeys(state, [{ frame, kind: "artifact", key, identity }]);
+  const text = typeof value === "string" ? value : canonicalStringify(value);
   const sha = state.hasher(text);
   const id = `art_${sha.slice(0, 16)}`;
-  const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
   const descriptor = { id, name, bytes: new TextEncoder().encode(text).length, sha256: sha, mimeType };
   if (!state.artifacts.has(id)) {
     state.artifacts.set(id, { descriptor, text });
     const reserved = reserveBytes(state.ledger.current, descriptor.bytes);
     if (reserved.ok) state.ledger.current = reserved.value;
   }
-  void key;
   return descriptor;
 };
 
-const llm = async (state: RunState, frame: FrameRef, spec: JsonObject, signal: AbortSignal): Promise<GuestCallResult> => {
-  const key = reqStr(spec, "key");
-  const prompt = reqStr(spec, "prompt");
-  const { model, thinking } = resolveModel(state, spec["model"]);
-  const ctxIds = contextIds(spec["context"]);
-  const schemaValue = spec["schema"];
-  let schema: JsonObject | undefined;
-  if (schemaValue !== undefined) {
-    const normalized = normalizeJsonSchema(schemaValue);
-    if (!normalized.ok)
-      throw new DslError(
-        "INVALID_SPEC",
-        `invalid JSON schema: ${normalized.error.map((error) => `${error.path}: ${error.message}`).join("; ")}`,
-      );
-    schema = normalized.value;
-  }
-  const maxOutputTokens = typeof spec["maxOutputTokens"] === "number" ? spec["maxOutputTokens"] : undefined;
-  const identity: JsonValue = {
-    prompt,
-    model,
-    ...(thinking ? { thinking } : {}),
-    ...(schema ? { schema } : {}),
-    contexts: ctxIds.map((id) => state.store.get(id)?.sha256 ?? id),
-    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
-  };
+const llm = async (
+  state: RunState,
+  frame: FrameRef,
+  spec: JsonObject,
+  signal: AbortSignal,
+  identityBound = false,
+): Promise<GuestCallResult> => {
+  const normalized = normalizeLlmSpec(state, spec);
+  const { key, prompt, model, thinking, contextIds: ctxIds, schema, maxOutputTokens, identity } = normalized;
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "llm", key, identity });
+  if (!identityBound) await bindKeys(state, [{ frame, kind: "llm", key, identity }]);
 
   const cancelled = (usage: CallUsage = ZERO_CALL_USAGE): GuestCallResult =>
     errResult(callId, callError("CANCELLED", "cell epoch closed"), usage, false);
@@ -420,6 +531,9 @@ const llmBatch = async (
   reqStr(spec, "key");
   const items = spec["items"];
   if (!Array.isArray(items)) throw new DslError("INVALID_SPEC", "llm.batch requires an items array");
+  const itemSpecs = items.map((item) => asObject(item));
+  const normalizedItems = itemSpecs.map((item) => normalizeLlmSpec(state, item));
+  await bindKeys(state, normalizedItems.map((item) => ({ frame, kind: "llm" as const, key: item.key, identity: item.identity })));
   const concurrency = typeof spec["concurrency"] === "number" ? Math.max(1, spec["concurrency"]) : state.profile.maxConcurrency;
   const results: GuestCallResult[] = new Array(items.length);
   let cursor = 0;
@@ -428,7 +542,7 @@ const llmBatch = async (
       throwIfAborted(signal);
       const index = cursor++;
       if (index >= items.length) return;
-      const result = await llm(state, frame, asObject(items[index] as JsonValue), signal);
+      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true);
       throwIfAborted(signal);
       results[index] = result;
     }

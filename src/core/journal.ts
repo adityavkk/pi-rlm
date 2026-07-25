@@ -26,6 +26,13 @@ export type RlmEvent =
   | { readonly type: "phase"; readonly frameId: string; readonly ordinal: number; readonly name: string }
   | { readonly type: "emit"; readonly frameId: string; readonly ordinal: number; readonly message: string }
   | {
+      readonly type: "key_bound";
+      readonly frameId: string;
+      readonly kind: CallKind;
+      readonly key: string;
+      readonly identityHash: string;
+    }
+  | {
       readonly type: "cell_committed";
       readonly frameId: string;
       readonly iteration: number;
@@ -65,6 +72,13 @@ export interface FrameStatus {
   readonly state: FrameState;
 }
 
+export interface KeyBindingStatus {
+  readonly frameId: string;
+  readonly kind: CallKind;
+  readonly key: string;
+  readonly identityHash: string;
+}
+
 export interface RunStatus {
   readonly runId?: string;
   readonly manifestHash?: string;
@@ -75,6 +89,7 @@ export interface RunStatus {
   readonly frames: Readonly<Record<string, FrameStatus>>;
   readonly frameOrder: readonly string[];
   readonly committedCallIds: readonly string[];
+  readonly keyBindings: readonly KeyBindingStatus[];
 }
 
 interface MutableFrame {
@@ -102,6 +117,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
   const frames = new Map<string, MutableFrame>();
   const frameOrder: string[] = [];
   const committedCallIds = new Set<string>();
+  const keyBindings = new Map<string, KeyBindingStatus>();
 
   const frame = (id: string): MutableFrame | undefined => frames.get(id);
 
@@ -133,6 +149,16 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       }
       case "emit":
         break;
+      case "key_bound": {
+        const registryKey = `${event.kind}\u0000${event.key}`;
+        if (!keyBindings.has(registryKey)) keyBindings.set(registryKey, {
+          frameId: event.frameId,
+          kind: event.kind,
+          key: event.key,
+          identityHash: event.identityHash,
+        });
+        break;
+      }
       case "cell_committed": {
         const f = frame(event.frameId);
         if (f && !f.seenIterations.has(event.iteration)) {
@@ -214,5 +240,6 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
     frames: frameStatuses,
     frameOrder,
     committedCallIds: [...committedCallIds],
+    keyBindings: [...keyBindings.values()],
   };
 };

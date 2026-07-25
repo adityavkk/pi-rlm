@@ -20,6 +20,12 @@ export interface ArtifactDescriptor {
   readonly mimeType: string;
 }
 
+export interface KeyIdentityBinding {
+  readonly canonicalIdentity: string;
+  readonly identityHash: string;
+  readonly ready: Promise<void>;
+}
+
 export interface FrameRef {
   readonly frameId: string;
   readonly depth: number;
@@ -43,6 +49,7 @@ export interface RunState {
   readonly backend: InterpreterBackend;
   readonly callCache: Map<string, GuestCallResult>;
   readonly inflight: Map<string, Promise<GuestCallResult>>;
+  readonly keyIdentities: Map<string, KeyIdentityBinding>;
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
   readonly frameSeq: { current: number };

@@ -9,7 +9,7 @@
  * tree-wide ledger.
  */
 
-import { budgetView, openFrame, reserveControllerTurn } from "../core/budget.ts";
+import { budgetView, openFrame, releaseLogicalCall, reserveControllerTurn, reserveLogicalCall } from "../core/budget.ts";
 import { type CallError, callError, type InterpreterError, interpreterError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import { isJsonObject, type JsonValue } from "../core/json.ts";
@@ -22,7 +22,7 @@ import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
-import { contextControl, dispatchCall, withContextMutation } from "./broker.ts";
+import { bindKeys, contextControl, dispatchCall, withContextMutation } from "./broker.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
@@ -309,39 +309,93 @@ const runChild = async (
   if (!isJsonObject(args)) return errResult("call_recurse_invalid", callError("INVALID_REQUEST", "recurse spec must be an object"), ZERO_CALL_USAGE, false);
   const key = typeof args["key"] === "string" ? args["key"] : "recurse";
   const objective = typeof args["objective"] === "string" ? args["objective"] : "";
-  const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "recurse", key, identity: args });
+  const refs = Array.isArray(args["context"]) ? args["context"] : args["context"] !== undefined ? [args["context"]] : [];
+  const contextIds = refs.flatMap((ref) => isJsonObject(ref) && typeof ref["id"] === "string" ? [ref["id"]] : []);
+  const identity: JsonValue = {
+    objective,
+    contexts: contextIds.map((id) => state.store.get(id)?.sha256 ?? id),
+    profile: typeof args["profile"] === "string" ? args["profile"] : state.profile.name,
+  };
+  const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "recurse", key, identity });
   const cancelled = (): GuestCallResult => errResult(callId, callError("CANCELLED", "cell epoch closed"), ZERO_CALL_USAGE, false);
   if (signal.aborted) return cancelled();
   if (objective.length === 0) return errResult(callId, callError("INVALID_REQUEST", "recurse requires an objective"), ZERO_CALL_USAGE, false);
+  await bindKeys(state, [{ frame: parentFrame, kind: "recurse", key, identity }]);
+  if (signal.aborted) return cancelled();
 
-  const refs = Array.isArray(args["context"]) ? args["context"] : args["context"] !== undefined ? [args["context"]] : [];
-  const inputs: Record<string, ContextDescriptor> = {};
-  refs.forEach((ref, i) => {
-    if (isJsonObject(ref) && typeof ref["id"] === "string") {
-      const desc = state.store.get(ref["id"]);
-      if (desc) inputs[i === 0 ? "context" : `context${i + 1}`] = desc;
+  const cached = state.callCache.get(callId);
+  if (cached) return { ...cached, cached: true };
+  const pending = state.inflight.get(callId);
+  if (pending) {
+    try {
+      return { ...(await waitForAbort(pending, signal)), cached: true };
+    } catch (error) {
+      if (wasAborted(error, signal)) return cancelled();
+      throw error;
     }
+  }
+
+  const inputs: Record<string, ContextDescriptor> = {};
+  contextIds.forEach((id, i) => {
+    const desc = state.store.get(id);
+    if (desc) inputs[i === 0 ? "context" : `context${i + 1}`] = desc;
   });
 
-  if (signal.aborted) return cancelled();
-  const opened = openFrame(state.ledger.current, parentFrame.depth + 1);
-  if (!opened.ok) return errResult(callId, opened.error, ZERO_CALL_USAGE, false);
-  state.ledger.current = opened.value;
+  let task!: Promise<GuestCallResult>;
+  task = (async (): Promise<GuestCallResult> => {
+    let logicalReserved = false;
+    try {
+      const reserved = reserveLogicalCall(state.ledger.current, state.clock.now());
+      if (!reserved.ok) return errResult(callId, reserved.error, ZERO_CALL_USAGE, false);
+      const opened = openFrame(reserved.value, parentFrame.depth + 1);
+      if (!opened.ok) return errResult(callId, opened.error, ZERO_CALL_USAGE, false);
+      state.ledger.current = opened.value;
+      logicalReserved = true;
 
-  const childFrameId = `${state.runId}:f${state.frameSeq.current++}`;
-  await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
-  if (signal.aborted) return cancelled();
+      const childFrameId = `${state.runId}:f${state.frameSeq.current++}`;
+      await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
+      if (signal.aborted) return cancelled();
 
-  const childFrame: FrameRef = { frameId: childFrameId, depth: parentFrame.depth + 1, objective, inputs, outputs: [] };
-  const childController = parentController.fork(objective, childFrameId);
-  const result = await runFrame(state, childFrame, childController, signal, deadlineMs);
-  if (signal.aborted || result.cancelled) return cancelled();
+      const childFrame: FrameRef = { frameId: childFrameId, depth: parentFrame.depth + 1, objective, inputs, outputs: [] };
+      const childController = parentController.fork(objective, childFrameId);
+      const result = await runFrame(state, childFrame, childController, signal, deadlineMs);
+      if (signal.aborted || result.cancelled) return cancelled();
 
-  const finalState = result.answer !== undefined ? "answered" : result.terminal ? "failed" : "closed";
-  await state.journal.append({ type: "frame_closed", frameId: childFrameId, state: finalState });
-  if (signal.aborted) return cancelled();
+      const finalState = result.answer !== undefined ? "answered" : result.terminal ? "failed" : "closed";
+      await state.journal.append({ type: "frame_closed", frameId: childFrameId, state: finalState });
+      if (signal.aborted) return cancelled();
 
-  if (result.terminal) return errResult(callId, callError("FAILED", result.terminal.message), ZERO_CALL_USAGE, false);
-  if (result.answer !== undefined) return okResult(callId, result.answer, ZERO_CALL_USAGE, false);
-  return errResult(callId, callError("FAILED", "child frame exhausted without an answer"), ZERO_CALL_USAGE, false);
+      const callResult = result.terminal
+        ? errResult(callId, callError("FAILED", result.terminal.message), ZERO_CALL_USAGE, false)
+        : result.answer !== undefined
+          ? okResult(callId, result.answer, ZERO_CALL_USAGE, false)
+          : errResult(callId, callError("FAILED", "child frame exhausted without an answer"), ZERO_CALL_USAGE, false);
+      await state.journal.append({
+        type: "call_committed",
+        frameId: parentFrame.frameId,
+        callId,
+        kind: "recurse",
+        key,
+        cached: false,
+        ok: callResult.ok,
+        usage: ZERO_CALL_USAGE,
+      });
+      state.callCache.set(callId, callResult);
+      logicalReserved = false;
+      return callResult;
+    } catch (error) {
+      if (wasAborted(error, signal)) return cancelled();
+      logicalReserved = false;
+      return errResult(callId, callError("FAILED", "child frame failed"), ZERO_CALL_USAGE, false);
+    } finally {
+      if (logicalReserved && signal.aborted) state.ledger.current = releaseLogicalCall(state.ledger.current);
+    }
+  })();
+
+  state.inflight.set(callId, task);
+  try {
+    return await task;
+  } finally {
+    if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+  }
 };

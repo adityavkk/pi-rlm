@@ -557,6 +557,140 @@ describe("runProgram e2e", () => {
     expect(result.answer).toEqual({ answer: "INVALID_SPEC,INVALID_SPEC" });
   });
 
+  test("changed llm and batch-child identities fail before provider spend", async () => {
+    const model = new MockModelClient(() => "only-result");
+    const controller = new MockController([
+      {
+        reasoning: "establish identity",
+        code: "workspace.first = await llm({ key: 'owned', prompt: 'first' }); 'bound'",
+      },
+      {
+        reasoning: "reject changed identities",
+        code: `
+          const codes = [];
+          try { await llm({ key: 'owned', prompt: 'changed' }); }
+          catch (error) { codes.push(error.code); }
+          try {
+            await llm.batch({
+              key: 'group',
+              items: [
+                { key: 'unlaunched', prompt: 'must not launch' },
+                { key: 'owned', prompt: 'also changed' },
+              ],
+            });
+          } catch (error) { codes.push(error.code); }
+          answer({ answer: codes.join(',') });`,
+      },
+    ]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "c" },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+      signal: new AbortController().signal,
+    });
+    expect(result.answer).toEqual({ answer: "KEY_IDENTITY_CHANGED,KEY_IDENTITY_CHANGED" });
+    expect(model.callCount).toBe(1);
+    expect(result.ledger.usage.logicalCalls).toBe(1);
+  });
+
+  test("concurrent and batch duplicate llm identities coalesce", async () => {
+    const model = new MockModelClient(() => "shared");
+    const controller = new MockController([{
+      reasoning: "coalesce duplicates",
+      code: `
+        const concurrent = await Promise.all([
+          llm({ key: 'concurrent', prompt: 'same' }),
+          llm({ key: 'concurrent', prompt: 'same' }),
+        ]);
+        const batch = await llm.batch({
+          key: 'group',
+          items: [
+            { key: 'batch-child', prompt: 'same child' },
+            { key: 'batch-child', prompt: 'same child' },
+          ],
+        });
+        answer({ answer: [concurrent[0].callId === concurrent[1].callId, batch[0].callId === batch[1].callId].join(',') });`,
+    }]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "c" },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+      signal: new AbortController().signal,
+    });
+    expect(result.answer).toEqual({ answer: "true,true" });
+    expect(model.callCount).toBe(2);
+    expect(result.ledger.usage.logicalCalls).toBe(2);
+  });
+
+  test("recurse keys reuse one child and reject changed identity", async () => {
+    const controller = new MockController(
+      [{
+        reasoning: "reuse child",
+        code: `
+          const [a, b] = await Promise.all([
+            recurse({ key: 'child', objective: 'same', context: input }),
+            recurse({ key: 'child', objective: 'same', context: input }),
+          ]);
+          let code = 'none';
+          try { await recurse({ key: 'child', objective: 'changed', context: input }); }
+          catch (error) { code = error.code; }
+          answer({ answer: (a.callId === b.callId) + ':' + code });`,
+      }],
+      () => new MockController([{ reasoning: "child", code: "answer('child-result')" }]),
+    );
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "c" },
+      controller,
+      model: new MockModelClient(() => "unused"),
+      backend,
+      dir: await tmp(),
+      signal: new AbortController().signal,
+    });
+    expect(result.answer).toEqual({ answer: "true:KEY_IDENTITY_CHANGED" });
+    expect(result.ledger.usage.framesOpened).toBe(1);
+    expect(result.ledger.usage.logicalCalls).toBe(1);
+  });
+
+  test("context and artifact keys reuse equal identities and reject changes", async () => {
+    const controller = new MockController([{
+      reasoning: "check keyed producers",
+      code: `
+        const codes = [];
+        const d1 = await contexts.derive({ key: 'derive', value: { b: 2, a: 1 } });
+        const d2 = await contexts.derive({ key: 'derive', value: { a: 1, b: 2 } });
+        try { await contexts.derive({ key: 'derive', value: { a: 2 } }); }
+        catch (error) { codes.push(error.code); }
+        const c1 = await contexts.concat({ key: 'concat', refs: [input], separator: '' });
+        const c2 = await contexts.concat({ key: 'concat', refs: [input], separator: '' });
+        try { await contexts.concat({ key: 'concat', refs: [input, input], separator: '' }); }
+        catch (error) { codes.push(error.code); }
+        const a1 = await artifacts.write({ key: 'artifact', name: 'data.json', value: { b: 2, a: 1 } });
+        const a2 = await artifacts.write({ key: 'artifact', name: 'data.json', value: { a: 1, b: 2 } });
+        try { await artifacts.write({ key: 'artifact', name: 'data.json', value: { a: 2 } }); }
+        catch (error) { codes.push(error.code); }
+        answer({ answer: [d1.id === d2.id, c1.id === c2.id, a1.id === a2.id, ...codes].join(',') });`,
+    }]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "source" },
+      controller,
+      model: new MockModelClient(() => "unused"),
+      backend,
+      dir: await tmp(),
+      signal: new AbortController().signal,
+    });
+    expect(result.answer).toEqual({
+      answer: "true,true,true,KEY_IDENTITY_CHANGED,KEY_IDENTITY_CHANGED,KEY_IDENTITY_CHANGED",
+    });
+  });
+
   test("denied context producers leave ledger, entries, and files unchanged", async () => {
     const dir = await tmp();
     const model = new MockModelClient(() => "ok");

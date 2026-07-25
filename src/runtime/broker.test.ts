@@ -74,6 +74,7 @@ describe("dispatchCall cancellation ownership", () => {
       backend: {} as InterpreterBackend,
       callCache: new Map(),
       inflight: new Map(),
+      keyIdentities: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
@@ -104,7 +105,9 @@ describe("dispatchCall cancellation ownership", () => {
       waiterAbort.signal,
       deadlineMs,
     ) as Promise<GuestCallResult>;
-    await Promise.resolve();
+    await within((async () => {
+      while (state.inflight.size !== 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })());
     expect(state.inflight.size).toBe(2);
     expect(state.ledger.current.usage.logicalCalls).toBe(2);
 
