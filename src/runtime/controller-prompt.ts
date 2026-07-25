@@ -46,6 +46,8 @@ Rules:
 - Use code for structural work (chunking, counting, joining); use llm for semantics.
 - Keep large data in workspace/contexts; never paste whole sources back to yourself.
 - Reuse stable keys so repeated calls are cached. Call answer() exactly once when done.
+- An answer is provisional until its cell returns successfully. A throw discards it; multiple
+  submissions in one cell reject the cell instead of selecting one.
 - A cell that throws, fails to await bridge work, or writes non-serializable workspace
   values is reported back as a recoverable error; correct course on the next cell.`;
 

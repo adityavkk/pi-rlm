@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
+import type { RlmEvent } from "../core/journal.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
@@ -17,6 +18,12 @@ beforeAll(async () => {
 });
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-e2e-"));
+const journalEvents = async (dir: string): Promise<RlmEvent[]> =>
+  (await readFile(join(dir, "events.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as RlmEvent);
 
 const program = (overrides: Partial<RlmProgram> = {}): RlmProgram => {
   const base = normalizeProgram({
@@ -267,6 +274,243 @@ describe("runProgram e2e", () => {
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "fixed" });
+  });
+
+  test("zero answer effects remain exploratory and one snapshotted answer commits", async () => {
+    const controller = new MockController([
+      { reasoning: "explore", code: "workspace.step = 'explored'; 'zero'" },
+      {
+        reasoning: "answer once",
+        code: "const submitted = { answer: 'first' }; answer(submitted); submitted.answer = 'mutated'; 'one'",
+      },
+    ]);
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "c" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "first" });
+    const events = await journalEvents(dir);
+    const cells = events.filter((event) => event.type === "cell_committed");
+    expect(cells).toHaveLength(2);
+    expect(cells[0]?.error).toBeUndefined();
+    expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+  });
+
+  test("same, conflicting, multiple, and undefined submissions reject deterministically then recover", async () => {
+    const cases = [
+      {
+        name: "same",
+        code: "answer({ answer: 'same' }); answer({ answer: 'same' }); 'duplicate'",
+        message: "cell submitted 2 answer effects; exactly one is allowed",
+      },
+      {
+        name: "conflicting",
+        code: "answer({ answer: 'first' }); answer({ answer: 'second' }); 'conflict'",
+        message: "cell submitted 2 answer effects; exactly one is allowed",
+      },
+      {
+        name: "multiple",
+        code: "answer({ answer: 'one' }); answer({ answer: 'two' }); answer({ answer: 'three' }); 'many'",
+        message: "cell submitted 3 answer effects; exactly one is allowed",
+      },
+      {
+        name: "undefined",
+        code: "answer(undefined); 'missing'",
+        message: "answer value must be strict JSON",
+      },
+    ];
+
+    for (const entry of cases) {
+      const seen: FrameState[] = [];
+      const cells: Cell[] = [
+        { reasoning: entry.name, code: entry.code },
+        { reasoning: "recover", code: `answer({ answer: '${entry.name}:fixed' }); 'recovered'` },
+      ];
+      let index = 0;
+      const controller: ControllerDriver = {
+        async next(state) {
+          seen.push(state);
+          return cells[index++] as Cell;
+        },
+        fork() { return this; },
+      };
+      const dir = await tmp();
+      const result = await runProgram({
+        program: program(), sources: { context: "c" }, controller,
+        model: new MockModelClient(() => "unused"), backend, dir,
+        signal: new AbortController().signal,
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.answer).toEqual({ answer: `${entry.name}:fixed` });
+      expect(seen[1]?.trajectory.entries.at(-1)?.error?.code).toBe("INVALID_RESULT");
+      expect(seen[1]?.trajectory.entries.at(-1)?.error?.message).toBe(entry.message);
+      const events = await journalEvents(dir);
+      const committedCells = events.filter((event) => event.type === "cell_committed");
+      expect(committedCells[0]?.error).toEqual({ code: "INVALID_RESULT", message: entry.message });
+      expect(committedCells[0]?.outputRef).toBeUndefined();
+      expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+    }
+  });
+
+  test("forged and unsafe answer snapshots persist nothing and recover on the next cell", async () => {
+    const cases = [
+      {
+        name: "forged-undefined",
+        code: `JSON.stringify = () => '{"value":{"answer":"forged"}}'; JSON.parse = () => ({ value: { answer: "forged" } }); answer(undefined); 'invalid'`,
+      },
+      {
+        name: "cycle",
+        code: "const value = { answer: 'cycle' }; value.self = value; answer(value); 'invalid'",
+      },
+      {
+        name: "accessor",
+        code: `const value = {}; Object.defineProperty(value, "answer", { enumerable: true, get() { while (true) {} } }); answer(value); 'invalid'`,
+      },
+      {
+        name: "proxy",
+        code: `const value = new Proxy({}, { ownKeys() { while (true) {} } }); answer(value); 'invalid'`,
+      },
+    ];
+
+    for (const entry of cases) {
+      const seen: FrameState[] = [];
+      const cells: Cell[] = [
+        { reasoning: entry.name, code: entry.code },
+        { reasoning: "recover", code: `answer({ answer: '${entry.name}:fixed' }); 'recovered'` },
+      ];
+      let index = 0;
+      const controller: ControllerDriver = {
+        async next(state) { seen.push(state); return cells[index++] as Cell; },
+        fork() { return this; },
+      };
+      const dir = await tmp();
+      const result = await runProgram({
+        program: program(), sources: { context: "c" }, controller,
+        model: new MockModelClient(() => "unused"), backend, dir,
+        signal: new AbortController().signal,
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.answer).toEqual({ answer: `${entry.name}:fixed` });
+      expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({
+        code: "INVALID_RESULT",
+        message: "answer value must be strict JSON",
+      });
+      const events = await journalEvents(dir);
+      const committedCells = events.filter((event) => event.type === "cell_committed");
+      expect(committedCells[0]?.outputRef).toBeUndefined();
+      expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+      expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+    }
+  });
+
+  test("prototype-poisoned accessor descriptors remain invalid without running getters", async () => {
+    const seen: FrameState[] = [];
+    const cells: Cell[] = [
+      {
+        reasoning: "poison descriptor inspection",
+        code: `
+          let getterCount = 0;
+          const value = {};
+          Object.defineProperty(value, "answer", {
+            enumerable: true,
+            get() { getterCount += 100; return "forged"; },
+          });
+          Object.defineProperty(Object.prototype, "value", {
+            configurable: true,
+            get() { getterCount += 1; return "forged"; },
+          });
+          Object.prototype.hasOwnProperty = () => true;
+          Function.prototype.call = () => true;
+          answer(value);
+          emit({ message: String(getterCount) });
+          'invalid'`,
+      },
+      { reasoning: "recover", code: "answer({ answer: 'fixed' }); 'recovered'" },
+    ];
+    let index = 0;
+    const controller: ControllerDriver = {
+      async next(state) { seen.push(state); return cells[index++] as Cell; },
+      fork() { return this; },
+    };
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "c" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "fixed" });
+    expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({
+      code: "INVALID_RESULT",
+      message: "answer value must be strict JSON",
+    });
+    const events = await journalEvents(dir);
+    const committedCells = events.filter((event) => event.type === "cell_committed");
+    expect(events.find((event) => event.type === "emit")?.message).toBe("0");
+    expect(committedCells[0]?.outputRef).toBeUndefined();
+    expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+  });
+
+  test("a thrown cell discards its earlier answer effect before recovery", async () => {
+    const dir = await tmp();
+    const controller = new MockController([
+      { reasoning: "answer then throw", code: "answer({ answer: 'discarded' }); throw new Error('after answer')" },
+      { reasoning: "recover", code: "answer({ answer: 'kept' }); 'done'" },
+    ]);
+    const result = await runProgram({
+      program: program(), sources: { context: "c" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "kept" });
+    const events = await journalEvents(dir);
+    const cells = events.filter((event) => event.type === "cell_committed");
+    expect(cells[0]?.error).toMatchObject({ code: "FAILED" });
+    expect(cells[0]?.outputRef).toBeUndefined();
+    expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+  });
+
+  test("answer output-byte denial persists nothing and is recoverable", async () => {
+    const dir = await tmp();
+    const seen: FrameState[] = [];
+    const cells: Cell[] = [
+      { reasoning: "too large", code: "answer({ answer: 'x'.repeat(50) }); 'large'" },
+      { reasoning: "fit remaining bytes", code: "answer({ answer: 'ok' }); 'small'" },
+    ];
+    let index = 0;
+    const controller: ControllerDriver = {
+      async next(state) { seen.push(state); return cells[index++] as Cell; },
+      fork() { return this; },
+    };
+    const result = await runProgram({
+      program: program(), sources: { context: "c" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 20 },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "ok" });
+    expect(result.ledger.usage.storedBytes).toBe(1 + Buffer.byteLength(JSON.stringify({ answer: "ok" })));
+    expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({ code: "BUDGET_BYTES" });
+    const events = await journalEvents(dir);
+    const cellsCommitted = events.filter((event) => event.type === "cell_committed");
+    expect(cellsCommitted[0]?.error).toEqual({
+      code: "BUDGET_BYTES",
+      message: "answer output exceeds remaining stored-byte budget",
+    });
+    expect(cellsCommitted[0]?.outputRef).toBeUndefined();
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
   });
 
   test("inherited output values do not satisfy the answer contract", async () => {

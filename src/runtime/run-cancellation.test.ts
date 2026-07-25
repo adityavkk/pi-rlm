@@ -298,6 +298,25 @@ describe("run cancellation and terminal finalization", () => {
     }
   });
 
+  test("cancellation after an answer effect discards the provisional submission", async () => {
+    const dir = await tmp();
+    const owner = new AbortController();
+    const backend = new FunctionBackend(async (options) => {
+      options.effect("answer", { value: { answer: "must-not-commit" } });
+      owner.abort();
+      return valueOutcome();
+    });
+    const result = await within(runProgram({
+      program: program(), sources: {}, controller: new OneCellController(), model: unusedModel,
+      backend, dir, signal: owner.signal,
+    }));
+
+    expect(result.status).toBe("cancelled");
+    expect(result.ledger.usage.storedBytes).toBe(0);
+    expect((await events(dir)).some((event) => event.type === "answer_committed")).toBe(false);
+    await expectSingleTerminal(dir, result);
+  });
+
   test("run deadline aborts pending work and rebuilds terminal status", async () => {
     const dir = await tmp();
     const controller: ControllerDriver = {

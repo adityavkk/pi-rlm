@@ -51,6 +51,27 @@ const errorInfo = (error: CallError | InterpreterError): { code: string; message
   message: error.message,
 });
 
+type CapturedAnswer =
+  | { readonly ok: true; readonly value: JsonValue }
+  | { readonly ok: false };
+
+/** Snapshot the first submission at effect time, before guest code can mutate it. */
+const captureAnswer = (args: JsonValue): CapturedAnswer => {
+  try {
+    if (!isJsonObject(args) || !Object.prototype.hasOwnProperty.call(args, "value")) return { ok: false };
+    const value = args["value"] as JsonValue | undefined;
+    if (value === undefined) return { ok: false };
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) return { ok: false };
+    return { ok: true, value: JSON.parse(serialized) as JsonValue };
+  } catch {
+    return { ok: false };
+  }
+};
+
+const hasErrorCode = (error: unknown, code: string): boolean =>
+  typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
+
 const validateAnswer = (candidate: JsonValue, frame: FrameRef): string[] => {
   if (frame.outputs.length === 0) return [];
   if (!isJsonObject(candidate)) return ["answer must be an object containing every declared output"];
@@ -137,13 +158,13 @@ export const runFrame = async (
       continue;
     }
 
-    let answered = false;
-    let candidate: JsonValue | undefined;
+    let answerEffectCount = 0;
+    let capturedAnswer: CapturedAnswer | undefined;
     const effect = (name: string, args: JsonValue): void => {
       if (signal?.aborted) return;
-      if (name === "answer" && isJsonObject(args)) {
-        answered = true;
-        candidate = args["value"] as JsonValue;
+      if (name === "answer") {
+        answerEffectCount += 1;
+        if (answerEffectCount === 1) capturedAnswer = captureAnswer(args);
       } else if (name === "phase" && isJsonObject(args)) {
         void state.journal.append({ type: "phase", frameId: frame.frameId, ordinal: phaseOrdinal++, name: String(args["name"]) }).catch(() => {});
       } else if (name === "emit" && isJsonObject(args)) {
@@ -211,32 +232,46 @@ export const runFrame = async (
       }).text;
       if (workspaceInvalid) {
         error = callError("FAILED", `workspace contains non-serializable values at: ${outcome.workspaceInvalidPaths.join(", ")}`);
-      } else if (answered && candidate !== undefined) {
-        const answerErrors = validateAnswer(candidate, frame);
-        if (answerErrors.length === 0) {
-          const ref = await withContextMutation(state, () =>
-            state.store.derive(
-              { key: `answer:${frame.frameId}:${iteration}`, value: candidate as JsonValue },
-              contextControl(state, cellDeadline, signal, true),
-            ), signal);
-          if (signal?.aborted) return cancelled();
-          entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
-          await state.journal.append({
-            type: "cell_committed",
-            frameId: frame.frameId,
-            iteration,
-            reasoning: cell.reasoning,
-            codeHash: state.hasher(cell.code).slice(0, 16),
-            hasResult: outcome.hasResult,
-            outputPreview: preview,
-            outputRef: ref.id,
-          });
-          if (signal?.aborted) return cancelled();
-          await state.journal.append({ type: "answer_committed", frameId: frame.frameId, completionMode: "answer", outputRef: ref.id });
-          if (signal?.aborted) return cancelled();
-          return { answer: candidate, completionMode: "answer", exhausted: false };
+      } else if (answerEffectCount > 1) {
+        error = callError("INVALID_RESULT", `cell submitted ${answerEffectCount} answer effects; exactly one is allowed`);
+      } else if (answerEffectCount === 1) {
+        if (!capturedAnswer?.ok) {
+          error = callError("INVALID_RESULT", "answer value must be strict JSON");
+        } else {
+          const candidate = capturedAnswer.value;
+          const answerErrors = validateAnswer(candidate, frame);
+          if (answerErrors.length > 0) {
+            error = callError("INVALID_RESULT", `answer did not satisfy the output contract: ${answerErrors.join("; ")}`);
+          } else {
+            try {
+              const ref = await withContextMutation(state, () =>
+                state.store.derive(
+                  { key: `answer:${frame.frameId}:${iteration}`, value: candidate },
+                  contextControl(state, cellDeadline, signal, true),
+                ), signal);
+              if (signal?.aborted) return cancelled();
+              entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
+              await state.journal.append({
+                type: "cell_committed",
+                frameId: frame.frameId,
+                iteration,
+                reasoning: cell.reasoning,
+                codeHash: state.hasher(cell.code).slice(0, 16),
+                hasResult: outcome.hasResult,
+                outputPreview: preview,
+                outputRef: ref.id,
+              });
+              if (signal?.aborted) return cancelled();
+              await state.journal.append({ type: "answer_committed", frameId: frame.frameId, completionMode: "answer", outputRef: ref.id });
+              if (signal?.aborted) return cancelled();
+              return { answer: candidate, completionMode: "answer", exhausted: false };
+            } catch (persistenceError) {
+              if (signal?.aborted) return cancelled();
+              if (!hasErrorCode(persistenceError, "BUDGET_BYTES")) throw persistenceError;
+              error = callError("BUDGET_BYTES", "answer output exceeds remaining stored-byte budget");
+            }
+          }
         }
-        error = callError("INVALID_RESULT", `answer did not satisfy the output contract: ${answerErrors.join("; ")}`);
       }
     }
 
