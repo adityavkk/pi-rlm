@@ -2,13 +2,13 @@
  * Durable event journal (imperative shell).
  *
  * `events.jsonl` is append-only and authoritative; each append is flushed with
- * fsync. `status.json` is a rebuildable cache written atomically via a temp file
- * and rename. A partially written final line (torn append on crash) is dropped
- * on read; a malformed interior line is treated as corruption.
+ * fsync. Before appending, an unterminated tail is removed back to the last
+ * verified newline and the repair is fsynced. `status.json` is a rebuildable
+ * cache written atomically via a synced temp file, rename, and directory fsync.
  */
 
 import { createHash } from "node:crypto";
-import { open, readFile, rename, writeFile } from "node:fs/promises";
+import { open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
 import { reduceStatus, type RlmEvent, type RunStatus } from "../core/journal.ts";
@@ -16,59 +16,109 @@ import { err, ok, type Result } from "../core/result.ts";
 
 const lineHash = (line: string): string => createHash("sha256").update(line).digest("hex").slice(0, 12);
 
+export interface JournalFileHandle {
+  appendFile(data: string, encoding: BufferEncoding): Promise<void>;
+  close(): Promise<void>;
+  readFile(): Promise<Buffer>;
+  sync(): Promise<void>;
+  truncate(length: number): Promise<void>;
+  writeFile(data: string, encoding: BufferEncoding): Promise<void>;
+}
+
+export interface JournalFileSystem {
+  open(path: string, flags: string): Promise<JournalFileHandle>;
+  readFile(path: string): Promise<Buffer>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+}
+
+const nodeFileSystem: JournalFileSystem = {
+  open: async (path, flags) => open(path, flags),
+  readFile: async (path) => readFile(path),
+  rename,
+};
+
+interface JournalScan {
+  readonly events: RlmEvent[];
+  readonly verifiedBytes: number;
+}
+
+const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => {
+  const verifiedBytes = raw.length === 0 || raw[raw.length - 1] === 0x0a
+    ? raw.length
+    : raw.lastIndexOf(0x0a) + 1;
+  const events: RlmEvent[] = [];
+  let lineStart = 0;
+  let lineNumber = 0;
+
+  for (let i = 0; i < verifiedBytes; i++) {
+    if (raw[i] !== 0x0a) continue;
+    const line = Buffer.from(raw.subarray(lineStart, i)).toString("utf8");
+    if (line.length > 0) {
+      try {
+        events.push(JSON.parse(line) as RlmEvent);
+      } catch {
+        return err(interpreterError("JOURNAL_CORRUPT", `corrupt journal line ${lineNumber} (${lineHash(line)})`));
+      }
+    }
+    lineStart = i + 1;
+    lineNumber++;
+  }
+
+  return ok({ events, verifiedBytes });
+};
+
+const isMissing = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+
 export class JournalStore {
   private readonly eventsPath: string;
   private readonly statusPath: string;
   private queue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly dir: string) {
+  constructor(
+    private readonly dir: string,
+    private readonly fileSystem: JournalFileSystem = nodeFileSystem,
+  ) {
     this.eventsPath = join(dir, "events.jsonl");
     this.statusPath = join(dir, "status.json");
   }
 
-  /** Append one event durably, then refresh the status cache. Serialized. */
+  /** Repair any torn tail, append one event durably, then refresh status. Serialized. */
   append(event: RlmEvent): Promise<void> {
     const run = async (): Promise<void> => {
       const line = `${JSON.stringify(event)}\n`;
-      const handle = await open(this.eventsPath, "a");
+      const handle = await this.fileSystem.open(this.eventsPath, "a+");
+      let events: RlmEvent[];
       try {
+        const raw = await handle.readFile();
+        const scanned = scanJournal(raw);
+        if (!scanned.ok) throw scanned.error;
+        events = scanned.value.events;
+        if (scanned.value.verifiedBytes !== raw.length) {
+          await handle.truncate(scanned.value.verifiedBytes);
+          await handle.sync();
+        }
         await handle.appendFile(line, "utf8");
         await handle.sync();
       } finally {
         await handle.close();
       }
-      const events = await this.readEventsInternal();
-      if (events.ok) await this.writeStatus(reduceStatus(events.value));
+      await this.writeStatus(reduceStatus([...events, event]));
     };
     this.queue = this.queue.then(run, run);
     return this.queue;
   }
 
   private async readEventsInternal(): Promise<Result<RlmEvent[], InterpreterError>> {
-    let raw: string;
+    let raw: Buffer;
     try {
-      raw = await readFile(this.eventsPath, "utf8");
-    } catch {
-      return ok([]);
+      raw = await this.fileSystem.readFile(this.eventsPath);
+    } catch (error) {
+      if (isMissing(error)) return ok([]);
+      throw error;
     }
-    if (raw.length === 0) return ok([]);
-    const lines = raw.split("\n");
-    // A trailing newline yields a final empty element; a torn append yields a
-    // non-empty final element that may not parse. Both are tolerated.
-    const trailingComplete = raw.endsWith("\n");
-    const events: RlmEvent[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i] as string;
-      if (line.length === 0) continue;
-      const isFinal = i === lines.length - 1;
-      try {
-        events.push(JSON.parse(line) as RlmEvent);
-      } catch {
-        if (isFinal && !trailingComplete) break; // torn last append: drop and recover
-        return err(interpreterError("JOURNAL_CORRUPT", `corrupt journal line ${i} (${lineHash(line)})`));
-      }
-    }
-    return ok(events);
+    const scanned = scanJournal(raw);
+    return scanned.ok ? ok(scanned.value.events) : scanned;
   }
 
   async readEvents(): Promise<Result<RlmEvent[], InterpreterError>> {
@@ -77,8 +127,21 @@ export class JournalStore {
 
   private async writeStatus(status: RunStatus): Promise<void> {
     const tmp = `${this.statusPath}.tmp`;
-    await writeFile(tmp, JSON.stringify(status, null, 2), "utf8");
-    await rename(tmp, this.statusPath);
+    const handle = await this.fileSystem.open(tmp, "w");
+    try {
+      await handle.writeFile(JSON.stringify(status, null, 2), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await this.fileSystem.rename(tmp, this.statusPath);
+
+    const directory = await this.fileSystem.open(this.dir, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
 
   async status(): Promise<Result<RunStatus, InterpreterError>> {
