@@ -63,13 +63,12 @@ Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
   /rlm Summarize the contradictions across these design notes
   ```
 
-- Tool call (model initiated, after you ask to "use pi-rlm"): the model calls
-  `rlm_run` with either `{ objective, context }` or a typed `{ program, sources }`.
-  An explicit phrase in the current host input authorizes only the first exact
-  tool call in that Pi turn. Otherwise, interactive modes display the normalized
-  objective, program shape, sources, and request hash for confirmation. Headless
-  unsolicited calls fail with `RLM_OPT_IN_REQUIRED`; there is no environment
-  variable bypass.
+- Tool call (model initiated): `rlm_run` accepts either `{ objective, context }`
+  or a typed `{ program, sources }`. Interactive modes always display the
+  normalized objective, program shape, source identity, and exact request hash
+  for host confirmation. Prompt text, including phrases such as "use pi-rlm",
+  is guidance only and never authorizes spend. Every headless `rlm_run` call
+  fails with `RLM_OPT_IN_REQUIRED`; there is no phrase or environment bypass.
 
 Model routing is configured with environment variables (all default to a single
 model):
@@ -115,9 +114,11 @@ deferreds plus a single centralized job-pump loop. See
 QuickJS, fresh contexts, budgets, and tool filtering are capability controls,
 not an operating-system sandbox. The guest has no `process`, `require`, dynamic
 import, network, timers, `Date`, or `Math.random`. CPU time and heap are capped
-per cell. Every run consumes one host-owned grant bound to its Pi session, host
-turn identity, user-prompt hash, normalized request hash, and exact tool call.
-The model cannot submit a grant ID or reuse a consumed call. Do not rely on this
+per cell. Every run consumes one host-owned grant created by `/rlm` or an exact-
+request UI confirmation and bound to its Pi session, host turn identity,
+originating-input hash, normalized request hash, and exact tool call. The model
+cannot create authority with prompt wording, submit a grant ID, or reuse a
+consumed call. Do not rely on this
 to run untrusted code against secrets; it is a bounded capability layer, not a
 security boundary.
 

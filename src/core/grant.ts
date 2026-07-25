@@ -3,13 +3,13 @@
  *
  * Prompt guidance is not authorization. Before any RLM run spends resources the
  * host must hold a single-use grant bound to the current session, turn nonce,
- * and prompt hash. `/rlm` and recognized explicit phrases mint a grant; a model
- * cannot forge one because it cannot supply a matching turn nonce.
+ * prompt hash, normalized request, and exact tool call. Only an exact-request
+ * host confirmation or the dedicated `/rlm` host action can mint one.
  */
 
 import { err, ok, type Result } from "./result.ts";
 
-export type GrantMode = "slash_command" | "explicit_prompt" | "confirmed";
+export type GrantMode = "slash_command" | "confirmed";
 
 export interface LaunchGrant {
   readonly grantId: string;
@@ -82,14 +82,3 @@ export const expireOtherTurns = (store: GrantStore, currentTurnNonce: string): G
     if (grant.turnNonce === currentTurnNonce) grants[id] = grant;
   return { grants };
 };
-
-const EXPLICIT_PATTERNS: readonly RegExp[] = [
-  /(^|\s)\/rlm(\s|$)/i,
-  /\buse\s+pi-?rlm\b/i,
-  /\brun\s+(an?\s+)?rlm\b/i,
-  /\bpi-?rlm\s+run\b/i,
-];
-
-/** Conservative detector for an explicit human opt-in phrase in a user entry. */
-export const detectExplicitOptIn = (userText: string): boolean =>
-  EXPLICIT_PATTERNS.some((pattern) => pattern.test(userText));

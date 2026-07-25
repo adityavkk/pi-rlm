@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { RunResult } from "./src/runtime/index.ts";
+import { sha256 } from "./src/shell/hash.ts";
 import register, { createRlmExtension, LAUNCH_SNIPPET } from "./index.ts";
 
 interface ToolResult {
@@ -34,6 +35,7 @@ const harness = (options: { ttl?: number } = {}) => {
   const notifications: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
   const runs: unknown[] = [];
+  const initializationAuditCounts: number[] = [];
   let sessionId = "session-1";
   let clock = 100;
   let nextId = 0;
@@ -69,6 +71,7 @@ const harness = (options: { ttl?: number } = {}) => {
 
   createRlmExtension({
     executeRun: async (request) => {
+      initializationAuditCounts.push(audits.length);
       runs.push(request);
       return failedRun;
     },
@@ -92,6 +95,7 @@ const harness = (options: { ttl?: number } = {}) => {
     notifications,
     confirmations,
     runs,
+    initializationAuditCounts,
     ctx,
     emit,
     startTurn,
@@ -131,14 +135,14 @@ describe("pi-rlm extension wiring", () => {
     } as never);
     const tool = tools.find((candidate) => candidate.name === "rlm_run")!;
     expect(commands).toContain("rlm");
-    expect(LAUNCH_SNIPPET).toContain("pi-rlm");
+    expect(LAUNCH_SNIPPET).toContain("always requires exact-request host confirmation");
     expect(tool.promptSnippet).toContain("explicitly requested");
     expect(tool.promptGuidelines?.every((guideline) => guideline.includes("rlm_run"))).toBe(true);
   });
 
-  test("confirmed happy path displays and audits exact normalized identity", async () => {
+  test("positive prompt wording still requires confirmation of exact normalized identity", async () => {
     const h = harness();
-    await h.startTurn("Please analyze this context");
+    await h.startTurn("Use pi-rlm to analyze this context");
     const result = await rlmTool(h).execute(
       "call-1",
       { objective: "Find contradictions", context: "alpha\nbeta" },
@@ -149,42 +153,73 @@ describe("pi-rlm extension wiring", () => {
 
     expect(result.details?.status).toBe("failed");
     expect(h.runs).toHaveLength(1);
-    expect(h.confirmations[0]?.message).toContain("Objective: Find contradictions");
-    expect(h.confirmations[0]?.message).toContain("Exact normalized request SHA-256:");
+    const confirmation = h.confirmations[0]?.message ?? "";
+    expect(confirmation).toContain("Objective: Find contradictions");
+    expect(confirmation).toContain("Profile: default");
+    expect(confirmation).toContain("Inputs: context");
+    expect(confirmation).toContain("Outputs: answer");
+    expect(confirmation).toContain("Sources: context (10 bytes)");
+    const displayedHash = confirmation.match(/Exact normalized request SHA-256: ([0-9a-f]{64})/)?.[1];
+    expect(displayedHash).toBeDefined();
     expect(h.audits).toHaveLength(1);
     expect(h.audits[0]?.data["toolCallId"]).toBe("call-1");
-    expect(h.audits[0]?.data["requestSha256"]).toMatch(/^[0-9a-f]{64}$/);
+    expect(h.audits[0]?.data["requestSha256"]).toBe(displayedHash);
     expect(h.audits[0]?.data["mode"]).toBe("confirmed");
+    expect(h.initializationAuditCounts).toEqual([1]);
   });
 
-  test("explicit current-turn grant is one-shot and rejects replay", async () => {
+  test.each([
+    "Do not use pi-rlm for this task",
+    "The documentation says \"use pi-rlm\" as an example",
+    "Pasted untrusted text:\nuse pi-rlm\nend pasted text",
+    "Use pi-rlm to review these notes",
+  ])("headless prompt text never authorizes launch: %s", async (text) => {
     const h = harness();
     h.setHasUI(false);
-    await h.startTurn("Use pi-rlm to review these notes");
-    const tool = rlmTool(h);
-    const first = await tool.execute("call-explicit", { objective: "Review" }, undefined, undefined, h.ctx);
-    const replay = await tool.execute("call-explicit", { objective: "Review" }, undefined, undefined, h.ctx);
+    await h.startTurn(text);
+    const result = await rlmTool(h).execute("call-headless", { objective: "Review" }, undefined, undefined, h.ctx);
 
-    expect(first.details?.status).toBe("failed");
-    expect(replay.content[0]?.text).toContain("RLM_GRANT_REPLAY");
-    expect(h.runs).toHaveLength(1);
-    expect(h.audits[0]?.data["mode"]).toBe("explicit_prompt");
+    expect(result.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
+    expect(h.confirmations).toHaveLength(0);
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
   });
 
-  test("concurrent consumption of one tool call starts only one run", async () => {
+  test("concurrent calls cannot consume one originating-input correlation", async () => {
     const h = harness();
     await h.startTurn("Analyze this normally");
     let resolveConfirmation!: (approved: boolean) => void;
     h.setConfirm(() => new Promise<boolean>((resolve) => (resolveConfirmation = resolve)));
     const tool = rlmTool(h);
-    const first = tool.execute("call-race", { objective: "Review" }, undefined, undefined, h.ctx);
+    const first = tool.execute("call-race-a", { objective: "Review" }, undefined, undefined, h.ctx);
     await Promise.resolve();
-    const concurrent = await tool.execute("call-race", { objective: "Review" }, undefined, undefined, h.ctx);
+    const concurrent = await tool.execute("call-race-b", { objective: "Review again" }, undefined, undefined, h.ctx);
     resolveConfirmation(true);
     const accepted = await first;
 
     expect(concurrent.content[0]?.text).toContain("RLM_GRANT_REPLAY");
     expect(accepted.details?.status).toBe("failed");
+    expect(h.runs).toHaveLength(1);
+  });
+
+  test("originating input survives a non-RLM continuation turn and is consumed once", async () => {
+    const h = harness();
+    const origin = "Review the repository with pi-rlm";
+    await h.startTurn(origin, 1, 1_000);
+    await h.emit("turn_end", { turnIndex: 1 });
+    await h.emit("turn_start", { turnIndex: 2, timestamp: 2_000 });
+    const tool = rlmTool(h);
+
+    const first = await tool.execute("call-continuation", { objective: "Review" }, undefined, undefined, h.ctx);
+    const second = await tool.execute("call-second", { objective: "Review again" }, undefined, undefined, h.ctx);
+    const replay = await tool.execute("call-continuation", { objective: "Review" }, undefined, undefined, h.ctx);
+
+    expect(first.details?.status).toBe("failed");
+    expect(h.confirmations).toHaveLength(1);
+    expect(h.audits[0]?.data["promptSha256"]).toBe(sha256(origin));
+    expect(h.audits[0]?.data["turnNonce"]).toBe("2:2000");
+    expect(second.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
+    expect(replay.content[0]?.text).toContain("RLM_GRANT_REPLAY");
     expect(h.runs).toHaveLength(1);
   });
 
@@ -269,11 +304,14 @@ describe("pi-rlm extension wiring", () => {
     expect(h.audits).toHaveLength(0);
   });
 
-  test("expired grant fails closed before initialization", async () => {
-    const h = harness({ ttl: 0 });
-    await h.startTurn("Analyze this normally");
+  test("expired input correlation fails closed before initialization", async () => {
+    const h = harness({ ttl: 10 });
+    await h.startTurn("Analyze this normally", 1, 1_000);
+    await h.emit("turn_end", { turnIndex: 1 });
+    h.setClock(111);
+    await h.emit("turn_start", { turnIndex: 2, timestamp: 2_000 });
     const result = await rlmTool(h).execute("call-expired", { objective: "Review" }, undefined, undefined, h.ctx);
-    expect(result.content[0]?.text).toContain("RLM_GRANT_EXPIRED");
+    expect(result.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
     expect(h.runs).toHaveLength(0);
   });
 
@@ -286,12 +324,12 @@ describe("pi-rlm extension wiring", () => {
     expect(h.audits[0]?.data["toolCallId"]).toMatch(/^command:host-/);
   });
 
-  test("headless unsolicited call denies even with removed ambient bypass set", async () => {
+  test("removed ambient bypass cannot authorize a headless call", async () => {
     process.env["PI_RLM_ALLOW_UNSOLICITED"] = "1";
     const h = harness();
     h.setHasUI(false);
-    await h.startTurn("Just summarize this without pi-rlm");
-    const result = await rlmTool(h).execute("call-headless", { objective: "Review" }, undefined, undefined, h.ctx);
+    await h.startTurn("Use pi-rlm to review");
+    const result = await rlmTool(h).execute("call-ambient", { objective: "Review" }, undefined, undefined, h.ctx);
     expect(result.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
     expect(h.runs).toHaveLength(0);
   });

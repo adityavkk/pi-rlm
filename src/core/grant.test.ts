@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { consumeGrant, detectExplicitOptIn, emptyGrantStore, expireOtherTurns, mintGrant } from "./grant.ts";
+import { consumeGrant, emptyGrantStore, expireOtherTurns, mintGrant } from "./grant.ts";
 
 const grant = {
   grantId: "g1",
@@ -67,12 +67,5 @@ describe("launch grants", () => {
     ({ store } = mintGrant(store, { ...grant, grantId: "g2", turnNonce: "t2" }));
     const kept = expireOtherTurns(store, "t2");
     expect(Object.keys(kept.grants)).toEqual(["g2"]);
-  });
-
-  test("detectExplicitOptIn recognizes explicit phrases only", () => {
-    expect(detectExplicitOptIn("please /rlm summarize")).toBe(true);
-    expect(detectExplicitOptIn("use pi-rlm on this repo")).toBe(true);
-    expect(detectExplicitOptIn("run an RLM over the logs")).toBe(true);
-    expect(detectExplicitOptIn("just summarize this file")).toBe(false);
   });
 });

@@ -17,7 +17,6 @@ import {
   canonicalStringify,
   compileShorthand,
   consumeGrant,
-  detectExplicitOptIn,
   emptyGrantStore,
   mintGrant,
   normalizeProgram,
@@ -36,7 +35,8 @@ import { PiModelClient } from "./src/shell/model/pi-model.ts";
 
 export const LAUNCH_SNIPPET =
   "pi-rlm runs long-context recursive model/agent workflows in a sandboxed JS controller. " +
-  "Start one explicitly with the /rlm command or by asking to 'use pi-rlm'. Do not start runs for ordinary tasks.";
+  "Use /rlm for a direct host launch; rlm_run always requires exact-request host confirmation. " +
+  "Do not propose it for ordinary tasks.";
 
 const envModel = (key: string, fallback: string): string => process.env[key] ?? fallback;
 
@@ -162,20 +162,17 @@ export interface RlmExtensionDependencies {
   readonly grantTtlMs?: number;
 }
 
-interface PromptState {
-  readonly sessionId: string;
-  readonly promptSha256: string;
-  readonly explicit: boolean;
-  readonly expiresAtMs: number;
-  explicitAssigned: boolean;
+interface LaunchReservation {
+  readonly toolCallId: string;
+  readonly requestSha256: string;
 }
 
-interface ActiveTurn {
+interface InputCorrelation {
   readonly sessionId: string;
-  readonly turnNonce: string;
   readonly promptSha256: string;
-  readonly explicitExpiresAtMs: number;
-  explicitAvailable: boolean;
+  readonly expiresAtMs: number;
+  currentTurnNonce?: string;
+  reservation?: LaunchReservation;
 }
 
 interface LaunchBinding {
@@ -203,20 +200,23 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
-  let promptState: PromptState | undefined;
-  let activeTurn: ActiveTurn | undefined;
+  let inputCorrelation: InputCorrelation | undefined;
   let grantStore = emptyGrantStore();
   const pendingToolCalls = new Set<string>();
   const consumedToolCalls = new Set<string>();
 
   const bindingFor = (ctx: ExtensionContext): LaunchBinding | undefined => {
-    if (!activeTurn) return undefined;
+    if (!inputCorrelation) return undefined;
     const sessionId = ctx.sessionManager.getSessionId();
-    if (activeTurn.sessionId !== sessionId) return undefined;
+    if (inputCorrelation.sessionId !== sessionId || now() >= inputCorrelation.expiresAtMs) {
+      inputCorrelation = undefined;
+      return undefined;
+    }
+    if (inputCorrelation.currentTurnNonce === undefined) return undefined;
     return {
       sessionId,
-      turnNonce: activeTurn.turnNonce,
-      promptSha256: activeTurn.promptSha256,
+      turnNonce: inputCorrelation.currentTurnNonce,
+      promptSha256: inputCorrelation.promptSha256,
     };
   };
 
@@ -274,42 +274,30 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   };
 
   pi.on("input", (event, ctx) => {
-    promptState = {
+    inputCorrelation = {
       sessionId: ctx.sessionManager.getSessionId(),
       promptSha256: sha256(event.text),
-      explicit: detectExplicitOptIn(event.text),
       expiresAtMs: now() + grantTtlMs,
-      explicitAssigned: false,
     };
   });
 
   pi.on("turn_start", (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    if (!promptState || promptState.sessionId !== sessionId) {
-      activeTurn = undefined;
+    if (!inputCorrelation || inputCorrelation.sessionId !== sessionId || now() >= inputCorrelation.expiresAtMs) {
+      inputCorrelation = undefined;
       return;
     }
-    const explicitAvailable = promptState.explicit && !promptState.explicitAssigned && now() < promptState.expiresAtMs;
-    promptState.explicitAssigned = true;
-    activeTurn = {
-      sessionId,
-      turnNonce: `${event.turnIndex}:${event.timestamp}`,
-      promptSha256: promptState.promptSha256,
-      explicitExpiresAtMs: promptState.expiresAtMs,
-      explicitAvailable,
-    };
+    inputCorrelation.currentTurnNonce = `${event.turnIndex}:${event.timestamp}`;
   });
 
   pi.on("turn_end", () => {
-    activeTurn = undefined;
+    if (inputCorrelation) delete inputCorrelation.currentTurnNonce;
   });
   pi.on("agent_end", () => {
-    activeTurn = undefined;
-    promptState = undefined;
+    inputCorrelation = undefined;
   });
   pi.on("session_shutdown", () => {
-    activeTurn = undefined;
-    promptState = undefined;
+    inputCorrelation = undefined;
     grantStore = emptyGrantStore();
     pendingToolCalls.clear();
     consumedToolCalls.clear();
@@ -365,9 +353,9 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     label: "RLM Run",
     description: [
       "Run a long-context recursive model/agent workflow (pi-rlm).",
-      "Use only after explicit user opt-in ('use pi-rlm' / '/rlm'); not for ordinary tasks.",
+      "Use only when the user requests it; prompt wording is never launch authority.",
       "Provide { objective, context } for the shorthand, or { program, sources } for a typed program.",
-      "Requires a host-owned, exact-request, one-shot grant before spending.",
+      "Requires interactive host confirmation and a host-owned, exact-request, one-shot grant before spending.",
     ].join(" "),
     promptSnippet: "rlm_run: start an explicitly requested recursive long-context program",
     promptGuidelines: [
@@ -381,29 +369,28 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       if (pendingToolCalls.has(callKey) || consumedToolCalls.has(callKey))
         return denied("RLM_GRANT_REPLAY: this tool call was already authorized or consumed.");
       pendingToolCalls.add(callKey);
+      let reservedCorrelation: InputCorrelation | undefined;
+      let consumedCorrelation = false;
       try {
+        if (!ctx.hasUI)
+          return denied("RLM_OPT_IN_REQUIRED: rlm_run requires interactive exact-request confirmation; use /rlm for a direct host launch.");
         const built = buildRequest(params as LaunchParams);
         if (!built.ok)
           return { content: [{ type: "text", text: built.message }], details: { status: "invalid" } };
         const initialBinding = bindingFor(ctx);
-        if (!initialBinding)
-          return denied("RLM_OPT_IN_REQUIRED: no current Pi user turn is available for a launch grant.");
+        if (!initialBinding || !inputCorrelation)
+          return denied("RLM_OPT_IN_REQUIRED: no current Pi user-turn correlation is available for confirmation.");
         const expectedHash = requestSha256(built.value);
+        if (inputCorrelation.reservation)
+          return denied("RLM_GRANT_REPLAY: this user input is already reserved by another rlm_run call.");
+        inputCorrelation.reservation = { toolCallId, requestSha256: expectedHash };
+        reservedCorrelation = inputCorrelation;
 
-        let mode: GrantMode;
-        if (activeTurn?.explicitAvailable && now() < activeTurn.explicitExpiresAtMs) {
-          activeTurn.explicitAvailable = false;
-          mode = "explicit_prompt";
-        } else {
-          if (!ctx.hasUI)
-            return denied("RLM_OPT_IN_REQUIRED: explicitly request pi-rlm in the current input or use /rlm.");
-          const approved = await ctx.ui.confirm(
-            "Approve exact pi-rlm request?",
-            confirmationMessage(built.value, expectedHash),
-          );
-          if (!approved) return denied("RLM_OPT_IN_REQUIRED: pi-rlm launch was not approved.");
-          mode = "confirmed";
-        }
+        const approved = await ctx.ui.confirm(
+          "Approve exact pi-rlm request?",
+          confirmationMessage(built.value, expectedHash),
+        );
+        if (!approved) return denied("RLM_OPT_IN_REQUIRED: pi-rlm launch was not approved.");
 
         const current = buildRequest(params as LaunchParams);
         const actualHash = current.ok ? requestSha256(current.value) : "invalid-after-approval";
@@ -413,7 +400,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           promptSha256: "missing",
         };
         const authorization = mintAndConsume(
-          mode,
+          "confirmed",
           initialBinding,
           actualBinding,
           expectedHash,
@@ -423,6 +410,8 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         if (!authorization.ok)
           return denied(`${denialCode(authorization.denial)}: pi-rlm launch binding changed before consumption.`);
 
+        consumedCorrelation = true;
+        if (inputCorrelation === reservedCorrelation) inputCorrelation = undefined;
         consumedToolCalls.add(callKey);
         audit(authorization.grant);
         try {
@@ -435,6 +424,13 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           };
         }
       } finally {
+        if (
+          !consumedCorrelation &&
+          reservedCorrelation !== undefined &&
+          inputCorrelation === reservedCorrelation &&
+          reservedCorrelation.reservation?.toolCallId === toolCallId
+        )
+          delete reservedCorrelation.reservation;
         pendingToolCalls.delete(callKey);
       }
     },

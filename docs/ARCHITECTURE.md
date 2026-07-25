@@ -68,14 +68,22 @@ Runtime (`src/runtime`, coordinator):
 
 ## Launch authorization boundary
 
-Launcher prompt guidance is not authority. The extension records the public Pi
-0.80.10 `input` and `turn_start` events in host-owned closure state, uses
-`sessionManager.getSessionId()` for the real session identity, and derives the
-turn binding from Pi's `turnIndex` and `timestamp`. It hashes the exact user
-input and the canonical normalized launch request. A grant also binds the exact
-Pi tool-call ID, expires, and is synchronously removed before runtime or backend
-initialization. Consumed grant metadata is persisted as a `pi-rlm-launch-grant`
-custom entry without source contents.
+Launcher prompt guidance and natural-language phrases are not authority. The
+extension records the public Pi 0.80.10 `input` and `turn_start` events in
+host-owned closure state, uses `sessionManager.getSessionId()` for the real
+session identity, and derives the turn binding from Pi's `turnIndex` and
+`timestamp`. The originating input correlation survives provider continuation
+turns after other tools; a new input, successful consumption, agent end, expiry,
+or session shutdown clears it. `rlm_run` always requires dialog-capable UI and
+confirmation of the canonical normalized request. Headless tool calls fail
+closed regardless of prompt content.
+
+When `rlm_run.execute` starts, it atomically reserves the surviving correlation
+for that exact tool-call ID and request hash. After confirmation, a grant binds
+the session, current continuation turn, originating-input hash, request hash,
+and tool call. It expires and is synchronously removed before runtime or
+backend initialization. Consumed metadata is persisted as a
+`pi-rlm-launch-grant` custom entry without source contents.
 
 Pi 0.80.10 does not expose an opaque turn nonce or the current user entry from a
 tool's `execute` context. Therefore `turnIndex:timestamp` is the strictest
