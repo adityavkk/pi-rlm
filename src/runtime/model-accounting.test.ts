@@ -26,11 +26,11 @@ beforeAll(async () => {
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-accounting-"));
 
-const program = (): RlmProgram => {
+const program = (withEvidenceInput = false): RlmProgram => {
   const normalized = normalizeProgram({
     objective: "account every model effect",
     profile: "default",
-    inputs: [],
+    inputs: withEvidenceInput ? [{ name: "context", adapter: "text", description: "fallback evidence" }] : [],
     outputs: [{ name: "answer", schema: { type: "string" } }],
   });
   if (!normalized.ok) throw new Error("invalid test program");
@@ -172,7 +172,7 @@ describe("tree-wide model accounting", () => {
     const dir = await tmp();
     const model = new MockModelClient(() => "unused");
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir,
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "external" } })),
@@ -188,7 +188,7 @@ describe("tree-wide model accounting", () => {
   test("provider fallback can call the model only through the shared boundary", async () => {
     const model = new MockModelClient(() => usageResponse('{"answer":"provider"}', 3, 4, 0.05, 9));
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor(async (_evidence, _signal, operation) => {
@@ -211,7 +211,7 @@ describe("tree-wide model accounting", () => {
   test("provider extractor that skips its boundary fails instead of becoming free work", async () => {
     const model = new MockModelClient(() => "unused");
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "hidden" } }), "provider"),
@@ -299,7 +299,7 @@ describe("reviewed accounting boundaries", () => {
       }
     }
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "external" } })),
@@ -322,7 +322,7 @@ describe("reviewed accounting boundaries", () => {
       return { ok: true, value: { answer: "external" } };
     });
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, maxConcurrency: 1 },
       extractor,

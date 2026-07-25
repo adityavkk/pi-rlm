@@ -11,7 +11,11 @@ import { throwIfAborted } from "./abort.ts";
 import type { Profile } from "./profile.ts";
 import type { ArtifactDescriptor } from "./state.ts";
 
-export const EXTRACTOR_EVIDENCE_VERSION = "1.0.0";
+export const EXTRACTOR_EVIDENCE_VERSION = "1.1.0";
+
+/** ECMAScript UTF-16 code-unit order; independent of host locale and ICU data. */
+export const compareCodeUnits = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
 
 export interface ExtractorVariableDescriptor {
   readonly name: string;
@@ -29,6 +33,7 @@ export interface ExtractorExactValue {
   readonly key: string;
   readonly value: JsonValue;
   readonly exact: true;
+  readonly required: boolean;
   readonly bytes: number;
 }
 
@@ -36,6 +41,8 @@ export interface ExtractorAnswerCandidate {
   readonly iteration: number;
   readonly value: JsonValue;
   readonly exact: true;
+  /** Invalid submissions are optional; a valid unpersisted answer is required. */
+  readonly required: boolean;
   readonly bytes: number;
   readonly validationErrors: readonly string[];
 }
@@ -50,6 +57,8 @@ export interface ExtractorHandleProjection {
   readonly previewStrategy: "exact" | "head-tail";
   readonly omittedBytes: number;
   readonly truncated: boolean;
+  /** Required handles are represented exactly, never by a preview. */
+  readonly required: boolean;
   readonly references: readonly string[];
 }
 
@@ -70,6 +79,8 @@ export interface ExtractorEvidenceProjection {
   readonly omittedAnswerCandidates: number;
   readonly omittedHandles: number;
   readonly omittedTrajectoryEntries: number;
+  /** Count of represented exact values or content-bearing bounded previews. */
+  readonly substantiveItems: number;
   readonly truncated: boolean;
 }
 
@@ -152,7 +163,7 @@ export const snapshotExtractorJson = (
         return { ok: true, value: out };
       }
       const out = Object.create(null) as Record<string, JsonValue>;
-      for (const key of Object.getOwnPropertyNames(value).sort()) {
+      for (const key of Object.getOwnPropertyNames(value).sort(compareCodeUnits)) {
         const property = Object.getOwnPropertyDescriptor(value, key);
         if (!property?.enumerable) continue;
         if (!("value" in property)) return { ok: false, reason: "accessor property" };
@@ -190,6 +201,8 @@ interface HandleRequest {
   readonly id: string;
   readonly priority: number;
   readonly required: boolean;
+  /** Descriptor size retained even when the backing handle is unavailable. */
+  readonly knownBytes?: number;
   readonly references: Set<string>;
 }
 
@@ -237,14 +250,23 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     reference: string,
     priority: number,
     required: boolean,
+    knownBytes?: number,
   ): void => {
     const mapKey = `${kind}:${id}`;
     const existing = handleRequests.get(mapKey);
     if (existing) {
       existing.references.add(reference);
-      if (priority < existing.priority || (required && !existing.required))
-        handleRequests.set(mapKey, { ...existing, priority: Math.min(priority, existing.priority), required: required || existing.required });
-    } else handleRequests.set(mapKey, { kind, id, priority, required, references: new Set([reference]) });
+      if (priority < existing.priority || (required && !existing.required)
+        || (existing.knownBytes === undefined && knownBytes !== undefined))
+        handleRequests.set(mapKey, {
+          ...existing,
+          priority: Math.min(priority, existing.priority),
+          required: required || existing.required,
+          ...(existing.knownBytes === undefined && knownBytes !== undefined ? { knownBytes } : {}),
+        });
+    } else handleRequests.set(mapKey, {
+      kind, id, priority, required, ...(knownBytes !== undefined ? { knownBytes } : {}), references: new Set([reference]),
+    });
   };
 
   for (const declared of input.program.inputs) {
@@ -262,7 +284,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       bytes: descriptor.bytes,
       mimeType: descriptor.mimeType,
     });
-    requestHandle("context", descriptor.id, `input:${declared.name}`, 3, false);
+    requestHandle("context", descriptor.id, `input:${declared.name}`, 3, false, descriptor.bytes);
   }
 
   const answerCandidates: ExtractorAnswerCandidate[] = [];
@@ -286,6 +308,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     omittedAnswerCandidates: 0,
     omittedHandles: 0,
     omittedTrajectoryEntries: input.entries.length,
+    substantiveItems: 0,
     truncated: input.entries.length > 0,
   }) as unknown as ExtractorEvidenceProjection;
 
@@ -299,6 +322,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       omittedAnswerCandidates: Number.MAX_SAFE_INTEGER,
       omittedHandles: Number.MAX_SAFE_INTEGER,
       omittedTrajectoryEntries: Number.MAX_SAFE_INTEGER,
+      substantiveItems: Number.MAX_SAFE_INTEGER,
       truncated: true,
     } as unknown as JsonValue;
     return jsonBytes(candidate, checkpoint) <= input.profile.extractorEvidenceMaxBytes;
@@ -319,26 +343,39 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     .sort((left, right) => right.iteration - left.iteration);
   for (const entry of candidates) {
     checkpoint();
+    const validationErrors = [...(entry.answerCandidate?.validationErrors ?? [])];
+    const required = validationErrors.length === 0;
     const snapshot = snapshotExtractorJson(entry.answerCandidate?.value, checkpoint);
-    if (!snapshot.ok) return fail("a prior invalid answer candidate is unavailable as safe JSON");
+    if (!snapshot.ok) {
+      omittedItems++;
+      omittedAnswerCandidates++;
+      if (required) return fail("a required answer candidate is unavailable as safe JSON");
+      continue;
+    }
     const bytes = jsonBytes(snapshot.value, checkpoint);
     const candidate: ExtractorAnswerCandidate = {
       iteration: entry.iteration,
       value: snapshot.value,
       exact: true,
+      required,
       bytes,
-      validationErrors: [...(entry.answerCandidate?.validationErrors ?? [])],
+      validationErrors,
     };
     if (bytes > input.profile.extractorValueMaxBytes || bytes > input.profile.extractorValuesMaxBytes - exactValueBytes) {
       omittedBytes = saturatingAdd(omittedBytes, bytes);
       omittedItems++;
       omittedAnswerCandidates++;
-      return fail("a prior invalid answer candidate exceeds safe exact-evidence limits");
+      if (required) return fail("a required answer candidate exceeds safe exact-evidence limits");
+      continue;
     }
     answerCandidates.push(candidate);
     if (!fits()) {
       answerCandidates.pop();
-      return fail("a prior invalid answer candidate does not fit the aggregate evidence limit");
+      omittedBytes = saturatingAdd(omittedBytes, bytes);
+      omittedItems++;
+      omittedAnswerCandidates++;
+      if (required) return fail("a required answer candidate does not fit the aggregate evidence limit");
+      continue;
     }
     exactValueBytes += bytes;
   }
@@ -347,7 +384,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   const keys = Object.keys(workspace).sort((left, right) => {
     const leftPriority = outputNames.has(left) ? 0 : /answer|candidate|final|result/i.test(left) ? 1 : 2;
     const rightPriority = outputNames.has(right) ? 0 : /answer|candidate|final|result/i.test(right) ? 1 : 2;
-    return leftPriority - rightPriority || left.localeCompare(right);
+    return leftPriority - rightPriority || compareCodeUnits(left, right);
   });
   for (const key of keys) {
     checkpoint();
@@ -355,11 +392,21 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     const handle = taggedHandle(value);
     const required = outputNames.has(key);
     if (handle) {
-      requestHandle(handle.kind, handle.id, `workspace:${key}`, required ? 0 : /answer|candidate|final|result/i.test(key) ? 1 : 2, required);
+      const knownBytes = handle.kind === "context"
+        ? input.store.get(handle.id)?.bytes
+        : input.artifacts.get(handle.id)?.descriptor.bytes;
+      requestHandle(
+        handle.kind,
+        handle.id,
+        `workspace:${key}`,
+        required ? 0 : /answer|candidate|final|result/i.test(key) ? 1 : 2,
+        required,
+        knownBytes,
+      );
       continue;
     }
     const bytes = jsonBytes(value, checkpoint);
-    const item: ExtractorExactValue = { key, value, exact: true, bytes };
+    const item: ExtractorExactValue = { key, value, exact: true, required, bytes };
     if (bytes <= input.profile.extractorValueMaxBytes
       && bytes <= input.profile.extractorValuesMaxBytes - exactValueBytes) {
       workspaceValues.push(item);
@@ -380,7 +427,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     if (request.kind === "context") {
       const descriptor = input.store.get(request.id);
       if (!descriptor) return undefined;
-      const exact = descriptor.bytes <= headBytes + tailBytes;
+      const exact = request.required || descriptor.bytes <= headBytes + tailBytes;
       let preview = "";
       let selected = 0;
       if (exact) {
@@ -400,40 +447,49 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
         id: descriptor.id, kind: "context", sha256: descriptor.sha256, bytes: descriptor.bytes,
         preview, previewBytes: selected, previewStrategy: exact ? "exact" : "head-tail",
         omittedBytes: descriptor.bytes - selected, truncated: !exact,
-        references: [...request.references].sort(),
+        required: request.required,
+        references: [...request.references].sort(compareCodeUnits),
       };
     }
     const artifact = input.artifacts.get(request.id);
     if (!artifact) return undefined;
-    const preview = headTailPreview(artifact.text, { headBytes, tailBytes });
+    const preview = request.required
+      ? headTailPreview(artifact.text, { headBytes: artifact.descriptor.bytes, tailBytes: 0 })
+      : headTailPreview(artifact.text, { headBytes, tailBytes });
     return {
       id: artifact.descriptor.id, kind: "artifact", sha256: artifact.descriptor.sha256,
       bytes: artifact.descriptor.bytes, preview: preview.text,
       previewBytes: artifact.descriptor.bytes - preview.omittedBytes,
       previewStrategy: preview.truncated ? "head-tail" : "exact",
       omittedBytes: preview.omittedBytes, truncated: preview.truncated,
-      references: [...request.references].sort(),
+      required: request.required,
+      references: [...request.references].sort(compareCodeUnits),
     };
   };
 
   const sortedHandles = [...handleRequests.values()].sort((left, right) =>
-    left.priority - right.priority || left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id));
+    left.priority - right.priority || compareCodeUnits(left.kind, right.kind) || compareCodeUnits(left.id, right.id));
   for (const request of sortedHandles) {
     checkpoint();
     let headBytes = Math.min(input.profile.extractorHandleHeadBytes, input.profile.contextMaxReadBytes);
     let tailBytes = Math.min(input.profile.extractorHandleTailBytes, input.profile.contextMaxReadBytes);
+    if (request.required && request.kind === "context"
+      && request.knownBytes !== undefined && request.knownBytes > input.profile.contextMaxReadBytes)
+      return fail("a required workspace handle exceeds the exact context read limit");
     let item = makeHandle(request, headBytes, tailBytes);
+    const knownBytes = item?.bytes ?? request.knownBytes;
     if (!item) {
+      omittedBytes = saturatingAdd(omittedBytes, knownBytes ?? 0);
       omittedItems++;
       omittedHandles++;
-      if (request.required) return fail("a required workspace handle is unavailable");
+      if (request.required) return fail("a required workspace handle is unavailable exactly");
       continue;
     }
     for (;;) {
       handles.push(item);
       if (fits()) break;
       handles.pop();
-      if (request.required) return fail("a required workspace handle projection exceeds the aggregate evidence limit");
+      if (request.required) return fail("a required workspace handle does not fit exactly in the aggregate evidence limit");
       if (headBytes + tailBytes <= 2) {
         item = undefined;
         break;
@@ -444,10 +500,13 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       if (!item) break;
     }
     if (!item) {
+      omittedBytes = saturatingAdd(omittedBytes, knownBytes ?? 0);
       omittedItems++;
       omittedHandles++;
       continue;
     }
+    if (request.required && (item.truncated || item.omittedBytes !== 0))
+      return fail("a required workspace handle is not represented exactly");
     omittedBytes = saturatingAdd(omittedBytes, item.omittedBytes);
     if (item.truncated) truncatedItems++;
   }
@@ -480,6 +539,12 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   }
   omittedItems += trajectory.omittedCount;
 
+  const substantiveItems = answerCandidates.length + workspaceValues.length
+    + handles.filter((handle) => handle.previewStrategy === "exact" || handle.previewBytes > 0).length
+    + trajectory.entries.filter((entry) =>
+      byteLength(entry.reasoning) > 0
+      || entry.codePreview.originalBytes - entry.codePreview.omittedBytes > 0
+      || byteLength(entry.outputPreview) > 0).length;
   Object.assign(projection, {
     omittedBytes,
     omittedItems,
@@ -488,8 +553,11 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     omittedAnswerCandidates,
     omittedHandles,
     omittedTrajectoryEntries: trajectory.omittedCount,
+    substantiveItems,
     truncated: omittedBytes > 0 || omittedItems > 0 || truncatedItems > 0,
   });
+  if (substantiveItems === 0)
+    return fail("fallback evidence contains no substantive exact value or bounded content preview");
   let serializedBytes = 0;
   for (let iteration = 0; iteration < 8; iteration++) {
     (projection as { serializedBytes: number }).serializedBytes = serializedBytes;
