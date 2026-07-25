@@ -48,6 +48,8 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
   const commands = new Map<string, CapturedCommand>();
   const events = new Map<string, EventHandler[]>();
   const audits: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const resultEntries: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const resultMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const notifications: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
   const runs: unknown[] = [];
@@ -65,7 +67,11 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     },
     mode: "tui",
     cwd: process.cwd(),
-    sessionManager: { getSessionId: () => sessionId },
+    isProjectTrusted: () => true,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      buildContextEntries: () => [],
+    },
     ui: {
       confirm: async (title: string, message: string) => {
         confirmations.push({ title, message });
@@ -81,8 +87,11 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     registerCommand: (name: string, definition: CapturedCommand) => commands.set(name, definition),
     on: (name: string, handler: EventHandler) => events.set(name, [...(events.get(name) ?? []), handler]),
     appendEntry: (type: string, data: Record<string, unknown>) => {
-      audits.push({ type, data });
-      return `entry-${audits.length}`;
+      (type === "pi-rlm-result" ? resultEntries : audits).push({ type, data });
+      return `entry-${audits.length + resultEntries.length}`;
+    },
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+      resultMessages.push({ message, options });
     },
   };
 
@@ -114,6 +123,8 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     tools,
     commands,
     audits,
+    resultEntries,
+    resultMessages,
     notifications,
     confirmations,
     runs,
@@ -138,7 +149,18 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
   };
 };
 
-const rlmTool = (h: ReturnType<typeof harness>): CapturedTool => h.tools.find((tool) => tool.name === "rlm_run")!;
+const rlmTool = (h: ReturnType<typeof harness>): CapturedTool => {
+  const tool = h.tools.find((candidate) => candidate.name === "rlm_run")!;
+  return {
+    ...tool,
+    execute: (id, params, signal, onUpdate, ctx) => {
+      if (params && typeof params === "object" && !Array.isArray(params)
+        && "objective" in params && !("context" in params) && !("program" in params))
+        (params as Record<string, unknown>)["context"] = "index test source";
+      return tool.execute(id, params, signal, onUpdate, ctx);
+    },
+  };
+};
 
 const pendingOfflineRuntime = (dir: string): {
   readonly dependencies: RlmRuntimeDependencies;
@@ -627,7 +649,7 @@ describe("pi-rlm extension wiring", () => {
 
   test("/rlm mints, consumes, and audits its own one-shot command grant", async () => {
     const h = harness();
-    await h.commands.get("rlm")!.handler("Summarize the notes", h.ctx);
+    await h.commands.get("rlm")!.handler('{"objective":"Summarize the notes","context":"fixture notes"}', h.ctx);
     expect(h.runs).toHaveLength(1);
     expect(h.audits).toHaveLength(1);
     expect(h.audits[0]?.data["mode"]).toBe("slash_command");
@@ -698,7 +720,7 @@ describe("pi-rlm extension wiring", () => {
     } });
     await h.startTurn("Use pi-rlm for this preflight run");
     const result = await rlmTool(h).execute("call-preflight", { objective: "Preflight" }, undefined, undefined, h.ctx);
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     expect(directoryCalls).toBe(0);
   });
 
@@ -729,12 +751,12 @@ describe("pi-rlm extension wiring", () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-command-"));
     const offline = pendingOfflineRuntime(dir);
     const h = harness({ runtime: offline.dependencies });
-    const pending = h.commands.get("rlm")!.handler("Wait offline", h.ctx);
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Wait offline","context":"fixture"}', h.ctx);
     await offline.started;
     await h.emit(eventName, event);
     await pending;
 
-    expect(h.notifications.at(-1)).toContain("cancelled");
+    expect(h.resultMessages.at(-1)?.message["content"]).toContain('"status":"cancelled"');
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -767,7 +789,7 @@ describe("pi-rlm extension wiring", () => {
       expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
       const text = result.content[0]?.text ?? "";
       expect(text.match(/RETENTION_METADATA_FAILED/g)).toHaveLength(1);
-      expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+      expect(text).toContain('"warningCodes":["RETENTION_METADATA_FAILED"]');
       expect(text).not.toContain("failed before producing a result");
       const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
       expect(warningAudit?.data["runId"]).toBe(journalRunId);
@@ -807,7 +829,7 @@ describe("pi-rlm extension wiring", () => {
       const warnings = text.match(/RETENTION_METADATA_FAILED/g) ?? [];
       expect(warnings).toHaveLength(fault === "unlink" ? 0 : 1);
       if (fault !== "unlink")
-        expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+        expect(text).toContain('"warningCodes":["RETENTION_METADATA_FAILED"]');
       const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
       expect(warningAudit?.data["codes"] ?? []).toEqual(fault === "unlink" ? [] : ["RETENTION_METADATA_FAILED"]);
       const listing = await new ManagedRunStore({ root: stateRoot }).list();
@@ -858,7 +880,7 @@ describe("pi-rlm extension wiring", () => {
   test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-"));
     const { result } = await managedStatusRun("failed", { root: stateRoot }, () => " invalid nonce ");
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     const listing = await new ManagedRunStore({ root: stateRoot }).list();
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs[0]).toMatchObject({ activity: "stale", metadata: { status: "active" } });
@@ -880,7 +902,7 @@ describe("pi-rlm extension wiring", () => {
       root: stateRoot,
       metadataFileSystem: releaseFaultFileSystem(fault),
     }, () => " invalid nonce ");
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     expect(result.content[0]?.text ?? "").not.toContain("RETENTION_METADATA_FAILED");
     const listing = await new ManagedRunStore({ root: stateRoot }).list();
     expect(listing.runs).toHaveLength(1);

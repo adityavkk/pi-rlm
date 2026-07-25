@@ -57,18 +57,34 @@ entry in `package.json`.
 
 Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
 
-- Slash command (host initiated):
+- Slash command (host initiated), using one of these exact forms:
 
-  ```
-  /rlm Summarize the contradictions across these design notes
+  ```text
+  /rlm {"objective":"Summarize contradictions","context":"inline notes..."}
+  /rlm {"program":{"objective":"...","inputs":[],"outputs":[{"name":"answer","schema":{"type":"string"}}],"profile":"default"}}
+  /rlm --file "relative/path.md" -- Summarize contradictions
+  /rlm --session -- Summarize the active conversation branch
   ```
 
-- Tool call (model initiated): `rlm_run` accepts either `{ objective, context }`
-  or a typed `{ program, sources }`. Interactive modes always display the
-  normalized objective, program shape, source identity, and exact request hash
+  Bare objectives, trailing arguments, malformed JSON, and incomplete sources
+  fail with a typed `RLM_SOURCE_*` result before authorization or runtime setup.
+  Inline and file sources are capped at 64 MiB UTF-8. Session projection is
+  compaction-aware and capped at 16 MiB and 10,000 active entries.
+
+- Tool call (model initiated): `rlm_run` accepts either a non-empty
+  `{ objective, context }` or a typed `{ program, sources }`. A typed program
+  may omit `sources` only when it declares zero inputs; every declared input
+  otherwise requires a present, non-whitespace string. Interactive modes always
+  display the normalized objective, program shape, source identity, and exact request hash
   for host confirmation. Prompt text, including phrases such as "use pi-rlm",
   is guidance only and never authorizes spend. Every headless `rlm_run` call
   fails with `RLM_OPT_IN_REQUIRED`; there is no phrase or environment bypass.
+
+Command results are delivered as bounded, visible `pi-rlm-result` custom
+messages plus metadata-only custom entries. Tool results use the same bounded
+projection directly and never inject another message. Answers at most 64 KiB
+are included in full; larger answers use a deterministic head/tail preview and
+the content-addressed output descriptor remains authoritative.
 
 Completed, failed, and cancelled extension runs are retained under a private,
 host-owned state root for future recovery and bounded by age, count, and exact
@@ -147,6 +163,20 @@ bun run typecheck # strict TypeScript
 
 The full design lives in the
 [agent-spells design suite](https://github.com/adityavkk/agent-spells/blob/main/docs/design/pi-rlm.md).
+
+## Pi 0.80.10 limitations
+
+Node does not expose an `openat`-style directory capability. File capture checks
+real containment, stable non-symlink parents, `O_NOFOLLOW` where available,
+regular-file/single-link metadata, size stability, and fatal UTF-8 decoding, but
+a same-user adversary can still race pathname components between checks.
+Project file sources therefore require Pi project trust and are not an OS
+sandbox.
+
+`pi.sendMessage()` reports synchronous delivery failures only. Pi 0.80.10 does
+not expose later asynchronous session-persistence failures to extensions, and
+in-memory/ephemeral sessions cannot make a result durable across process exit.
+A synchronous failure is audited without retrying or rerunning the RLM.
 
 ## Downside
 

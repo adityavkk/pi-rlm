@@ -93,6 +93,30 @@ not described as a Pi-issued nonce. Missing correlation fails closed. `/rlm`
 bypasses the agent turn lifecycle, so the command handler creates a unique
 host-owned command nonce and immediately consumes its bound grant.
 
+## Command source and result boundary
+
+The command boundary accepts only strict inline JSON, trusted relative project
+files, or the active compaction-aware session branch. It completes source
+capture, completeness checks, UTF-8 and aggregate bounds before request hashing,
+grant creation, launch audit, component initialization, or managed-directory
+allocation. File capture never records the submitted path. Session projection
+includes role-delimited user/assistant text, compaction and branch summaries,
+and labeled textual custom messages; system messages, thinking, tools and tool
+results, images, settings, and extension details/data are excluded.
+
+A completed runtime result carries the full `ctx_<sha256>` descriptor from the
+authoritative root `answer_committed` event. Command and tool surfaces share one
+bounded projection: full canonical answer through 64 KiB, otherwise a
+deterministic UTF-8 head/tail preview with omitted-byte metadata. Command
+results use public `appendEntry` for metadata and `sendMessage` for one visible,
+non-triggering custom message. Tool results are already durable Pi tool results
+and do not send a second message. Notifications are not used for terminal data.
+
+Pi 0.80.10 exposes synchronous `sendMessage` failures but not later asynchronous
+persistence failures. Synchronous failure gets one bounded metadata audit and
+never retries the run; ephemeral sessions remain durable only for their process
+lifetime.
+
 ## Invariants
 
 - Full source content never enters a model request unless a bounded slice was

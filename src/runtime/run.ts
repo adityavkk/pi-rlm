@@ -100,6 +100,8 @@ export interface RunResult {
   readonly status: "completed" | "failed" | "cancelled";
   readonly completionMode?: "answer" | "fallback_extract";
   readonly answer?: JsonValue;
+  /** Content-addressed descriptor from the authoritative answer_committed event. */
+  readonly output?: { readonly ref: string; readonly sha256: string; readonly bytes: number };
   readonly error?: RunError;
   readonly warnings?: readonly RunWarning[];
   readonly ledger: Ledger;
@@ -200,6 +202,21 @@ type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | 
 const isTerminalEvent = (event: RlmEvent): event is TerminalEvent =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
 
+const outputFromEvents = (
+  events: readonly RlmEvent[],
+  rootFrameId: string,
+  result: PlannedResult,
+): RunResult["output"] => {
+  if (result.status !== "completed" || result.completionMode === undefined) return undefined;
+  const committed = events.find((event): event is Extract<RlmEvent, { type: "answer_committed" }> =>
+    event.type === "answer_committed" && event.frameId === rootFrameId && event.completionMode === result.completionMode);
+  if (!committed || committed.outputSha256 === undefined || committed.outputBytes === undefined) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(committed.outputSha256)
+    || committed.outputRef !== `ctx_${committed.outputSha256}`
+    || !Number.isSafeInteger(committed.outputBytes) || committed.outputBytes < 0) return undefined;
+  return { ref: committed.outputRef, sha256: committed.outputSha256, bytes: committed.outputBytes };
+};
+
 const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): PlannedResult => {
   if (event.type === "run_completed") {
     return {
@@ -246,7 +263,7 @@ const finalize = async (
       if (!observeDurableFailure(error)) throw error;
     }
   };
-  const finish = (result: PlannedResult): RunResult => {
+  const finish = (result: PlannedResult, events: readonly RlmEvent[] = []): RunResult => {
     const warnings: RunWarning[] = [];
     if (journal.statusCacheFailures().length > 0) {
       const cause = safeCause(journal.statusCacheFailures()[0]?.cause);
@@ -264,7 +281,8 @@ const finalize = async (
         ...(cause ? { cause } : {}),
       });
     }
-    return { ...result, ...(warnings.length > 0 ? { warnings } : {}), ledger: ledgerRef.current };
+    const output = outputFromEvents(events, rootFrameId, result);
+    return { ...result, ...(output ? { output } : {}), ...(warnings.length > 0 ? { warnings } : {}), ledger: ledgerRef.current };
   };
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -278,7 +296,7 @@ const finalize = async (
       const scanned = await journal.readEvents();
       if (!scanned.ok) throw scanned.error;
       const existingTerminal = scanned.value.find(isTerminalEvent);
-      if (existingTerminal) return finish(resultFromTerminal(existingTerminal, initial));
+      if (existingTerminal) return finish(resultFromTerminal(existingTerminal, initial), scanned.value);
       if (drainFailure !== undefined && !observeDurableFailure(drainFailure)) {
         planned = failure(initial.runId, "JOURNAL_FAILED", "failed to finalize run journal", drainFailure);
       }
@@ -316,13 +334,13 @@ const finalize = async (
       const finalized = await journal.readEvents();
       if (!finalized.ok) throw finalized.error;
       const committedTerminal = finalized.value.find(isTerminalEvent);
-      if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial));
+      if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial), finalized.value);
       throw new Error("terminal event was not committed");
     } catch (error) {
       try {
         const rescued = await journal.readEvents();
         const committedTerminal = rescued.ok ? rescued.value.find(isTerminalEvent) : undefined;
-        if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial));
+        if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial), rescued.ok ? rescued.value : []);
       } catch {
         // Preserve the original finalization failure classification.
       }
