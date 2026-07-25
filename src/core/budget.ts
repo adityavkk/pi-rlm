@@ -9,7 +9,7 @@
 
 import { type CallError, callError } from "./errors.ts";
 import { err, ok, type Result } from "./result.ts";
-import { MAX_CALL_TOKENS } from "./usage.ts";
+import { MAX_CALL_COST_USD, MAX_CALL_DURATION_MS, MAX_CALL_TOKENS, type CallUsage } from "./usage.ts";
 
 export interface BudgetLimits {
   readonly maxDepth: number;
@@ -31,6 +31,10 @@ export interface BudgetUsage {
   readonly activeLeafCalls: number;
   readonly tokensReserved: number;
   readonly tokensUsed: number;
+  readonly inputTokensUsed: number;
+  readonly outputTokensUsed: number;
+  readonly costUsd: number;
+  readonly providerDurationMs: number;
   readonly storedBytes: number;
 }
 
@@ -47,6 +51,10 @@ export const ZERO_USAGE: BudgetUsage = {
   activeLeafCalls: 0,
   tokensReserved: 0,
   tokensUsed: 0,
+  inputTokensUsed: 0,
+  outputTokensUsed: 0,
+  costUsd: 0,
+  providerDurationMs: 0,
   storedBytes: 0,
 };
 
@@ -118,19 +126,58 @@ export const settleAttempt = (
   ledger: Ledger,
   reservedTokens: number,
   actualTokens: number,
+): Result<Ledger, CallError> => settleAccounting(ledger, reservedTokens, actualTokens, 0, 0, 0, 0);
+
+const settleAccounting = (
+  ledger: Ledger,
+  reservedTokens: number,
+  actualTokens: number,
+  inputTokens: number,
+  outputTokens: number,
+  costUsd: number,
+  durationMs: number,
 ): Result<Ledger, CallError> => {
   if (!Number.isSafeInteger(ledger.usage.tokensReserved) || ledger.usage.tokensReserved < 0
-    || !Number.isSafeInteger(ledger.usage.tokensUsed) || ledger.usage.tokensUsed < 0)
+    || !Number.isSafeInteger(ledger.usage.tokensUsed) || ledger.usage.tokensUsed < 0
+    || !Number.isSafeInteger(ledger.usage.inputTokensUsed) || ledger.usage.inputTokensUsed < 0
+    || !Number.isSafeInteger(ledger.usage.outputTokensUsed) || ledger.usage.outputTokensUsed < 0
+    || !Number.isFinite(ledger.usage.costUsd) || ledger.usage.costUsd < 0
+    || !Number.isSafeInteger(ledger.usage.providerDurationMs) || ledger.usage.providerDurationMs < 0)
     return err(callError("INVALID_RESULT", "invalid ledger accounting"));
   if (!Number.isSafeInteger(reservedTokens) || reservedTokens < 0 || reservedTokens > ledger.usage.tokensReserved)
     return err(callError("INVALID_RESULT", "invalid token reservation settlement"));
   if (!Number.isSafeInteger(actualTokens) || actualTokens < 0 || actualTokens > MAX_CALL_TOKENS
-    || ledger.usage.tokensUsed > Number.MAX_SAFE_INTEGER - actualTokens)
-    return err(callError("INVALID_RESULT", "invalid reported token usage"));
+    || !Number.isSafeInteger(inputTokens) || inputTokens < 0 || inputTokens > MAX_CALL_TOKENS
+    || !Number.isSafeInteger(outputTokens) || outputTokens < 0 || outputTokens > MAX_CALL_TOKENS
+    || inputTokens + outputTokens > actualTokens
+    || !Number.isFinite(costUsd) || costUsd < 0 || costUsd > MAX_CALL_COST_USD
+    || !Number.isSafeInteger(durationMs) || durationMs < 0 || durationMs > MAX_CALL_DURATION_MS
+    || ledger.usage.tokensUsed > Number.MAX_SAFE_INTEGER - actualTokens
+    || ledger.usage.inputTokensUsed > Number.MAX_SAFE_INTEGER - inputTokens
+    || ledger.usage.outputTokensUsed > Number.MAX_SAFE_INTEGER - outputTokens
+    || ledger.usage.providerDurationMs > Number.MAX_SAFE_INTEGER - durationMs
+    || !Number.isFinite(ledger.usage.costUsd + costUsd))
+    return err(callError("INVALID_RESULT", "invalid reported provider usage"));
   return ok(patch(ledger, {
     tokensReserved: ledger.usage.tokensReserved - reservedTokens,
     tokensUsed: ledger.usage.tokensUsed + actualTokens,
+    inputTokensUsed: ledger.usage.inputTokensUsed + inputTokens,
+    outputTokensUsed: ledger.usage.outputTokensUsed + outputTokens,
+    costUsd: ledger.usage.costUsd + costUsd,
+    providerDurationMs: ledger.usage.providerDurationMs + durationMs,
   }));
+};
+
+/** Settle all finite provider-reported accounting for one reserved attempt. */
+export const settleAttemptUsage = (
+  ledger: Ledger,
+  reservedTokens: number,
+  usage: CallUsage,
+): Result<Ledger, CallError> => {
+  const input = usage.inputTokens ?? 0;
+  const output = usage.outputTokens ?? 0;
+  const total = usage.totalTokens ?? input + output;
+  return settleAccounting(ledger, reservedTokens, total, input, output, usage.costUsd ?? 0, usage.durationMs);
 };
 
 /** Try to acquire a leaf concurrency slot. `"saturated"` means the scheduler must wait. */
@@ -171,6 +218,10 @@ export interface BudgetView {
   readonly controllerTurnsUsed: number;
   readonly controllerTurnsRemaining: number;
   readonly reportedTokensUsed: number;
+  readonly reportedInputTokensUsed: number;
+  readonly reportedOutputTokensUsed: number;
+  readonly reportedCostUsd: number;
+  readonly providerDurationMs: number;
   readonly reportedTokensReserved: number;
   readonly reportedTokenLimit?: number;
   readonly storedBytesUsed: number;
@@ -193,6 +244,10 @@ export const budgetView = (ledger: Ledger, depth: number): BudgetView => {
     controllerTurnsUsed: usage.controllerTurns,
     controllerTurnsRemaining: Math.max(0, limits.maxControllerTurns - usage.controllerTurns),
     reportedTokensUsed: usage.tokensUsed,
+    reportedInputTokensUsed: usage.inputTokensUsed,
+    reportedOutputTokensUsed: usage.outputTokensUsed,
+    reportedCostUsd: usage.costUsd,
+    providerDurationMs: usage.providerDurationMs,
     reportedTokensReserved: usage.tokensReserved,
     ...(limits.tokenLimit !== undefined ? { reportedTokenLimit: limits.tokenLimit } : {}),
     storedBytesUsed: usage.storedBytes,

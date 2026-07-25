@@ -6,6 +6,7 @@ export * from "./model-controller.ts";
 export * from "./controller-prompt.ts";
 export * from "./call-result.ts";
 export * from "./extractor.ts";
+export { DEFAULT_MAX_OUTPUT_TOKENS, ModelInvocationError, tokenReservation } from "./provider.ts";
 export * from "./semaphore.ts";
 export type { FrameResult } from "./frame.ts";
 export type { RunState, FrameRef, ArtifactDescriptor } from "./state.ts";

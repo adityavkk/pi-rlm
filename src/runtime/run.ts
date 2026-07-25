@@ -22,6 +22,7 @@ import { persistAnswer } from "./answer-persistence.ts";
 import type { ControllerDriver } from "./controller.ts";
 import type { Extractor } from "./extractor.ts";
 import { runFrame } from "./frame.ts";
+import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, RunState } from "./state.ts";
@@ -110,6 +111,8 @@ const exceptionResult = (
       ? failure(runId, "BUDGET_DEADLINE", "run deadline reached")
       : cancellation(runId);
   }
+  if (error instanceof ModelInvocationError)
+    return failure(runId, error.callError.code, error.callError.message, error);
   if (error instanceof ContextBudgetError)
     return failure(runId, "BUDGET_BYTES", "stored byte limit reached", error);
   if (error instanceof JournalAppendError)
@@ -386,12 +389,14 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       callCache: new Map(),
       inflight: new Map(),
       keyIdentities: new Map(),
+      scopeUsage: new Map(),
       semaphore: new Semaphore(profile.maxConcurrency),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
     };
     const rootFrame: FrameRef = {
       frameId: rootFrameId,
+      lineage: rootFrameId,
       depth: 0,
       objective: input.program.objective,
       inputs,
@@ -405,6 +410,8 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       planned = failure(runId, "BUDGET_DEADLINE", "run deadline reached");
     } else if (result.cancelled) {
       planned = cancellation(runId);
+    } else if (result.providerError) {
+      planned = failure(runId, result.providerError.code, result.providerError.message);
     } else if (result.terminal) {
       planned = failure(runId, result.terminal.code, result.terminal.message);
     } else if (result.answer !== undefined) {
@@ -421,7 +428,23 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
         workspace: result.workspace ?? {},
         trajectory: projectTrajectory(result.entries ?? [], profile.trajectory),
       };
-      const extracted = await waitForAbort(input.extractor.extract(evidence, scope.signal), scope.signal);
+      const operation = createModelOperation(state, rootFrame, {
+        operationId: `${runId}:extractor`,
+        kind: "extractor",
+        key: "fallback",
+        signal: scope.signal,
+        deadlineMs: limits.deadlineMs,
+      });
+      const extracted = input.extractor.accountingMode === "provider"
+        ? await waitForAbort(input.extractor.extract(evidence, scope.signal, {
+            complete: (request) => operation.complete(state.model, request),
+          }), scope.signal)
+        : await operation.runExternal(() => input.extractor!.extract(evidence, scope.signal));
+      if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
+        throw new ModelInvocationError(
+          { code: "INVALID_REQUEST", message: "provider extractor returned without using the accounting boundary", retryable: false },
+          operation.usage,
+        );
       throwIfAborted(scope.signal);
       if (extracted.ok) {
         phase = "context";

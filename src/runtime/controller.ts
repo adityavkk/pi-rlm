@@ -7,7 +7,9 @@ import type { BudgetView } from "../core/budget.ts";
 import type { JsonValue } from "../core/json.ts";
 import type { RlmOutputField } from "../core/program.ts";
 import type { TrajectoryProjection } from "../core/trajectory.ts";
+import type { CallUsage } from "../core/usage.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
+import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 
 export interface FrameState {
   readonly frameId: string;
@@ -27,7 +29,13 @@ export interface Cell {
   readonly code: string;
 }
 
+export interface ControllerModelOperation {
+  readonly usage: CallUsage;
+  complete(client: ModelClient, request: ModelRequest): Promise<ModelResponse>;
+}
+
 export interface ControllerDriver {
-  next(state: FrameState, signal: AbortSignal): Promise<Cell>;
+  /** Drivers must perform provider work only through `operation.complete`. */
+  next(state: FrameState, signal: AbortSignal, operation: ControllerModelOperation): Promise<Cell>;
   fork(childObjective: string, childFrameId: string): ControllerDriver;
 }

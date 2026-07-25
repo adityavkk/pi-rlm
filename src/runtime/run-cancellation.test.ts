@@ -204,7 +204,9 @@ describe("run cancellation and terminal finalization", () => {
     const result = await within(run);
     expect(result.status).toBe("cancelled");
     expect(calls).toBe(1);
-    expect(result.ledger.usage.logicalCalls).toBe(0);
+    expect(result.ledger.usage.logicalCalls).toBe(1);
+    expect(result.ledger.usage.attempts).toBe(1);
+    expect(result.ledger.usage.activeLeafCalls).toBe(0);
     expect(result.ledger.usage.tokensReserved).toBe(0);
     const before = await readFile(join(dir, "events.jsonl"), "utf8");
     const ledgerBefore = JSON.stringify(result.ledger);
@@ -236,7 +238,9 @@ describe("run cancellation and terminal finalization", () => {
     owner.abort();
     const result = await within(run);
     const closed = (await events(dir)).filter((event) => event.type === "frame_closed");
-    expect(closed.map((event) => event.frameId)).toEqual([`${result.runId}:f1`, `${result.runId}:f0`]);
+    expect(closed).toHaveLength(2);
+    expect(closed[0]?.frameId).not.toBe(`${result.runId}:f0`);
+    expect(closed[1]?.frameId).toBe(`${result.runId}:f0`);
     expect(closed.every((event) => event.type === "frame_closed" && event.state === "cancelled")).toBe(true);
     await expectSingleTerminal(dir, result);
   });

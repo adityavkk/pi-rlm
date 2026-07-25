@@ -62,6 +62,7 @@ const brokerState = async (model: ModelClient, runId: string): Promise<RunState>
     callCache: new Map(),
     inflight: new Map(),
     keyIdentities: new Map(),
+    scopeUsage: new Map(),
     semaphore: new Semaphore(1),
     contextSemaphore: new Semaphore(1),
     frameSeq: { current: 1 },
@@ -128,6 +129,7 @@ describe("dispatchCall cancellation ownership", () => {
       callCache: new Map(),
       inflight: new Map(),
       keyIdentities: new Map(),
+      scopeUsage: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
@@ -162,7 +164,7 @@ describe("dispatchCall cancellation ownership", () => {
       while (state.inflight.size !== 2) await new Promise((resolve) => setTimeout(resolve, 1));
     })());
     expect(state.inflight.size).toBe(2);
-    expect(state.ledger.current.usage.logicalCalls).toBe(2);
+    expect(state.ledger.current.usage.logicalCalls).toBe(1);
 
     waiterAbort.abort();
     const waiterResult = await within(waiter);
@@ -175,7 +177,9 @@ describe("dispatchCall cancellation ownership", () => {
     clearTimeout(holderDeadline);
     expect(holderResult.error?.code).toBe("CANCELLED");
     expect(state.inflight.size).toBe(0);
-    expect(state.ledger.current.usage.logicalCalls).toBe(0);
+    expect(state.ledger.current.usage.logicalCalls).toBe(1);
+    expect(state.ledger.current.usage.attempts).toBe(1);
+    expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(state.callCache.size).toBe(0);
 
@@ -234,6 +238,7 @@ describe("dispatchCall cancellation ownership", () => {
       callCache: new Map(),
       inflight: new Map(),
       keyIdentities: new Map(),
+      scopeUsage: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
@@ -326,7 +331,8 @@ describe("dispatchCall cancellation ownership", () => {
         new AbortController().signal,
         Date.now() + 5_000,
       ) as GuestCallResult;
-      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" }, usage: ZERO_CALL_USAGE });
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" }, usage: { attempts: 1 } });
+      expect(result.usage.durationMs).toBeGreaterThanOrEqual(0);
       expect(state.ledger.current.usage.tokensReserved).toBe(0);
       expect(state.ledger.current.usage.tokensUsed).toBe(0);
       expect(Object.values(state.ledger.current.usage).every(Number.isSafeInteger)).toBe(true);
@@ -432,17 +438,17 @@ describe("dispatchCall cancellation ownership", () => {
     }
 
     expect(getterCalls).toBe(0);
-    expect(results[0]).toMatchObject({ ok: false, error: { code: "FAILED" }, usage: ZERO_CALL_USAGE });
+    expect(results[0]).toMatchObject({ ok: false, error: { code: "FAILED" }, usage: { attempts: 1, durationMs: 0 } });
     expect(results[0]?.error?.details).toBeUndefined();
     expect(results[1]?.error?.details).toBeUndefined();
-    expect(results[1]?.usage).toEqual(ZERO_CALL_USAGE);
+    expect(results[1]?.usage).toEqual({ attempts: 1, durationMs: 0 });
     expect(results[2]).toMatchObject({
       error: { details: { usage: { attempts: 1, durationMs: 2 } } },
       usage: { attempts: 1, durationMs: 2 },
     });
     expect(JSON.stringify(results[2])).not.toContain("cycle");
     expect(results[3]?.error?.details).toBeUndefined();
-    expect(results[3]?.usage).toEqual(ZERO_CALL_USAGE);
+    expect(results[3]?.usage).toEqual({ attempts: 1, durationMs: 0 });
     expect(JSON.stringify(results)).not.toContain("pppppppp");
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(state.ledger.current.usage.tokensUsed).toBe(0);

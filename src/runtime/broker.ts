@@ -6,29 +6,21 @@
  * (guest-catchable); call failures return a typed CallResult.
  */
 
-import { releaseLogicalCall, reserveAttempt, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
-import { callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
+import { releaseLogicalCall, reserveLogicalCall } from "../core/budget.ts";
+import { callError } from "../core/errors.ts";
 import { deriveCallId, identityHash, type CallKind } from "../core/ids.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
 import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
-import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
-import {
-  addUsage,
-  MAX_CALL_ATTEMPTS,
-  MAX_CALL_COST_USD,
-  MAX_CALL_DURATION_MS,
-  MAX_CALL_TOKENS,
-  normalizeCallUsage,
-  ZERO_CALL_USAGE,
-} from "../core/usage.ts";
+import { MAX_CALL_TOKENS, type CallUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import type { ContextDescriptor, ContextOperationControl } from "../shell/context-store.ts";
 import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
-import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
+import { createModelOperation, DEFAULT_MAX_OUTPUT_TOKENS, ModelInvocationError } from "./provider.ts";
+export { tokenReservation } from "./provider.ts";
 import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
 import { remainingStoredBytes, reserveStoredBytes, retainedJsonBytes } from "./stored-bytes.ts";
 
@@ -107,7 +99,10 @@ interface KeyClaim {
   readonly identity: JsonValue;
 }
 
-const keyRegistryId = (kind: CallKind, key: string): string => `${kind}\u0000${key}`;
+const keyRegistryId = (kind: CallKind, key: string, frame: FrameRef): string =>
+  kind === "recurse"
+    ? `${kind}\u0000${frame.lineage ?? frame.frameId}\u0000${key}`
+    : `${kind}\u0000${key}`;
 
 /** Atomically validate and bind stable keys before any reservation or effect. */
 export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Promise<void> => {
@@ -115,7 +110,7 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
   for (const claim of claims) {
     const canonicalIdentity = canonicalStringify(claim.identity);
     const normalized = { ...claim, canonicalIdentity, identityHash: identityHash(state.hasher, claim.identity) };
-    const id = keyRegistryId(claim.kind, claim.key);
+    const id = keyRegistryId(claim.kind, claim.key, claim.frame);
     const prior = requested.get(id);
     if (prior && prior.canonicalIdentity !== canonicalIdentity)
       throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
@@ -153,7 +148,7 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
         ready,
         state: "pending",
       };
-      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), binding);
+      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key, claim.frame), binding);
       return { claim, binding, resolveReady, rejectReady };
     });
     // Observe every deferred before journal I/O can reject one. This also makes
@@ -177,12 +172,12 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
         if (error instanceof JournalAppendError && error.eventDurable) {
           binding.state = "durable_failed";
           binding.error = error;
-        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key)) === binding) {
-          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key));
+        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key, claim.frame)) === binding) {
+          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key, claim.frame));
         }
         current.rejectReady(error);
         for (const remaining of installed.slice(index + 1)) {
-          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key);
+          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key, remaining.claim.frame);
           if (state.keyIdentities.get(id) === remaining.binding) state.keyIdentities.delete(id);
           remaining.rejectReady(error);
         }
@@ -226,8 +221,8 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
   const rawMaxOutputTokens = spec["maxOutputTokens"];
   if (rawMaxOutputTokens !== undefined
     && (typeof rawMaxOutputTokens !== "number" || !Number.isSafeInteger(rawMaxOutputTokens)
-      || rawMaxOutputTokens < 0 || rawMaxOutputTokens > MAX_CALL_TOKENS))
-    throw new DslError("INVALID_SPEC", `"maxOutputTokens" must be a nonnegative safe integer at most ${MAX_CALL_TOKENS}`);
+      || rawMaxOutputTokens <= 0 || rawMaxOutputTokens > MAX_CALL_TOKENS))
+    throw new DslError("INVALID_SPEC", `"maxOutputTokens" must be a positive safe integer at most ${MAX_CALL_TOKENS}`);
   const maxOutputTokens = (rawMaxOutputTokens as number | undefined) ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const identity: JsonValue = {
     prompt,
@@ -247,83 +242,6 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
     maxOutputTokens,
     identity,
   };
-};
-
-const PI_ERROR_CODES = new Set(["CANCELLED", "PROVIDER_ERROR", "OUTPUT_TRUNCATED", "UNEXPECTED_TOOL_USE", "MISSING_TEXT"]);
-const PI_STOP_REASONS = new Set(["stop", "length", "toolUse", "error", "aborted"]);
-type NormalizedPiFailure = {
-  readonly code: string;
-  readonly stopReason: string;
-  readonly provider: string;
-  readonly model: string;
-  readonly usage: CallUsage;
-};
-
-const ownDataValue = (value: object, key: string): { readonly found: boolean; readonly value?: unknown } => {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor) return { found: false };
-    return "value" in descriptor ? { found: true, value: descriptor.value } : { found: true };
-  } catch {
-    return { found: true };
-  }
-};
-
-const boundedOwnString = (value: object, key: string): string | undefined => {
-  const property = ownDataValue(value, key);
-  return property.found
-    && typeof property.value === "string"
-    && property.value.length > 0
-    && property.value.length <= ERROR_DETAIL_MAX_LENGTH
-    ? property.value
-    : undefined;
-};
-
-const usageLimits = (state: RunState): CallUsageLimits => ({
-  maxAttempts: MAX_CALL_ATTEMPTS,
-  maxTokens: MAX_CALL_TOKENS,
-  maxCostUsd: MAX_CALL_COST_USD,
-  maxDurationMs: Math.min(MAX_CALL_DURATION_MS, state.profile.wallMs),
-});
-
-const normalizeModelResponse = (
-  value: unknown,
-  limits: CallUsageLimits,
-): { readonly text: string; readonly usage: CallUsage } | undefined => {
-  if (!value || typeof value !== "object") return undefined;
-  const text = ownDataValue(value, "text");
-  const rawUsage = ownDataValue(value, "usage");
-  if (!text.found || typeof text.value !== "string" || !rawUsage.found) return undefined;
-  const usage = normalizeCallUsage(rawUsage.value, limits);
-  return usage.ok ? Object.assign(Object.create(null), { text: text.value, usage: usage.value }) : undefined;
-};
-
-/** Snapshot only own data descriptors. Provider errors cross an untrusted adapter boundary. */
-const normalizePiFailure = (error: PiModelError, limits: CallUsageLimits): NormalizedPiFailure | undefined => {
-  const code = boundedOwnString(error, "code");
-  const stopReason = boundedOwnString(error, "stopReason");
-  const provider = boundedOwnString(error, "provider");
-  const model = boundedOwnString(error, "model");
-  const usageProperty = ownDataValue(error, "usage");
-  const normalized = usageProperty.found ? normalizeCallUsage(usageProperty.value, limits) : undefined;
-  const usage = normalized?.ok ? normalized.value : undefined;
-  if (!code || !PI_ERROR_CODES.has(code) || !stopReason || !PI_STOP_REASONS.has(stopReason) || !provider || !model || !usage)
-    return undefined;
-  return Object.assign(Object.create(null), { code, stopReason, provider, model, usage }) as NormalizedPiFailure;
-};
-
-const piFailure = (error: NormalizedPiFailure) => {
-  const code = error.code === "CANCELLED"
-    ? "CANCELLED"
-    : error.code === "PROVIDER_ERROR"
-      ? "FAILED"
-      : "INVALID_RESULT";
-  const message = code === "CANCELLED"
-    ? "model completion cancelled"
-    : code === "FAILED"
-      ? "model provider failed"
-      : "model completion returned an invalid result";
-  return callError(code, message, error);
 };
 
 /** Handle one value-returning guest call. */
@@ -554,6 +472,7 @@ export const retainCallResult = async (
   event: Extract<RlmEvent, { type: "call_committed" }>,
   signal: AbortSignal,
   deadlineMs?: number,
+  cacheResult = true,
 ): Promise<GuestCallResult> => {
   checkpointCall(state, signal, deadlineMs);
   const release = await state.contextSemaphore.acquire(signal);
@@ -583,6 +502,10 @@ export const retainCallResult = async (
       journalFailure = error;
     }
     if (!journalCommitted) throw new Error("call journal event ignored after terminal");
+    if (!cacheResult) {
+      if (journalFailure) throw journalFailure;
+      return result;
+    }
 
     checkpointCall(state, signal, deadlineMs);
     const reserved = reserveStoredBytes(state.ledger, retainedJsonBytes(result as unknown as JsonValue));
@@ -600,24 +523,6 @@ export const retainCallResult = async (
   } finally {
     release();
   }
-};
-
-const DEFAULT_MAX_OUTPUT_TOKENS = 512;
-
-type TokenReservationRequest = Pick<ModelRequest, "prompt" | "system" | "context" | "maxOutputTokens">;
-
-export const tokenReservation = (request: TokenReservationRequest): number | undefined => {
-  const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
-  let inputCharacters = request.prompt.length;
-  const inputs = request.system === undefined
-    ? (request.context ?? [])
-    : [request.system, ...(request.context ?? [])];
-  for (const input of inputs) {
-    if (inputCharacters > Number.MAX_SAFE_INTEGER - input.length) return undefined;
-    inputCharacters += input.length;
-  }
-  const inputTokens = Math.ceil(inputCharacters / 4);
-  return inputTokens <= MAX_CALL_TOKENS - maxOutputTokens ? inputTokens + maxOutputTokens : undefined;
 };
 
 const llm = async (
@@ -649,25 +554,19 @@ const llm = async (
     }
   }
 
+  const operation = createModelOperation(state, frame, {
+    operationId: callId,
+    kind: "llm",
+    key,
+    signal,
+    deadlineMs: deadlineMs ?? state.ledger.current.limits.deadlineMs,
+  });
   let task!: Promise<GuestCallResult>;
   task = (async (): Promise<GuestCallResult> => {
-    let release: (() => void) | undefined;
-    let logicalReserved = false;
-    let pendingTokenReservation = 0;
-    let usage: CallUsage = ZERO_CALL_USAGE;
     try {
-      throwIfAborted(signal);
-      const reservedCall = reserveLogicalCall(state.ledger.current, now(state));
-      if (!reservedCall.ok) return errResult(callId, reservedCall.error, usage, false);
-      state.ledger.current = reservedCall.value;
-      logicalReserved = true;
-
-      release = await state.semaphore.acquire(signal);
-      if (!release) return cancelled(usage);
       checkpointCall(state, signal, deadlineMs);
-
       const contexts = await waitForAbort(Promise.all(ctxIds.map((id) => state.store.load(id))), signal);
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
       const request: ModelRequest = {
         prompt,
         context: contexts,
@@ -677,24 +576,7 @@ const llm = async (
         maxOutputTokens,
         signal,
       };
-      const reserveTokens = tokenReservation(request);
-      if (reserveTokens === undefined)
-        return errResult(callId, callError("INVALID_REQUEST", "call token reservation exceeds per-call maximum"), usage, false);
-      const limits = usageLimits(state);
-      const reservedAttempt = reserveAttempt(state.ledger.current, now(state), reserveTokens);
-      if (!reservedAttempt.ok) return errResult(callId, reservedAttempt.error, usage, false);
-      state.ledger.current = reservedAttempt.value;
-      pendingTokenReservation = reserveTokens;
-
-      const firstRaw = await waitForAbort(state.model.complete(request), signal);
-      checkpointCall(state, signal, deadlineMs);
-      const first = normalizeModelResponse(firstRaw, limits);
-      if (!first) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
-      const firstSettlement = settle(state, reserveTokens, first.usage.totalTokens ?? 0);
-      if (!firstSettlement.ok) return errResult(callId, firstSettlement.error, usage, false);
-      usage = first.usage;
-      state.ledger.current = firstSettlement.value;
-      pendingTokenReservation = 0;
+      const first = await operation.complete(state.model, request);
 
       let value: JsonValue;
       if (schema) {
@@ -702,42 +584,27 @@ const llm = async (
         let candidate = parsed.ok ? parsed.value : undefined;
         let errors = candidate === undefined ? ["not valid JSON"] : validateAgainstSchema(candidate, schema);
         if (candidate === undefined || errors.length > 0) {
-          throwIfAborted(signal);
-          const repairPrompt = `${prompt}\n\nReturn ONLY a JSON value that matches the required schema. Previous output was invalid (${errors.join("; ")}):\n${first.text}`;
-          const repairRequest = { ...request, prompt: repairPrompt };
-          const repairReserveTokens = tokenReservation(repairRequest);
-          const repairReserve = repairReserveTokens === undefined
-            ? undefined
-            : reserveAttempt(state.ledger.current, now(state), repairReserveTokens);
-          if (repairReserve?.ok && repairReserveTokens !== undefined) {
-            state.ledger.current = repairReserve.value;
-            pendingTokenReservation = repairReserveTokens;
-            const repairRaw = await waitForAbort(state.model.complete(repairRequest), signal);
-            checkpointCall(state, signal, deadlineMs);
-            const repair = normalizeModelResponse(repairRaw, limits);
-            if (!repair) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
-            const combined = addUsage(usage, repair.usage);
-            if (!combined.ok) return errResult(callId, callError("INVALID_RESULT", combined.error.message), usage, false);
-            const repairSettlement = settle(state, repairReserveTokens, repair.usage.totalTokens ?? 0);
-            if (!repairSettlement.ok) return errResult(callId, repairSettlement.error, usage, false);
-            usage = combined.value;
-            state.ledger.current = repairSettlement.value;
-            pendingTokenReservation = 0;
-            const reparsed = strictJson(repair.text);
-            candidate = reparsed.ok ? reparsed.value : undefined;
-            errors = candidate === undefined ? ["not valid JSON"] : validateAgainstSchema(candidate, schema);
-          }
+          checkpointCall(state, signal, deadlineMs);
+          const repairPrompt = `${prompt}
+
+Return ONLY a JSON value that matches the required schema. Previous output was invalid (${errors.join("; ")}):
+${first.text}`;
+          const repair = await operation.complete(state.model, { ...request, prompt: repairPrompt });
+          const reparsed = strictJson(repair.text);
+          candidate = reparsed.ok ? reparsed.value : undefined;
+          errors = candidate === undefined ? ["not valid JSON"] : validateAgainstSchema(candidate, schema);
         }
         if (candidate === undefined || errors.length > 0)
-          return errResult(callId, callError("INVALID_RESULT", `structured output invalid: ${errors.join("; ")}`), usage, false);
+          return errResult(callId, callError("INVALID_RESULT", `structured output invalid: ${errors.join("; ")}`), operation.usage, false);
         value = candidate;
       } else {
         value = first.text;
       }
 
       checkpointCall(state, signal, deadlineMs);
+      const usage = operation.usage;
       const result = okResult(callId, value, usage, false);
-      const retained = await retainCallResult(state, result, {
+      return retainCallResult(state, result, {
         type: "call_committed",
         frameId: frame.frameId,
         callId,
@@ -747,37 +614,12 @@ const llm = async (
         ok: true,
         usage,
       }, signal, deadlineMs);
-      logicalReserved = false;
-      return retained;
     } catch (error) {
-      if (wasAborted(error, signal)) return cancelled(usage);
-      logicalReserved = false;
+      if (error instanceof ModelInvocationError)
+        return errResult(callId, error.callError, error.usage, false);
+      if (wasAborted(error, signal)) return cancelled(operation.usage);
       if (error instanceof JournalAppendError) throw error;
-      if (error instanceof PiModelError) {
-        const failure = normalizePiFailure(error, usageLimits(state));
-        if (failure) {
-          const combined = addUsage(usage, failure.usage);
-          if (!combined.ok) return errResult(callId, callError("INVALID_RESULT", combined.error.message), usage, false);
-          if (pendingTokenReservation > 0) {
-            const failureSettlement = settle(state, pendingTokenReservation, failure.usage.totalTokens ?? 0);
-            if (!failureSettlement.ok) return errResult(callId, failureSettlement.error, usage, false);
-            state.ledger.current = failureSettlement.value;
-            pendingTokenReservation = 0;
-          }
-          usage = combined.value;
-          return errResult(callId, piFailure(failure), usage, false);
-        }
-      }
-      return errResult(callId, callError("FAILED", "model completion failed"), usage, false);
-    } finally {
-      if (pendingTokenReservation > 0) {
-        const releasedReservation = settle(state, pendingTokenReservation, 0);
-        if (releasedReservation.ok) state.ledger.current = releasedReservation.value;
-      }
-      if (logicalReserved && signal.aborted) {
-        state.ledger.current = releaseLogicalCall(state.ledger.current);
-      }
-      release?.();
+      return errResult(callId, callError("FAILED", "model completion failed"), operation.usage, false);
     }
   })();
 
@@ -788,9 +630,6 @@ const llm = async (
     if (state.inflight.get(callId) === task) state.inflight.delete(callId);
   }
 };
-
-const settle = (state: RunState, reserved: number, actual: number) =>
-  settleAttempt(state.ledger.current, reserved, actual);
 
 const llmBatch = async (
   state: RunState,
@@ -806,8 +645,12 @@ const llmBatch = async (
   if (!Array.isArray(items)) throw new DslError("INVALID_SPEC", "llm.batch requires an items array");
   const itemSpecs = items.map((item) => asObject(item));
   const normalizedItems = itemSpecs.map((item) => normalizeLlmSpec(state, item));
+  const rawConcurrency = spec["concurrency"];
+  if (rawConcurrency !== undefined
+    && (typeof rawConcurrency !== "number" || !Number.isSafeInteger(rawConcurrency) || rawConcurrency <= 0))
+    throw new DslError("INVALID_SPEC", '"concurrency" must be a positive safe integer');
+  const concurrency = (rawConcurrency as number | undefined) ?? state.profile.maxConcurrency;
   await bindKeys(state, normalizedItems.map((item) => ({ frame, kind: "llm" as const, key: item.key, identity: item.identity })));
-  const concurrency = typeof spec["concurrency"] === "number" ? Math.max(1, spec["concurrency"]) : state.profile.maxConcurrency;
   const results: GuestCallResult[] = new Array(items.length);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length || 1) }, async () => {

@@ -9,6 +9,7 @@
 
 import { type CallError, type InterpreterError } from "./errors.ts";
 import { headTailPreview, headPreview, type Preview } from "./preview.ts";
+import type { CallUsage } from "./usage.ts";
 
 export type CellError = InterpreterError | CallError;
 
@@ -18,6 +19,7 @@ export interface TrajectoryEntry {
   readonly code: string;
   readonly hasResult: boolean;
   readonly outputPreview: string;
+  readonly usage?: CallUsage;
   readonly outputRef?: string;
   readonly error?: CellError;
 }
@@ -27,6 +29,7 @@ export interface ProjectedEntry {
   readonly reasoning: string;
   readonly codePreview: Preview;
   readonly outputPreview: string;
+  readonly usage?: CallUsage;
   readonly outputRef?: string;
   readonly error?: CellError;
 }
@@ -53,6 +56,7 @@ const projectEntry = (entry: TrajectoryEntry, options: ProjectionOptions): Proje
     tailBytes: options.codeTailBytes,
   }),
   outputPreview: entry.outputPreview,
+  ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
   ...(entry.outputRef !== undefined ? { outputRef: entry.outputRef } : {}),
   ...(entry.error !== undefined ? { error: entry.error } : {}),
 });

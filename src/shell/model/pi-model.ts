@@ -109,6 +109,9 @@ export class PiModelClient implements ModelClient {
     let message: AssistantMessage;
     try {
       message = await this.runtime.completeSimple(resolved, context, {
+        // Pi 0.80.10 exposes maxRetries on the public simple-completion options.
+        // One accounting attempt therefore maps to one transport request.
+        maxRetries: 0,
         ...(reasoning ? { reasoning } : {}),
         ...(request.maxOutputTokens !== undefined ? { maxTokens: request.maxOutputTokens } : {}),
         ...(request.signal ? { signal: request.signal } : {}),

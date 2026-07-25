@@ -1,6 +1,7 @@
 /** Shared, mutable run state threaded through the broker and frame runners. */
 
 import type { Ledger } from "../core/budget.ts";
+import type { CallUsage } from "../core/usage.ts";
 import type { Hasher } from "../core/ids.ts";
 import type { RlmProgram, RlmOutputField } from "../core/program.ts";
 import type { ContextDescriptor, ContextStore } from "../shell/context-store.ts";
@@ -30,10 +31,14 @@ export interface KeyIdentityBinding {
 
 export interface FrameRef {
   readonly frameId: string;
+  /** Deterministic recurse ancestry; unlike scheduling ordinals, stable for identity and controller forks. */
+  readonly lineage?: string;
   readonly depth: number;
   readonly objective: string;
   readonly inputs: Readonly<Record<string, ContextDescriptor>>;
   readonly outputs: readonly RlmOutputField[];
+  /** Recurse results that receive this frame's provider usage without re-settlement. */
+  readonly usageScopes?: readonly string[];
 }
 
 export interface RunState {
@@ -52,6 +57,7 @@ export interface RunState {
   readonly callCache: Map<string, GuestCallResult>;
   readonly inflight: Map<string, Promise<GuestCallResult>>;
   readonly keyIdentities: Map<string, KeyIdentityBinding>;
+  readonly scopeUsage: Map<string, CallUsage>;
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
   readonly frameSeq: { current: number };

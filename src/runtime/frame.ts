@@ -17,13 +17,14 @@ import { headTailPreview } from "../core/preview.ts";
 import { validateAgainstSchema } from "../core/schema.ts";
 import { appendEntry, projectTrajectory, type TrajectoryEntry } from "../core/trajectory.ts";
 import { validateWorkspace } from "../core/workspace.ts";
-import { ZERO_CALL_USAGE } from "../core/usage.ts";
+import { type CallUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
 import { JournalAppendError } from "../shell/journal-store.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
 import { bindKeys, dispatchCall, resolveContextRefs, retainCallResult } from "./broker.ts";
+import { createModelOperation, hasAttemptCapacity, ModelInvocationError } from "./provider.ts";
 import { persistAnswer } from "./answer-persistence.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
@@ -34,6 +35,7 @@ export interface FrameResult {
   readonly completionMode?: "answer";
   readonly exhausted: boolean;
   readonly terminal?: InterpreterError;
+  readonly providerError?: CallError;
   readonly cancelled?: true;
   readonly deadline?: true;
   readonly workspace?: JsonValue;
@@ -107,6 +109,12 @@ export const runFrame = async (
 
   for (let iteration = 1; ; iteration++) {
     if (signal?.aborted) return cancelled();
+    if (state.clock.now() >= state.ledger.current.limits.deadlineMs)
+      return { exhausted: false, deadline: true, workspace, entries };
+    if (state.ledger.current.usage.controllerTurns >= state.ledger.current.limits.maxControllerTurns)
+      return { exhausted: true, workspace, entries };
+    if (!hasAttemptCapacity(state))
+      return { exhausted: false, providerError: callError("BUDGET_ATTEMPTS", `attempt limit ${state.ledger.current.limits.maxAttempts} reached`), workspace, entries };
     const turn = reserveControllerTurn(state.ledger.current, state.clock.now());
     if (!turn.ok)
       return turn.error.code === "DEADLINE"
@@ -115,6 +123,13 @@ export const runFrame = async (
     state.ledger.current = turn.value;
 
     const projection = projectTrajectory(entries, state.profile.trajectory);
+    const controllerOperation = createModelOperation(state, frame, {
+      operationId: `${frame.frameId}:controller:${iteration}`,
+      kind: "controller",
+      key: String(iteration),
+      signal,
+      deadlineMs: Math.min(ownerDeadlineMs, state.ledger.current.limits.deadlineMs),
+    });
     let cell: Cell;
     try {
       cell = await waitForAbort(controller.next({
@@ -128,12 +143,15 @@ export const runFrame = async (
         outputs: frame.outputs,
         trajectory: projection,
         ...(lastOutcome ? { lastOutcome } : {}),
-      }, signal), signal);
+      }, signal, controllerOperation), signal);
     } catch (error) {
+      if (error instanceof ModelInvocationError)
+        return { exhausted: false, providerError: error.callError, workspace, entries };
       if (wasAborted(error, signal)) return cancelled();
       throw error;
     }
     if (signal?.aborted) return cancelled();
+    const controllerUsage = controllerOperation.usage;
 
     const transformed = transformCell(cell.code);
     if (!transformed.ok) {
@@ -143,6 +161,7 @@ export const runFrame = async (
         code: cell.code,
         hasResult: false,
         outputPreview: "",
+        usage: controllerUsage,
         error: transformed.error,
       });
       await state.journal.append({
@@ -153,6 +172,7 @@ export const runFrame = async (
         codeHash: state.hasher(cell.code).slice(0, 16),
         hasResult: false,
         outputPreview: "",
+        usage: controllerUsage,
         error: errorInfo(transformed.error),
       });
       if (signal?.aborted) return cancelled();
@@ -258,6 +278,7 @@ export const runFrame = async (
                   codeHash: state.hasher(cell.code).slice(0, 16),
                   hasResult: outcome.hasResult,
                   outputPreview: preview,
+                  usage: controllerUsage,
                   outputRef,
                 }, {
                   type: "answer_committed",
@@ -287,6 +308,7 @@ export const runFrame = async (
       code: cell.code,
       hasResult: outcome.kind === "value" ? outcome.hasResult : false,
       outputPreview: preview,
+      usage: controllerUsage,
       ...(error ? { error } : {}),
     });
     await state.journal.append({
@@ -297,6 +319,7 @@ export const runFrame = async (
       codeHash: state.hasher(cell.code).slice(0, 16),
       hasResult: outcome.kind === "value" ? outcome.hasResult : false,
       outputPreview: preview,
+      usage: controllerUsage,
       ...(error ? { error: errorInfo(error) } : {}),
     });
     if (signal?.aborted) return cancelled();
@@ -316,13 +339,16 @@ const runChild = async (
   const key = typeof args["key"] === "string" ? args["key"] : "recurse";
   const objective = typeof args["objective"] === "string" ? args["objective"] : "";
   const contexts = resolveContextRefs(state, args["context"], "context");
+  const parentLineage = parentFrame.lineage ?? parentFrame.frameId;
   const identity: JsonValue = {
+    parentLineage,
     objective,
     contexts: contexts.map((context) => context.sha256),
     profile: typeof args["profile"] === "string" ? args["profile"] : state.profile.name,
   };
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "recurse", key, identity });
-  const cancelled = (): GuestCallResult => errResult(callId, callError("CANCELLED", "cell epoch closed"), ZERO_CALL_USAGE, false);
+  const recurseUsage = (): CallUsage => state.scopeUsage.get(callId) ?? ZERO_CALL_USAGE;
+  const cancelled = (): GuestCallResult => errResult(callId, callError("CANCELLED", "cell epoch closed"), recurseUsage(), false);
   if (signal.aborted) return cancelled();
   if (objective.length === 0) return errResult(callId, callError("INVALID_REQUEST", "recurse requires an objective"), ZERO_CALL_USAGE, false);
   await bindKeys(state, [{ frame: parentFrame, kind: "recurse", key, identity }]);
@@ -356,11 +382,20 @@ const runChild = async (
       state.ledger.current = opened.value;
       logicalReserved = true;
 
-      const childFrameId = `${state.runId}:f${state.frameSeq.current++}`;
+      state.scopeUsage.set(callId, ZERO_CALL_USAGE);
+      const childFrameId = `${state.runId}:frame:${callId}`;
       await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
       if (signal.aborted) return cancelled();
 
-      const childFrame: FrameRef = { frameId: childFrameId, depth: parentFrame.depth + 1, objective, inputs, outputs: [] };
+      const childFrame: FrameRef = {
+        frameId: childFrameId,
+        lineage: callId,
+        depth: parentFrame.depth + 1,
+        objective,
+        inputs,
+        outputs: [],
+        usageScopes: [...(parentFrame.usageScopes ?? []), callId],
+      };
       const childController = parentController.fork(objective, childFrameId);
       const result = await runFrame(state, childFrame, childController, signal, deadlineMs);
       if (signal.aborted || result.cancelled) return cancelled();
@@ -369,11 +404,17 @@ const runChild = async (
       await state.journal.append({ type: "frame_closed", frameId: childFrameId, state: finalState });
       if (signal.aborted) return cancelled();
 
-      const callResult = result.terminal
-        ? errResult(callId, callError("FAILED", result.terminal.message), ZERO_CALL_USAGE, false)
+      const usage = recurseUsage();
+      const childError = result.providerError
+        ? result.providerError
+        : result.terminal
+          ? callError("FAILED", result.terminal.message)
+          : undefined;
+      const callResult = childError
+        ? errResult(callId, childError, usage, false)
         : result.answer !== undefined
-          ? okResult(callId, result.answer, ZERO_CALL_USAGE, false)
-          : errResult(callId, callError("FAILED", "child frame exhausted without an answer"), ZERO_CALL_USAGE, false);
+          ? okResult(callId, result.answer, usage, false)
+          : errResult(callId, callError("FAILED", "child frame exhausted without an answer"), usage, false);
       const retained = await retainCallResult(state, callResult, {
         type: "call_committed",
         frameId: parentFrame.frameId,
@@ -382,17 +423,18 @@ const runChild = async (
         key,
         cached: false,
         ok: callResult.ok,
-        usage: ZERO_CALL_USAGE,
-      }, signal, deadlineMs);
+        usage,
+      }, signal, deadlineMs, callResult.ok);
       logicalReserved = false;
       return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled();
       logicalReserved = false;
       if (error instanceof JournalAppendError) throw error;
-      return errResult(callId, callError("FAILED", "child frame failed"), ZERO_CALL_USAGE, false);
+      return errResult(callId, callError("FAILED", "child frame failed"), recurseUsage(), false);
     } finally {
       if (logicalReserved && signal.aborted) state.ledger.current = releaseLogicalCall(state.ledger.current);
+      state.scopeUsage.delete(callId);
     }
   })();
 

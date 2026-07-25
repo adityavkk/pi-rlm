@@ -11,6 +11,8 @@ import type { BudgetLimits } from "./budget.ts";
 import type { CallKind } from "./ids.ts";
 import type { CallUsage } from "./usage.ts";
 
+export type ProviderOperationKind = "controller" | "llm" | "extractor";
+
 export type CompletionMode = "answer" | "fallback_extract";
 export type RunState = "running" | "completed" | "failed" | "cancelled";
 export type FrameState = "open" | "answered" | "closed" | "failed" | "cancelled";
@@ -40,8 +42,20 @@ export type RlmEvent =
       readonly codeHash: string;
       readonly hasResult: boolean;
       readonly outputPreview: string;
+      readonly usage?: CallUsage;
       readonly outputRef?: string;
       readonly error?: EventErrorInfo;
+    }
+  | {
+      readonly type: "provider_attempted";
+      readonly frameId: string;
+      readonly operationId: string;
+      readonly kind: ProviderOperationKind;
+      readonly key: string;
+      readonly attempt: number;
+      readonly outcome: "ok" | "error" | "cancelled" | "invalid_result";
+      readonly usage: CallUsage;
+      readonly errorCode?: string;
     }
   | {
       readonly type: "call_committed";
@@ -148,9 +162,10 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         break;
       }
       case "emit":
+      case "provider_attempted":
         break;
       case "key_bound": {
-        const registryKey = `${event.kind}\u0000${event.key}`;
+        const registryKey = `${event.frameId}\u0000${event.kind}\u0000${event.key}`;
         if (!keyBindings.has(registryKey)) keyBindings.set(registryKey, {
           frameId: event.frameId,
           kind: event.kind,
