@@ -94,13 +94,17 @@ describe("budget ledger", () => {
     if (!r.ok) expect(r.error.code).toBe("BUDGET_DEADLINE");
   });
 
-  test("byte reservation and rollback", () => {
+  test("byte reservation and rollback stay exact and finite", () => {
     const l = createLedger({ ...limits, storedByteLimit: 100 });
     const r = reserveBytes(l, 60);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(reserveBytes(r.value, 60).ok).toBe(false);
       expect(releaseBytes(r.value, 60).usage.storedBytes).toBe(0);
+    }
+    for (const invalid of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_VALUE]) {
+      expect(reserveBytes(l, invalid)).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" } });
+      expect(l.usage.storedBytes).toBe(0);
     }
   });
 

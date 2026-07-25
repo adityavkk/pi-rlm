@@ -46,7 +46,17 @@ export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
 };
 
 export interface ContextByteReservation {
+  /** Finalize exactly one successful retained-byte mutation. */
+  readonly commit?: () => void;
+  /** Release the reservation when its mutation does not commit. */
   rollback(): void;
+}
+
+/** A staged context mutation. The store lock remains held until settlement. */
+export interface ContextStoreTransaction<T> {
+  readonly value: T;
+  commit(): void;
+  rollback(): Promise<void>;
 }
 
 /** Optional composition points for broker deadlines and atomic byte reservation. */

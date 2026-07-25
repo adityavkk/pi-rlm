@@ -22,7 +22,8 @@ import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
-import { bindKeys, contextControl, dispatchCall, resolveContextRefs, withContextMutation } from "./broker.ts";
+import { bindKeys, dispatchCall, resolveContextRefs, retainCallResult } from "./broker.ts";
+import { persistAnswer } from "./answer-persistence.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
@@ -244,26 +245,30 @@ export const runFrame = async (
             error = callError("INVALID_RESULT", `answer did not satisfy the output contract: ${answerErrors.join("; ")}`);
           } else {
             try {
-              const ref = await withContextMutation(state, () =>
-                state.store.derive(
-                  { key: `answer:${frame.frameId}:${iteration}`, value: candidate },
-                  contextControl(state, cellDeadline, signal, true),
-                ), signal);
+              const ref = await persistAnswer(
+                state,
+                `answer:${frame.frameId}:${iteration}`,
+                candidate,
+                (outputRef) => [{
+                  type: "cell_committed",
+                  frameId: frame.frameId,
+                  iteration,
+                  reasoning: cell.reasoning,
+                  codeHash: state.hasher(cell.code).slice(0, 16),
+                  hasResult: outcome.hasResult,
+                  outputPreview: preview,
+                  outputRef,
+                }, {
+                  type: "answer_committed",
+                  frameId: frame.frameId,
+                  completionMode: "answer",
+                  outputRef,
+                }],
+                cellDeadline,
+                signal,
+              );
               if (signal?.aborted) return cancelled();
               entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
-              await state.journal.append({
-                type: "cell_committed",
-                frameId: frame.frameId,
-                iteration,
-                reasoning: cell.reasoning,
-                codeHash: state.hasher(cell.code).slice(0, 16),
-                hasResult: outcome.hasResult,
-                outputPreview: preview,
-                outputRef: ref.id,
-              });
-              if (signal?.aborted) return cancelled();
-              await state.journal.append({ type: "answer_committed", frameId: frame.frameId, completionMode: "answer", outputRef: ref.id });
-              if (signal?.aborted) return cancelled();
               return { answer: candidate, completionMode: "answer", exhausted: false };
             } catch (persistenceError) {
               if (signal?.aborted) return cancelled();
@@ -368,7 +373,7 @@ const runChild = async (
         : result.answer !== undefined
           ? okResult(callId, result.answer, ZERO_CALL_USAGE, false)
           : errResult(callId, callError("FAILED", "child frame exhausted without an answer"), ZERO_CALL_USAGE, false);
-      await state.journal.append({
+      const retained = await retainCallResult(state, callResult, {
         type: "call_committed",
         frameId: parentFrame.frameId,
         callId,
@@ -377,10 +382,9 @@ const runChild = async (
         cached: false,
         ok: callResult.ok,
         usage: ZERO_CALL_USAGE,
-      });
-      state.callCache.set(callId, callResult);
+      }, signal);
       logicalReserved = false;
-      return callResult;
+      return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled();
       logicalReserved = false;

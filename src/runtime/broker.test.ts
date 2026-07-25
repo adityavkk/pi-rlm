@@ -12,6 +12,7 @@ import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
+import { MockModelClient } from "../shell/model/mock.ts";
 import { ManualClock } from "../shell/clock.ts";
 import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
 import { dispatchCall, tokenReservation } from "./broker.ts";
@@ -444,5 +445,29 @@ describe("dispatchCall cancellation ownership", () => {
     expect(JSON.stringify(results)).not.toContain("pppppppp");
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(state.ledger.current.usage.tokensUsed).toBe(0);
+  });
+
+  test("denied call-cache snapshots never insert and remain denied on retry", async () => {
+    const model = new MockModelClient(() => "oversized model result");
+    const state = await brokerState(model, "run_cache_bytes");
+    state.ledger.current = createLedger({ ...state.ledger.current.limits, storedByteLimit: 1 });
+    const results: GuestCallResult[] = [];
+    for (let index = 0; index < 2; index++) {
+      results.push(await dispatchCall(
+        state,
+        testFrame,
+        "llm",
+        { key: "same", prompt: "same" },
+        noRecurse,
+        new AbortController().signal,
+        Date.now() + 5_000,
+      ) as GuestCallResult);
+    }
+    expect(results.map((result) => result.error?.code)).toEqual(["BUDGET_BYTES", "BUDGET_BYTES"]);
+    expect(model.callCount).toBe(2);
+    expect(state.callCache.size).toBe(0);
+    expect(state.ledger.current.usage.storedBytes).toBe(0);
+    const events = await state.journal.readEvents();
+    expect(events.ok && events.value.some((event) => event.type === "call_committed")).toBe(false);
   });
 });

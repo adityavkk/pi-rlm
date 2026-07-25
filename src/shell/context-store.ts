@@ -25,6 +25,7 @@ import {
   ContextSpecError,
   type ContextStoreInstrumentation,
   type ContextStoreLimits,
+  type ContextStoreTransaction,
   ContextUnavailableError,
   DEFAULT_CONTEXT_STORE_LIMITS,
 } from "./context-store-contract.ts";
@@ -45,6 +46,7 @@ export type {
   ContextRead,
   ContextStoreInstrumentation,
   ContextStoreLimits,
+  ContextStoreTransaction,
 } from "./context-store-contract.ts";
 
 const encoder = new TextEncoder();
@@ -140,6 +142,7 @@ export class ContextStore {
   private readonly entries = new Map<string, Entry>();
   private readonly contentDir: string;
   private readonly limits: ContextStoreLimits;
+  private mutationTail: Promise<void> = Promise.resolve();
   private uniqueBytes = 0;
 
   constructor(
@@ -184,47 +187,78 @@ export class ContextStore {
     return new PreparedEntry(descriptor, prepared.materialize, this.instrumentation.onMaterialize);
   }
 
-  private async commitPrepared(
+  private async acquireMutation(): Promise<() => void> {
+    const previous = this.mutationTail;
+    let unlock!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { unlock = resolve; });
+    await previous;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      unlock();
+    };
+  }
+
+  private async beginPrepared(
     prepared: readonly PreparedEntry[],
     control?: ContextOperationControl,
-  ): Promise<ContextDescriptor[]> {
-    const canonical = new Map<string, ContextDescriptor>();
-    for (const [id, entry] of this.entries) canonical.set(id, entry.descriptor);
-    const additions: PreparedEntry[] = [];
-    const descriptors = prepared.map((candidate) => {
-      const existing = canonical.get(candidate.descriptor.id);
-      if (existing) return existing;
-      canonical.set(candidate.descriptor.id, candidate.descriptor);
-      additions.push(candidate);
-      return candidate.descriptor;
-    });
-    const delta = additions.reduce((sum, candidate) => sum + candidate.descriptor.bytes, 0);
-    const maxOutputBytes = control?.maxOutputBytes === undefined
-      ? Number.MAX_SAFE_INTEGER
-      : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
-    if (delta > maxOutputBytes)
-      throw new ContextBudgetError(`context output requires ${delta} bytes; ${maxOutputBytes} bytes remain`);
-
+  ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
+    const release = await this.acquireMutation();
     let reservation: ContextByteReservation | undefined;
     let createdDir = false;
-    let bytesCommitted = false;
+    let bytesInserted = false;
+    let delta = 0;
     const createdPaths: string[] = [];
-    const insertedIds: string[] = [];
+    const inserted: Entry[] = [];
+
+    const rollbackStaged = async (): Promise<void> => {
+      for (const entry of inserted) {
+        if (this.entries.get(entry.descriptor.id) === entry) this.entries.delete(entry.descriptor.id);
+      }
+      if (bytesInserted) this.uniqueBytes -= delta;
+      reservation?.rollback();
+      const cleanup = await Promise.allSettled(createdPaths.map((path) => unlink(path)));
+      if (createdDir) await rmdir(this.contentDir).catch(() => undefined);
+      const failed = cleanup.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+    };
+
     try {
+      const canonical = new Map<string, ContextDescriptor>();
+      for (const [id, entry] of this.entries) canonical.set(id, entry.descriptor);
+      const additions: PreparedEntry[] = [];
+      const descriptors = prepared.map((candidate) => {
+        const existing = canonical.get(candidate.descriptor.id);
+        if (existing) return existing;
+        canonical.set(candidate.descriptor.id, candidate.descriptor);
+        additions.push(candidate);
+        return candidate.descriptor;
+      });
+      for (const candidate of additions) {
+        if (delta > Number.MAX_SAFE_INTEGER - candidate.descriptor.bytes)
+          throw new ContextSpecError("context output is too large");
+        delta += candidate.descriptor.bytes;
+      }
+      const maxOutputBytes = control?.maxOutputBytes === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
+      if (delta > maxOutputBytes)
+        throw new ContextBudgetError(`context output requires ${delta} bytes; ${maxOutputBytes} bytes remain`);
       if (delta > 0) reservation = control?.reserveBytes?.(delta);
-      const materialized: Entry[] = [];
+
       for (const candidate of additions) {
         control?.checkpoint?.();
         const bytesArray = candidate.materialize();
         if (bytesArray.length !== candidate.descriptor.bytes || sha256Bytes(bytesArray) !== candidate.descriptor.sha256)
           throw new Error(`prepared context ${candidate.descriptor.id} changed before commit`);
-        materialized.push({ descriptor: candidate.descriptor, bytesArray });
+        inserted.push({ descriptor: candidate.descriptor, bytesArray });
       }
-      if (materialized.length > 0 && !existsSync(this.contentDir)) {
+      if (inserted.length > 0 && !existsSync(this.contentDir)) {
         await mkdir(this.contentDir, { recursive: true });
         createdDir = true;
       }
-      for (const entry of materialized) {
+      for (const entry of inserted) {
         control?.checkpoint?.();
         const path = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
         if (existsSync(path)) continue;
@@ -238,22 +272,47 @@ export class ContextStore {
           }
         }
       }
-      for (const entry of materialized) {
-        this.entries.set(entry.descriptor.id, entry);
-        insertedIds.push(entry.descriptor.id);
-      }
+      for (const entry of inserted) this.entries.set(entry.descriptor.id, entry);
       this.uniqueBytes += delta;
-      bytesCommitted = true;
+      bytesInserted = true;
       control?.checkpoint?.();
-      return descriptors;
+
+      let active = true;
+      return {
+        value: descriptors,
+        commit: () => {
+          if (!active) return;
+          active = false;
+          reservation?.commit?.();
+          release();
+        },
+        rollback: async () => {
+          if (!active) return;
+          active = false;
+          try {
+            await rollbackStaged();
+          } finally {
+            release();
+          }
+        },
+      };
     } catch (error) {
-      for (const id of insertedIds) this.entries.delete(id);
-      if (bytesCommitted) this.uniqueBytes -= delta;
-      reservation?.rollback();
-      await Promise.allSettled(createdPaths.map((path) => unlink(path)));
-      if (createdDir) await rmdir(this.contentDir).catch(() => undefined);
+      try {
+        await rollbackStaged();
+      } finally {
+        release();
+      }
       throw error;
     }
+  }
+
+  private async commitPrepared(
+    prepared: readonly PreparedEntry[],
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor[]> {
+    const transaction = await this.beginPrepared(prepared, control);
+    transaction.commit();
+    return transaction.value;
   }
 
   private async intern(
@@ -272,6 +331,17 @@ export class ContextStore {
     control?: ContextOperationControl,
   ): Promise<ContextDescriptor> {
     return this.intern(label, text, mimeType, control);
+  }
+
+  /** Stage all initial sources as one unique-byte transaction. */
+  beginIngestTexts(
+    sources: readonly { readonly label: string; readonly text: string; readonly mimeType?: string }[],
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
+    return this.beginPrepared(
+      sources.map((source) => this.prepareText(source.label, source.text, source.mimeType ?? "text/plain")),
+      control,
+    );
   }
 
   get(id: string): ContextDescriptor | undefined {
@@ -456,13 +526,29 @@ export class ContextStore {
     return this.commitPrepared(prepared, control);
   }
 
+  async beginDerive(
+    spec: { key: string; value: string | JsonValue; label?: string },
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor>> {
+    const label = spec.label ?? `derived:${spec.key}`;
+    const prepared = typeof spec.value === "string"
+      ? this.prepareText(label, spec.value, "text/plain")
+      : this.prepareJson(label, spec.value, control);
+    const transaction = await this.beginPrepared([prepared], control);
+    return {
+      value: transaction.value[0] as ContextDescriptor,
+      commit: () => transaction.commit(),
+      rollback: () => transaction.rollback(),
+    };
+  }
+
   async derive(
     spec: { key: string; value: string | JsonValue; label?: string },
     control?: ContextOperationControl,
   ): Promise<ContextDescriptor> {
-    const label = spec.label ?? `derived:${spec.key}`;
-    if (typeof spec.value === "string") return this.intern(label, spec.value, "text/plain", control);
-    return (await this.commitPrepared([this.prepareJson(label, spec.value, control)], control))[0] as ContextDescriptor;
+    const transaction = await this.beginDerive(spec, control);
+    transaction.commit();
+    return transaction.value;
   }
 
   async concat(

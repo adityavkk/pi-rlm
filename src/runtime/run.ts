@@ -1,6 +1,6 @@
 /** Top-level run orchestration and exactly-once durable finalization. */
 
-import { createLedger, type Ledger, releaseBytes, reserveBytes } from "../core/budget.ts";
+import { createLedger, type Ledger } from "../core/budget.ts";
 import { identityHash } from "../core/ids.ts";
 import type { FrameState, RlmEvent } from "../core/journal.ts";
 import type { JsonValue } from "../core/json.ts";
@@ -18,13 +18,14 @@ import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
-import { contextControl, withContextMutation } from "./broker.ts";
+import { persistAnswer } from "./answer-persistence.ts";
 import type { ControllerDriver } from "./controller.ts";
 import type { Extractor } from "./extractor.ts";
 import { runFrame } from "./frame.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, RunState } from "./state.ts";
+import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 
 export const RLM_DSL_VERSION = "0.1.0";
 
@@ -109,6 +110,10 @@ const exceptionResult = (
       ? failure(runId, "BUDGET_DEADLINE", "run deadline reached")
       : cancellation(runId);
   }
+  if (error instanceof ContextBudgetError)
+    return failure(runId, "BUDGET_BYTES", "stored byte limit reached", error);
+  if (error instanceof JournalAppendError)
+    return failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error);
   const code = phase === "journal"
     ? "JOURNAL_FAILED"
     : phase === "source"
@@ -305,20 +310,12 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throwIfAborted(scope.signal);
       if (clock.now() >= limits.deadlineMs) throw new Error("run deadline reached");
     },
-    maxOutputBytes: Math.max(0, ledgerRef.current.limits.storedByteLimit - ledgerRef.current.usage.storedBytes),
+    maxOutputBytes: remainingStoredBytes(ledgerRef.current),
     reserveBytes: (bytes) => {
       throwIfAborted(scope.signal);
-      const reserved = reserveBytes(ledgerRef.current, bytes);
+      const reserved = reserveStoredBytes(ledgerRef, bytes);
       if (!reserved.ok) throw new ContextBudgetError(reserved.error.message);
-      ledgerRef.current = reserved.value;
-      let active = true;
-      return {
-        rollback: () => {
-          if (!active) return;
-          active = false;
-          ledgerRef.current = releaseBytes(ledgerRef.current, bytes);
-        },
-      };
+      return reserved.value;
     },
   });
 
@@ -329,20 +326,39 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       dsl: RLM_DSL_VERSION,
       backend: input.backend.id,
     }));
-    await journal.append({ type: "run_started", runId, manifestHash, limits });
-    throwIfAborted(scope.signal);
-
     phase = "source";
-    const inputs: Record<string, ContextDescriptor> = {};
-    for (const declared of input.program.inputs) {
+    const sourceTransaction = await store.beginIngestTexts(
+      input.program.inputs.map((declared) => ({
+        label: declared.name,
+        text: input.sources[declared.name] ?? "",
+        mimeType: "text/plain",
+      })),
+      sourceControl(),
+    );
+    let sourceDurable = false;
+    try {
       throwIfAborted(scope.signal);
-      const text = input.sources[declared.name] ?? "";
-      inputs[declared.name] = await waitForAbort(
-        store.ingestText(declared.name, text, "text/plain", sourceControl()),
-        scope.signal,
-      );
+      phase = "journal";
+      try {
+        const outcome = await journal.append({ type: "run_started", runId, manifestHash, limits });
+        sourceDurable = outcome.event === "committed";
+      } catch (error) {
+        sourceDurable = error instanceof JournalAppendError && error.eventDurable;
+        throw error;
+      }
+      if (!sourceDurable) throw new Error("run start ignored after terminal");
+      sourceTransaction.commit();
+    } catch (error) {
+      if (sourceDurable) sourceTransaction.commit();
+      else await sourceTransaction.rollback();
+      throw error;
     }
     throwIfAborted(scope.signal);
+
+    const inputs: Record<string, ContextDescriptor> = {};
+    input.program.inputs.forEach((declared, index) => {
+      inputs[declared.name] = sourceTransaction.value[index] as ContextDescriptor;
+    });
 
     phase = "journal";
     await journal.append({
@@ -409,19 +425,19 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throwIfAborted(scope.signal);
       if (extracted.ok) {
         phase = "context";
-        const ref = await withContextMutation(state, () =>
-          store.derive(
-            { key: `fallback:${rootFrameId}`, value: extracted.value },
-            contextControl(state, limits.deadlineMs, scope.signal, true),
-          ), scope.signal);
-        throwIfAborted(scope.signal);
-        phase = "journal";
-        await journal.append({
-          type: "answer_committed",
-          frameId: rootFrameId,
-          completionMode: "fallback_extract",
-          outputRef: ref.id,
-        });
+        await persistAnswer(
+          state,
+          `fallback:${rootFrameId}`,
+          extracted.value,
+          (outputRef) => [{
+            type: "answer_committed",
+            frameId: rootFrameId,
+            completionMode: "fallback_extract",
+            outputRef,
+          }],
+          limits.deadlineMs,
+          scope.signal,
+        );
         throwIfAborted(scope.signal);
         planned = {
           runId,

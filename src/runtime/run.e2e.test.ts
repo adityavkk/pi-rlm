@@ -755,4 +755,67 @@ describe("runProgram e2e", () => {
     expect(result.ledger.usage.storedBytes).toBe(164);
     expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
   });
+
+  test("oversized initial sources fail before payload state or files commit", async () => {
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "xx" },
+      controller: new MockController([{ reasoning: "must not run", code: "answer({ answer: 'bad' })" }]),
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 1 },
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("BUDGET_BYTES");
+    expect(result.ledger.usage.storedBytes).toBe(0);
+    expect(await readdir(dir)).not.toContain("contexts");
+    expect((await journalEvents(dir)).some((event) => event.type === "run_started")).toBe(false);
+  });
+
+  test("denied artifacts stay denied on retry and concurrent producers dedupe exactly", async () => {
+    const dir = await tmp();
+    const controller = new MockController([{
+      reasoning: "reserve every retained producer",
+      code: `
+        const denied = [];
+        for (let i = 0; i < 2; i++) {
+          try { await artifacts.write({ key: 'denied', name: 'large', value: 'x'.repeat(25) }); }
+          catch (error) { denied.push(error.code); }
+        }
+        const [d1, d2] = await Promise.all([
+          contexts.derive({ key: 'd1', value: 'same' }),
+          contexts.derive({ key: 'd2', value: 'same' }),
+        ]);
+        const [a1, a2] = await Promise.all([
+          artifacts.write({ key: 'a1', name: 'one', value: 'same' }),
+          artifacts.write({ key: 'a2', name: 'two', value: 'same' }),
+        ]);
+        answer({ answer: denied.join(',') === 'BUDGET_BYTES,BUDGET_BYTES' && d1.id === d2.id && a1.id === a2.id ? 'ok' : 'bad' });`,
+    }]);
+    const result = await runProgram({
+      program: program(), sources: { context: "s" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 24 },
+    });
+    expect(result.answer).toEqual({ answer: "ok" });
+    expect(result.ledger.usage.storedBytes).toBe(24); // source 1 + context 4 + artifact 4 + answer 15
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
+  });
+
+  test("fallback answers use the same denied transaction without residue", async () => {
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "" }, controller: new MockController([]),
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, storedByteLimit: 1 },
+      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "oversized" } })),
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("BUDGET_BYTES");
+    expect(result.ledger.usage.storedBytes).toBe(0);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(1);
+    expect((await journalEvents(dir)).some((event) => event.type === "answer_committed")).toBe(false);
+  });
 });
