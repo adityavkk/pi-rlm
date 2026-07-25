@@ -114,10 +114,25 @@ export const buildPreamble = (globals: CellGlobals): string => {
       if (r.ok) return r.value;
       const e = new Error((r.error && r.error.message) || "host error");
       if (r.error) {
-        e.name = r.error.name || "RlmError";
-        e.code = r.error.code;
-        e.details = r.error.details;
-        e.retryable = r.error.retryable;
+        e.name = typeof r.error.name === "string" ? r.error.name : "RlmError";
+        if (typeof r.error.code === "string") e.code = r.error.code;
+        if (typeof r.error.retryable === "boolean") e.retryable = r.error.retryable;
+        const d = r.error.details;
+        if (d && typeof d === "object" && !Array.isArray(d)) {
+          const details = {};
+          if (typeof d.stopReason === "string") details.stopReason = d.stopReason;
+          if (typeof d.provider === "string") details.provider = d.provider;
+          if (typeof d.model === "string") details.model = d.model;
+          const u = d.usage;
+          if (u && typeof u === "object" && !Array.isArray(u)
+            && typeof u.attempts === "number" && typeof u.durationMs === "number") {
+            const usage = { attempts: u.attempts, durationMs: u.durationMs };
+            for (const k of ["inputTokens", "outputTokens", "totalTokens", "costUsd"])
+              if (typeof u[k] === "number") usage[k] = u[k];
+            details.usage = usage;
+          }
+          if (Object.keys(details).length > 0) e.details = details;
+        }
       }
       throw e;
     });

@@ -17,6 +17,7 @@ import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import type { ContextDescriptor, ContextOperationControl } from "../shell/context-store.ts";
 import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
+import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
@@ -225,6 +226,25 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
     ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     identity,
   };
+};
+
+const piFailure = (error: PiModelError) => {
+  const code = error.code === "CANCELLED"
+    ? "CANCELLED"
+    : error.code === "PROVIDER_ERROR"
+      ? "FAILED"
+      : "INVALID_RESULT";
+  const message = code === "CANCELLED"
+    ? "model completion cancelled"
+    : code === "FAILED"
+      ? "model provider failed"
+      : "model completion returned an invalid result";
+  return callError(code, message, {
+    stopReason: error.stopReason,
+    provider: error.provider,
+    model: error.model,
+    usage: error.usage,
+  });
 };
 
 /** Handle one value-returning guest call. */
@@ -552,6 +572,14 @@ const llm = async (
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled(usage);
       logicalReserved = false;
+      if (error instanceof PiModelError) {
+        usage = addUsage(usage, error.usage);
+        if (pendingTokenReservation > 0) {
+          state.ledger.current = settle(state, pendingTokenReservation, error.usage.totalTokens ?? 0);
+          pendingTokenReservation = 0;
+        }
+        return errResult(callId, piFailure(error), usage, false);
+      }
       return errResult(callId, callError("FAILED", "model completion failed"), usage, false);
     } finally {
       if (pendingTokenReservation > 0) {

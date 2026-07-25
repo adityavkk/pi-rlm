@@ -67,17 +67,93 @@ export const INTERPRETER_ERROR_CODES = [
 ] as const;
 export type InterpreterErrorCode = (typeof INTERPRETER_ERROR_CODES)[number];
 
+export const ERROR_MESSAGE_MAX_LENGTH = 2_048;
+export const ERROR_DETAIL_MAX_LENGTH = 256;
+
+export interface SafeErrorUsage {
+  readonly attempts: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly costUsd?: number;
+  readonly durationMs: number;
+}
+
+export interface CallErrorDetails {
+  readonly stopReason?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly usage?: SafeErrorUsage;
+}
+
+const ownData = (value: object, key: string): unknown => {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const boundedString = (value: unknown, maxLength: number): string | undefined =>
+  typeof value === "string" ? value.slice(0, maxLength) : undefined;
+
+const nonNegativeNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+const normalizeSafeUsage = (value: unknown): SafeErrorUsage | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const attempts = nonNegativeNumber(ownData(value, "attempts"));
+  const durationMs = nonNegativeNumber(ownData(value, "durationMs"));
+  if (attempts === undefined || durationMs === undefined) return undefined;
+  const optional = (key: "inputTokens" | "outputTokens" | "totalTokens" | "costUsd"): number | undefined =>
+    nonNegativeNumber(ownData(value, key));
+  const inputTokens = optional("inputTokens");
+  const outputTokens = optional("outputTokens");
+  const totalTokens = optional("totalTokens");
+  const costUsd = optional("costUsd");
+  return {
+    attempts,
+    durationMs,
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
+  };
+};
+
+/** Copy only bounded, data-only fields that are safe to expose to a guest. */
+export const normalizeCallErrorDetails = (value: unknown): CallErrorDetails | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const stopReason = boundedString(ownData(value, "stopReason"), ERROR_DETAIL_MAX_LENGTH);
+  const provider = boundedString(ownData(value, "provider"), ERROR_DETAIL_MAX_LENGTH);
+  const model = boundedString(ownData(value, "model"), ERROR_DETAIL_MAX_LENGTH);
+  const usage = normalizeSafeUsage(ownData(value, "usage"));
+  if (stopReason === undefined && provider === undefined && model === undefined && usage === undefined) return undefined;
+  return {
+    ...(stopReason !== undefined ? { stopReason } : {}),
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+  };
+};
+
 export interface CallError {
   readonly code: CallErrorCode;
   readonly message: string;
   readonly retryable: boolean;
+  readonly details?: CallErrorDetails;
 }
 
-export const callError = (code: CallErrorCode, message: string): CallError => ({
-  code,
-  message,
-  retryable: isRetryable(code),
-});
+export const callError = (code: CallErrorCode, message: string, details?: unknown): CallError => {
+  const safeDetails = normalizeCallErrorDetails(details);
+  return {
+    code,
+    message: message.slice(0, ERROR_MESSAGE_MAX_LENGTH),
+    retryable: isRetryable(code),
+    ...(safeDetails ? { details: safeDetails } : {}),
+  };
+};
 
 export interface InterpreterError {
   readonly code: InterpreterErrorCode;

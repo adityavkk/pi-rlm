@@ -75,6 +75,97 @@ describe("QuickJsBackend", () => {
     expect(calls.map((c) => c.name)).toEqual(["llm", "llm"]);
   });
 
+  test("round-trips only allowlisted host error metadata", async () => {
+    const out = await run(
+      `let caught;
+      try {
+        await llm({ key: "k", prompt: "p" });
+      } catch (e) {
+        caught = {
+          name: e.name, message: e.message, code: e.code, retryable: e.retryable,
+          details: e.details, secret: e.secret, leakedHostStack: e.stack.includes("HOST_STACK_SECRET"),
+        };
+      }
+      caught`,
+      {
+        dispatch: async () => {
+          const error = new Error("provider failed") as Error & Record<string, unknown>;
+          Object.assign(error, {
+            code: "FAILED",
+            retryable: true,
+            secret: "HOST_SECRET",
+            details: {
+              stopReason: "error",
+              provider: "safe-provider",
+              model: "safe-model",
+              usage: { attempts: 1, inputTokens: 4, outputTokens: 2, totalTokens: 6, costUsd: 0.01, durationMs: 25 },
+              secret: "DETAIL_SECRET",
+              stack: "DETAIL_STACK",
+            },
+          });
+          error.stack = "HOST_STACK_SECRET";
+          throw error;
+        },
+      },
+    );
+    expect(out.kind).toBe("value");
+    if (out.kind === "value") expect(out.result).toEqual({
+      name: "Error",
+      message: "provider failed",
+      code: "FAILED",
+      retryable: true,
+      details: {
+        stopReason: "error",
+        provider: "safe-provider",
+        model: "safe-model",
+        usage: { attempts: 1, inputTokens: 4, outputTokens: 2, totalTokens: 6, costUsd: 0.01, durationMs: 25 },
+      },
+      leakedHostStack: false,
+    });
+  });
+
+  test("bounds oversized host error metadata", async () => {
+    const oversized = "x".repeat(100_000);
+    const out = await run(
+      `let caught;
+       try { await llm({ key: "k", prompt: "p" }); }
+       catch (e) { caught = { messageLength: e.message.length, providerLength: e.details.provider.length }; }
+       caught`,
+      {
+        dispatch: async () => {
+          throw Object.assign(new Error(oversized), { details: { provider: oversized } });
+        },
+      },
+    );
+    expect(out.kind).toBe("value");
+    if (out.kind === "value") expect(out.result).toEqual({ messageLength: 2_048, providerLength: 256 });
+  });
+
+  test("ignores inherited, accessor, and arbitrary error detail fields", async () => {
+    let getterRead = false;
+    const out = await run(
+      `let caught;
+       try { await llm({ key: "k", prompt: "p" }); }
+       catch (e) { caught = { message: e.message, hasCode: "code" in e, hasDetails: "details" in e }; }
+       caught`,
+      {
+        dispatch: async () => {
+          const error = Object.create({
+            code: "DENIED",
+            retryable: true,
+            details: { provider: "inherited", secret: "SECRET" },
+          });
+          Object.defineProperty(error, "message", { get: () => { getterRead = true; throw new Error("getter secret"); } });
+          Object.defineProperty(error, "details", { value: { secret: "SECRET", stack: "STACK" } });
+          throw error;
+        },
+      },
+    );
+    expect(getterRead).toBe(false);
+    expect(out.kind).toBe("value");
+    if (out.kind === "value") expect(out.result).toEqual({ message: "host call failed", hasCode: false, hasDetails: false });
+  });
+
   test("guest throw becomes a recoverable guest_error", async () => {
     const out = await run("throw new Error('boom')");
     expect(out.kind).toBe("guest_error");

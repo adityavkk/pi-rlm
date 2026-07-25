@@ -11,6 +11,7 @@ import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
+import { PiModelError } from "../shell/model/pi-model.ts";
 import { dispatchCall } from "./broker.ts";
 import type { GuestCallResult } from "./call-result.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
@@ -146,5 +147,65 @@ describe("dispatchCall cancellation ownership", () => {
     expect(prompts).toEqual(["stuck", "next"]);
     expect(state.inflight.size).toBe(0);
     expect(state.callCache.size).toBe(1);
+  });
+
+  test("preserves bounded Pi failure metadata and reported usage", async () => {
+    const usage = { attempts: 1, inputTokens: 8, outputTokens: 3, totalTokens: 11, costUsd: 0.04, durationMs: 75 };
+    const model: ModelClient = {
+      id: "typed-failure",
+      async complete(): Promise<ModelResponse> {
+        throw new PiModelError("PROVIDER_ERROR", "error", "test-provider", "test-model", usage, "sensitive provider message");
+      },
+    };
+    const normalized = normalizeProgram({
+      objective: "broker metadata",
+      profile: "default",
+      inputs: [],
+      outputs: [{ name: "answer", schema: { type: "string" } }],
+    });
+    if (!normalized.ok) throw new Error("invalid test program");
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-broker-"));
+    const startMs = Date.now();
+    const state: RunState = {
+      runId: "run_broker_metadata",
+      startMs,
+      profile: DEFAULT_PROFILE,
+      clock: systemClock,
+      hasher: sha256,
+      program: normalized.value,
+      ledger: { current: createLedger(resolveLimits(DEFAULT_PROFILE, startMs)) },
+      store: new ContextStore(dir),
+      artifacts: new Map(),
+      model,
+      journal: new JournalStore(dir),
+      backend: {} as InterpreterBackend,
+      callCache: new Map(),
+      inflight: new Map(),
+      semaphore: new Semaphore(1),
+      contextSemaphore: new Semaphore(1),
+      frameSeq: { current: 1 },
+    };
+    const result = await dispatchCall(
+      state,
+      { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] },
+      "llm",
+      { key: "failure", prompt: "fail" },
+      async () => { throw new Error("unexpected recurse"); },
+      new AbortController().signal,
+      Date.now() + 5_000,
+    ) as GuestCallResult;
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "FAILED",
+        message: "model provider failed",
+        retryable: true,
+        details: { stopReason: "error", provider: "test-provider", model: "test-model", usage },
+      },
+      usage,
+    });
+    expect(JSON.stringify(result)).not.toContain("sensitive provider message");
+    expect(state.ledger.current.usage.tokensReserved).toBe(0);
   });
 });
