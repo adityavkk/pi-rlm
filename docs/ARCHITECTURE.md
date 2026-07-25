@@ -66,6 +66,24 @@ Runtime (`src/runtime`, coordinator):
 - `extractor.ts` the fallback-extraction contract.
 - `run.ts` orchestration, input snapshotting, and completion.
 
+## Launch authorization boundary
+
+Launcher prompt guidance is not authority. The extension records the public Pi
+0.80.10 `input` and `turn_start` events in host-owned closure state, uses
+`sessionManager.getSessionId()` for the real session identity, and derives the
+turn binding from Pi's `turnIndex` and `timestamp`. It hashes the exact user
+input and the canonical normalized launch request. A grant also binds the exact
+Pi tool-call ID, expires, and is synchronously removed before runtime or backend
+initialization. Consumed grant metadata is persisted as a `pi-rlm-launch-grant`
+custom entry without source contents.
+
+Pi 0.80.10 does not expose an opaque turn nonce or the current user entry from a
+tool's `execute` context. Therefore `turnIndex:timestamp` is the strictest
+public host turn identity available, correlated through lifecycle events; it is
+not described as a Pi-issued nonce. Missing correlation fails closed. `/rlm`
+bypasses the agent turn lifecycle, so the command handler creates a unique
+host-owned command nonce and immediately consumes its bound grant.
+
 ## Invariants
 
 - Full source content never enters a model request unless a bounded slice was

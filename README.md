@@ -65,8 +65,11 @@ Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
 
 - Tool call (model initiated, after you ask to "use pi-rlm"): the model calls
   `rlm_run` with either `{ objective, context }` or a typed `{ program, sources }`.
-  The host asks you to approve before anything is spent. Without a UI, an
-  unsolicited call is refused with `RLM_OPT_IN_REQUIRED`.
+  An explicit phrase in the current host input authorizes only the first exact
+  tool call in that Pi turn. Otherwise, interactive modes display the normalized
+  objective, program shape, sources, and request hash for confirmation. Headless
+  unsolicited calls fail with `RLM_OPT_IN_REQUIRED`; there is no environment
+  variable bypass.
 
 Model routing is configured with environment variables (all default to a single
 model):
@@ -112,9 +115,11 @@ deferreds plus a single centralized job-pump loop. See
 QuickJS, fresh contexts, budgets, and tool filtering are capability controls,
 not an operating-system sandbox. The guest has no `process`, `require`, dynamic
 import, network, timers, `Date`, or `Math.random`. CPU time and heap are capped
-per cell. A run cannot start without an explicit host grant, so prompt text
-alone can never spend your tokens. Do not rely on this to run untrusted code
-against secrets; it is a bounded capability layer, not a security boundary.
+per cell. Every run consumes one host-owned grant bound to its Pi session, host
+turn identity, user-prompt hash, normalized request hash, and exact tool call.
+The model cannot submit a grant ID or reuse a consumed call. Do not rely on this
+to run untrusted code against secrets; it is a bounded capability layer, not a
+security boundary.
 
 ## Testing
 
