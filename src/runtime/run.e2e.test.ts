@@ -73,6 +73,7 @@ describe("runProgram e2e", () => {
       signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
+    expect(result.runId).toMatch(/^run_[0-9a-f]{64}$/);
     expect(result.completionMode).toBe("answer");
     expect(result.answer).toEqual({ total: 3 });
     expect(model.callCount).toBe(3);

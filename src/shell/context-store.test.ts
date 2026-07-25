@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { link as hardLink, mkdir, mkdtemp, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -667,10 +667,122 @@ describe("ContextStore", () => {
     expect(new TextDecoder().decode(await new ContextStore(dir).loadFromDisk(first))).toBe("same concurrent payload");
   });
 
+  test("a publisher rollback cannot unlink another store's committed dedupe", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-cross-store-"));
+    const payload = "shared transaction payload";
+    let chargedA = 0;
+    let chargedB = 0;
+    const reserve = (charged: "a" | "b") => (bytes: number) => {
+      if (charged === "a") chargedA += bytes;
+      else chargedB += bytes;
+      let remaining = bytes;
+      return {
+        commit: () => { remaining = 0; },
+        release: (released: number) => {
+          remaining -= released;
+          if (charged === "a") chargedA -= released;
+          else chargedB -= released;
+        },
+        rollback: () => {
+          if (charged === "a") chargedA -= remaining;
+          else chargedB -= remaining;
+          remaining = 0;
+        },
+      };
+    };
+    const publisher = new ContextStore(dir);
+    const deduper = new ContextStore(dir);
+    const transaction = await publisher.beginDerive({ key: "a", value: payload }, { reserveBytes: reserve("a") });
+    const committed = await deduper.derive({ key: "b", value: payload }, { reserveBytes: reserve("b") });
+
+    await transaction.rollback();
+
+    expect(chargedA).toBe(Buffer.byteLength(payload));
+    expect(chargedB).toBe(Buffer.byteLength(payload));
+    expect(publisher.totalBytes()).toBe(Buffer.byteLength(payload));
+    expect(publisher.orphanedBytes()).toBe(Buffer.byteLength(payload));
+    expect(deduper.totalBytes()).toBe(Buffer.byteLength(payload));
+    expect(await readdir(join(dir, "contexts"))).toEqual([`${committed.sha256}.bin`]);
+    expect(new TextDecoder().decode(await new ContextStore(dir).loadFromDisk(committed))).toBe(payload);
+  });
+
+  test("rejects a contexts directory symlink without writing outside the run root", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-dir-link-"));
+    const outside = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-outside-"));
+    await symlink(outside, join(dir, "contexts"), "dir");
+    await expect(new ContextStore(dir).ingestText("escape", "must stay inside"))
+      .rejects.toMatchObject({ code: "CONTEXT_INTEGRITY_FAILED", reason: "type" });
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  test.each(["symlink", "hardlink"] as const)("rejects a final payload %s", async (kind) => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-final-link-"));
+    const outside = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-final-outside-"));
+    await mkdir(join(dir, "contexts"));
+    const payload = "linked payload";
+    const digest = sha256(payload);
+    const external = join(outside, "payload.bin");
+    await writeFile(external, payload);
+    const finalPath = join(dir, "contexts", `${digest}.bin`);
+    if (kind === "symlink") await symlink(external, finalPath);
+    else await hardLink(external, finalPath);
+    await expect(new ContextStore(dir).loadFromDisk({ id: `ctx_${digest}`, sha256: digest, bytes: payload.length }))
+      .rejects.toMatchObject({ code: "CONTEXT_INTEGRITY_FAILED", reason: "type" });
+  });
+
+  test.each(["corrupt", "partial"] as const)("post-write %s temp content is never published", async (fault) => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-post-write-"));
+    const faulted = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+      syncFile: async (path) => { await writeFile(path, fault === "partial" ? "x" : "corrupt payload"); },
+    });
+    await expect(faulted.ingestText("fault", "complete payload"))
+      .rejects.toMatchObject({ code: "CONTEXT_INTEGRITY_FAILED" });
+    expect((await readdir(join(dir, "contexts")).catch(() => [])).filter((name) => name.endsWith(".bin"))).toEqual([]);
+  });
+
+  test("published unlink failure reports final and temp, then settles only the exclusive temp", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-published-orphan-"));
+    const payload = "published orphan";
+    let attempts = 0;
+    let charged = 0;
+    const faulted = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+      unlink: async (path) => {
+        if (++attempts <= 2) throw new Error("injected unlink failure");
+        await unlink(path);
+      },
+    });
+    await expect(faulted.ingestText("fault", payload, "text/plain", {
+      reserveBytes: (bytes) => {
+        charged += bytes;
+        return { commit: () => {}, release: (released) => { charged -= released; }, rollback: () => { charged -= bytes; } };
+      },
+    })).rejects.toMatchObject({
+      code: "CONTEXT_CLEANUP_FAILED",
+      failures: [
+        { path: expect.stringMatching(/\.bin$/), bytes: Buffer.byteLength(payload) },
+        { path: expect.stringMatching(/\.tmp$/), bytes: Buffer.byteLength(payload) },
+      ],
+    });
+    expect(charged).toBe(Buffer.byteLength(payload));
+    expect(faulted.orphanedBytes()).toBe(Buffer.byteLength(payload));
+    const orphanFiles = await readdir(join(dir, "contexts"));
+    expect(orphanFiles.filter((name) => name.endsWith(".tmp"))).toHaveLength(1);
+    expect(orphanFiles.filter((name) => name.endsWith(".bin"))).toEqual([`${sha256(payload)}.bin`]);
+
+    await faulted.cleanupOrphans();
+    expect(faulted.orphanedBytes()).toBe(Buffer.byteLength(payload));
+    expect(charged).toBe(Buffer.byteLength(payload));
+    expect(await readdir(join(dir, "contexts"))).toEqual([`${sha256(payload)}.bin`]);
+    const reference = { id: `ctx_${sha256(payload)}`, sha256: sha256(payload), bytes: Buffer.byteLength(payload) };
+    expect(new TextDecoder().decode(await new ContextStore(dir).loadFromDisk(reference))).toBe(payload);
+  });
+
   test.each(["write", "sync", "rename", "directory sync"] as const)(
-    "%s fault never leaves a partial final payload",
+    "%s fault never publishes unverified content",
     async (phase) => {
       const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-fault-"));
+      const payload = "complete payload";
+      const digest = sha256(payload);
       const faulted = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
         ...(phase === "write" ? {
           writeFile: async (path, bytes) => {
@@ -684,10 +796,17 @@ describe("ContextStore", () => {
           syncDirectory: async () => { throw new Error("injected directory sync fault"); },
         } : {}),
       });
-      await expect(faulted.ingestText("fault", "complete payload")).rejects.toBeInstanceOf(Error);
+      await expect(faulted.ingestText("fault", payload)).rejects.toBeInstanceOf(Error);
       const files = await readdir(join(dir, "contexts")).catch(() => []);
-      expect(files.filter((name) => name.endsWith(".bin"))).toEqual([]);
+      expect(files.filter((name) => name.endsWith(".bin"))).toEqual(
+        phase === "directory sync" ? [`${digest}.bin`] : [],
+      );
       expect(files.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+      if (phase === "directory sync") {
+        const reference = { id: `ctx_${digest}`, sha256: digest, bytes: Buffer.byteLength(payload) };
+        expect(new TextDecoder().decode(await new ContextStore(dir).loadFromDisk(reference))).toBe(payload);
+        expect(faulted.orphanedBytes()).toBe(Buffer.byteLength(payload));
+      }
     },
   );
 

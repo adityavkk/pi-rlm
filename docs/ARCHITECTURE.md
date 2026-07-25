@@ -112,7 +112,9 @@ back with the mutation. Included producers:
 
 - UTF-8 context payloads: initial source batches, derive, concat, chunks,
   artifact-to-context conversion, and direct/fallback answer snapshots. A SHA
-  already present in `ContextStore` has zero delta, including duplicate chunks.
+  already present in the same `ContextStore` has zero delta, including duplicate
+  chunks. Independent stores sharing a contexts directory each charge the exact
+  run-local unique bytes once, even when their physical final file deduplicates.
 - UTF-8 artifact payloads retained by artifact id. Duplicate content in the
   artifact map has zero delta; a separate context snapshot is a separate
   logical producer.
@@ -121,13 +123,32 @@ back with the mutation. Included producers:
   cache insertion commits.
 
 The logical payload is charged once even when `ContextStore` keeps both an
-in-memory byte array and its durable content-addressed file. Returned views,
-bounded previews, workspace/trajectory objects, and serialization buffers are
-transient and not additional charges. `events.jsonl`, rebuildable `status.json`,
+in-memory byte array and its durable content-addressed file. A transaction owns
+only its random temporary pathname. Once its final content address is published,
+that name is shareable across processes and rollback never unlinks it. A rolled
+back publisher therefore retains one full run-local charge as a valid orphan;
+hard-link temporary aliases add no second charge. Returned views, bounded
+previews, workspace/trajectory objects, and serialization buffers are transient
+and not additional charges. `events.jsonl`, rebuildable `status.json`,
 run-manifest hashes, and control metadata are excluded: this journal is the
 authoritative control plane and must remain writable to record exhaustion and
 terminal state. The v1 checkpoint bridge stores no snapshots. Provider-token
 accounting remains separate from stored bytes.
+
+## Context filesystem boundary
+
+Context publication uses exclusive temporary creation, file sync, a verified
+post-write re-read, atomic no-clobber hard-link publication, temporary unlink,
+and directory sync. Existing `contexts` symlinks/non-directories are rejected.
+Payload opens use `O_NOFOLLOW` where available and require a regular file with
+exactly one link before length/SHA-256 verification. Real paths are revalidated
+against the trusted run root around publication and restart loads.
+
+Node does not expose an `openat`-style directory capability. These checks reject
+stable symlink, hard-link, and containment attacks, but they are not an OS
+sandbox against a same-user adversary swapping directory entries in the narrow
+interval between pathname checks and operations. Run directories must remain
+same-user trusted.
 
 ## Model invocation accounting
 

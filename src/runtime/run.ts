@@ -312,7 +312,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const startMs = clock.now();
   const limits = resolveLimits(profile, startMs);
   const ledgerRef = { current: createLedger(limits) };
-  const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`).slice(0, 16)}`;
+  const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`)}`;
   const rootFrameId = `${runId}:f0`;
   const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));

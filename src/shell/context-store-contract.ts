@@ -91,9 +91,11 @@ export class ContextUnavailableError extends Error {
   }
 }
 
+export type ContextIntegrityReason = "length" | "hash" | "type" | "containment";
+
 export class ContextIntegrityError extends Error {
   readonly code = "CONTEXT_INTEGRITY_FAILED";
-  constructor(readonly contextId: string, reason: "length" | "hash") {
+  constructor(readonly contextId: string, readonly reason: ContextIntegrityReason) {
     super(`context ${contextId} failed ${reason} verification`);
     this.name = "ContextIntegrityError";
   }
