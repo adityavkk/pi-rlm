@@ -49,6 +49,8 @@ export interface RunState {
   readonly hasher: Hasher;
   readonly program: RlmProgram;
   readonly ledger: { current: Ledger };
+  /** @internal Test-only observation of successful controller-turn reservations. */
+  readonly onControllerTurnReserved?: (controllerTurns: number) => void;
   readonly store: ContextStore;
   readonly artifacts: Map<string, { descriptor: ArtifactDescriptor; text: string }>;
   readonly model: ModelClient;

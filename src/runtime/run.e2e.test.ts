@@ -185,6 +185,7 @@ describe("runProgram e2e", () => {
       async dispose(): Promise<void> {}
     }
 
+    const observedControllerTurns: number[] = [];
     const child = new DelayedChildController();
     const controller = new MockController(
       [{
@@ -202,6 +203,7 @@ describe("runProgram e2e", () => {
       backend: new CancellingBackend(),
       dir,
       signal: new AbortController().signal,
+      onControllerTurnReserved: (controllerTurns) => { observedControllerTurns.push(controllerTurns); },
     });
 
     expect(result.status).toBe("failed");
@@ -210,15 +212,17 @@ describe("runProgram e2e", () => {
     expect(child.calls).toBe(1);
     expect(result.ledger.usage.controllerTurns).toBe(2);
     const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
-    const ledgerAtFinalization = JSON.stringify(result.ledger);
+    const observedCountAtFinalization = observedControllerTurns.length;
+    const observedTurnsAtFinalization = observedControllerTurns.at(-1);
+    expect(observedCountAtFinalization).toBe(2);
+    expect(observedTurnsAtFinalization).toBe(2);
 
     releaseChild();
     await childSettled;
     await Promise.resolve();
     expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(eventsAtFinalization);
-    expect(JSON.stringify(result.ledger)).toBe(ledgerAtFinalization);
-    // A late continuation would reserve another controller turn before this
-    // second next() call, so one call proves both scheduling and ledger stopped.
+    expect(observedControllerTurns).toHaveLength(observedCountAtFinalization);
+    expect(observedControllerTurns.at(-1)).toBe(observedTurnsAtFinalization);
     expect(child.calls).toBe(1);
   }, 5_000);
 

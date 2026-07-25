@@ -54,6 +54,8 @@ export interface RunInput {
   readonly extractor?: Extractor;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
+  /** @internal Test-only observation of successful controller-turn reservations. */
+  readonly onControllerTurnReserved?: (controllerTurns: number) => void;
 }
 
 export interface RunError {
@@ -405,6 +407,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       hasher: sha256,
       program: input.program,
       ledger: ledgerRef,
+      ...(input.onControllerTurnReserved ? { onControllerTurnReserved: input.onControllerTurnReserved } : {}),
       store,
       artifacts: new Map(),
       model: input.model,

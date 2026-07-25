@@ -107,6 +107,7 @@ export const runFrame = async (
         ? { exhausted: false, deadline: true, workspace, entries }
         : { exhausted: true, workspace, entries };
     state.ledger.current = turn.value;
+    state.onControllerTurnReserved?.(turn.value.usage.controllerTurns);
 
     const projection = projectTrajectory(entries, state.profile.trajectory);
     const controllerOperation = createModelOperation(state, frame, {
