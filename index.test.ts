@@ -43,7 +43,11 @@ const failedRun = {
   error: { code: "TEST_FAILURE", message: "test run finished" },
 } as unknown as RunResult;
 
-const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {}) => {
+const harness = (options: {
+  ttl?: number;
+  runtime?: RlmRuntimeDependencies;
+  executeRun?: (request: unknown, signal: AbortSignal) => Promise<RunResult>;
+} = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
   const events = new Map<string, EventHandler[]>();
@@ -60,6 +64,7 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
   let nextId = 0;
   let hasUI = true;
   let confirm: (title: string, message: string) => boolean | Promise<boolean> = () => true;
+  let appendFaultType: string | undefined;
 
   const ctx = {
     get hasUI() {
@@ -87,6 +92,7 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     registerCommand: (name: string, definition: CapturedCommand) => commands.set(name, definition),
     on: (name: string, handler: EventHandler) => events.set(name, [...(events.get(name) ?? []), handler]),
     appendEntry: (type: string, data: Record<string, unknown>) => {
+      if (type === appendFaultType) throw new Error("injected append failure with /private/host/path");
       (type === "pi-rlm-result" ? resultEntries : audits).push({ type, data });
       return `entry-${audits.length + resultEntries.length}`;
     },
@@ -103,7 +109,7 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
             initializationAuditCounts.push(audits.length);
             runSignals.push(signal);
             runs.push(request);
-            return failedRun;
+            return options.executeRun ? options.executeRun(request, signal) : failedRun;
           },
         }),
     now: () => clock,
@@ -145,6 +151,9 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     },
     setConfirm: (value: typeof confirm) => {
       confirm = value;
+    },
+    setAppendFaultType: (value: string | undefined) => {
+      appendFaultType = value;
     },
   };
 };
@@ -656,6 +665,60 @@ describe("pi-rlm extension wiring", () => {
     expect(h.audits[0]?.data["toolCallId"]).toMatch(/^command:host-/);
   });
 
+  test("a command transition during capture launches and delivers nothing into the replacement", async () => {
+    const h = harness();
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    await h.emit("session_before_switch", { reason: "resume" });
+    h.setSessionId("session-2");
+    await pending;
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+    expect(h.resultEntries).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(0);
+  });
+
+  test("a command transition during a long run retains the run result without cross-delivery", async () => {
+    let resolveRun!: (result: RunResult) => void;
+    const pendingRun = new Promise<RunResult>((resolve) => { resolveRun = resolve; });
+    const h = harness({ executeRun: async () => pendingRun });
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    while (h.runs.length === 0) await Promise.resolve();
+    await h.emit("session_before_fork", { entryId: "entry-1", position: "at" });
+    h.setSessionId("session-2");
+    resolveRun(failedRun);
+    await pending;
+    expect(h.runs).toHaveLength(1);
+    expect(h.resultEntries).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(0);
+  });
+
+  test("launch audit failure is bounded, launches no run, and does not expose raw errors", async () => {
+    const h = harness();
+    h.setAppendFaultType("pi-rlm-launch-grant");
+    await h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    expect(h.runs).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(1);
+    expect(h.resultMessages[0]?.message["content"]).toContain("RLM_AUDIT_FAILED");
+    expect(JSON.stringify(h.resultMessages)).not.toContain("/private/host/path");
+  });
+
+  test("confirmation and tool audit exceptions return structured results without launch", async () => {
+    const confirmation = harness();
+    await confirmation.startTurn("Use pi-rlm");
+    confirmation.setConfirm(() => Promise.reject(new Error("/private/confirm/path")));
+    const confirmationResult = await rlmTool(confirmation).execute("confirm-fault", { objective: "Review" }, undefined, undefined, confirmation.ctx);
+    expect(confirmationResult.content[0]?.text).toContain("RLM_CONFIRMATION_FAILED");
+    expect(confirmation.runs).toHaveLength(0);
+    expect(confirmationResult.content[0]?.text).not.toContain("/private/confirm/path");
+
+    const audited = harness();
+    await audited.startTurn("Use pi-rlm");
+    audited.setAppendFaultType("pi-rlm-launch-grant");
+    const auditResult = await rlmTool(audited).execute("audit-fault", { objective: "Review" }, undefined, undefined, audited.ctx);
+    expect(auditResult.content[0]?.text).toContain("RLM_AUDIT_FAILED");
+    expect(audited.runs).toHaveLength(0);
+  });
+
   test("removed ambient bypass cannot authorize a headless call", async () => {
     process.env["PI_RLM_ALLOW_UNSOLICITED"] = "1";
     const h = harness();
@@ -756,7 +819,7 @@ describe("pi-rlm extension wiring", () => {
     await h.emit(eventName, event);
     await pending;
 
-    expect(h.resultMessages.at(-1)?.message["content"]).toContain('"status":"cancelled"');
+    expect(h.resultMessages).toHaveLength(0);
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));

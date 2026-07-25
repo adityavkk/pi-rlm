@@ -3,12 +3,15 @@
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isProxy } from "node:util/types";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { compileShorthand, normalizeProgram, parseJsonValue, type RlmProgram } from "../core/index.ts";
+import { throwIfAborted, wasAborted } from "../runtime/abort.ts";
 
 export const INLINE_SOURCE_MAX_BYTES = 64 * 1024 * 1024;
 export const SESSION_SOURCE_MAX_BYTES = 16 * 1024 * 1024;
 export const SESSION_SOURCE_MAX_ENTRIES = 10_000;
+export const SESSION_SOURCE_MAX_NODES = 50_000;
 
 export type RlmSourceErrorCode =
   | "RLM_SOURCE_REQUIRED"
@@ -159,38 +162,51 @@ const parentPaths = (root: string, candidate: string): string[] => {
   return paths;
 };
 
-const snapshotParents = async (paths: readonly string[]): Promise<StableStat[]> => {
+const snapshotParents = async (paths: readonly string[], signal?: AbortSignal): Promise<StableStat[]> => {
   const snapshots: StableStat[] = [];
   for (const path of paths) {
+    throwIfAborted(signal);
     const stat = await lstat(path, { bigint: true });
+    throwIfAborted(signal);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe parent");
     snapshots.push(stableStat(stat));
   }
   return snapshots;
 };
 
-const readTrustedProjectFile = async (cwd: string, requestedPath: string): Promise<SourceResult> => {
+const readTrustedProjectFile = async (
+  cwd: string,
+  requestedPath: string,
+  signal?: AbortSignal,
+): Promise<SourceResult> => {
+  throwIfAborted(signal);
   if (!validRelativePath(requestedPath))
     return failure("RLM_SOURCE_INVALID", "File source must be a safe relative path under the real project directory.");
   try {
     const root = await realpath(cwd);
+    throwIfAborted(signal);
     const candidate = resolve(root, requestedPath);
     const rel = relative(root, candidate);
     if (!rel || rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))
       return failure("RLM_SOURCE_INVALID", "File source must remain under the real project directory.");
     const parents = parentPaths(root, candidate);
-    const beforeParents = await snapshotParents(parents);
+    const beforeParents = await snapshotParents(parents, signal);
+    throwIfAborted(signal);
     const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
     const handle = await open(candidate, flags);
     try {
+      throwIfAborted(signal);
       const before = await handle.stat({ bigint: true });
+      throwIfAborted(signal);
       if (!before.isFile() || before.nlink !== 1n)
         return failure("RLM_SOURCE_INVALID", "File source must be a regular, singly linked file.");
       if (before.size > BigInt(INLINE_SOURCE_MAX_BYTES))
         return failure("RLM_SOURCE_LIMIT", "File source exceeds the 64 MiB limit.");
-      const bytes = await handle.readFile();
+      const bytes = await handle.readFile(signal ? { signal } : undefined);
+      throwIfAborted(signal);
       const after = await handle.stat({ bigint: true });
-      const afterParents = await snapshotParents(parents);
+      throwIfAborted(signal);
+      const afterParents = await snapshotParents(parents, signal);
       if (!sameStat(stableStat(before), stableStat(after))
         || beforeParents.some((stat, index) => !sameStat(stat, afterParents[index]!)))
         return failure("RLM_SOURCE_INVALID", "File source changed while it was being captured.");
@@ -202,6 +218,7 @@ const readTrustedProjectFile = async (cwd: string, requestedPath: string): Promi
       } catch {
         return failure("RLM_SOURCE_ENCODING", "File source is not valid UTF-8.");
       }
+      throwIfAborted(signal);
       if (!text.trim()) return failure("RLM_SOURCE_REQUIRED", "File source must contain non-whitespace text.");
       const compiled = compileShorthand({ objective: "placeholder" });
       if (!compiled.ok) throw new Error("shorthand invariant");
@@ -209,83 +226,126 @@ const readTrustedProjectFile = async (cwd: string, requestedPath: string): Promi
     } finally {
       await handle.close();
     }
-  } catch {
+  } catch (error) {
+    if (wasAborted(error, signal)) throw error;
     return failure("RLM_SOURCE_INVALID", "File source could not be captured safely.");
   }
 };
 
-const own = (value: unknown, key: PropertyKey): unknown => {
-  if ((typeof value !== "object" && typeof value !== "function") || value === null) throw new Error("not an object");
-  const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (!descriptor || !("value" in descriptor)) throw new Error("missing or accessor property");
-  return descriptor.value;
-};
+class SessionSourceLimitError extends RangeError {}
+class SessionSourceInvalidError extends Error {}
 
-const safeArray = (value: unknown, max: number): unknown[] => {
-  if (!Array.isArray(value)) throw new Error("not an array");
-  const length = own(value, "length");
-  if (!Number.isSafeInteger(length) || (length as number) < 0) throw new Error("invalid array length");
-  if ((length as number) > max) throw new RangeError("array limit");
-  const result: unknown[] = [];
-  for (let index = 0; index < (length as number); index++) result.push(own(value, index));
-  return result;
-};
+class SessionTraversal {
+  private count = 0;
 
-const textualContent = (content: unknown): string => {
-  if (typeof content === "string") return content;
-  const blocks = safeArray(content, SESSION_SOURCE_MAX_ENTRIES);
-  const text: string[] = [];
-  for (const block of blocks) {
-    if (!isRecord(block)) continue;
-    const type = own(block, "type");
-    if (type !== "text") continue;
-    const value = own(block, "text");
-    if (typeof value === "string") text.push(value);
+  constructor(private readonly signal?: AbortSignal) {}
+
+  private rejectProxy(value: unknown): void {
+    if ((typeof value === "object" && value !== null) || typeof value === "function") {
+      if (isProxy(value)) throw new SessionSourceInvalidError("proxy value");
+    }
   }
+
+  /** Charge before inspecting a node, block, entry, or property descriptor. */
+  touch(value?: unknown): void {
+    throwIfAborted(this.signal);
+    this.rejectProxy(value);
+    this.count += 1;
+    if (this.count > SESSION_SOURCE_MAX_NODES) throw new SessionSourceLimitError("session node limit");
+  }
+
+  own(value: unknown, key: PropertyKey): unknown {
+    this.touch(value);
+    if ((typeof value !== "object" && typeof value !== "function") || value === null)
+      throw new SessionSourceInvalidError("not an object");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) throw new SessionSourceInvalidError("missing or accessor property");
+    this.rejectProxy(descriptor.value);
+    return descriptor.value;
+  }
+
+  array(value: unknown, max: number, visit: (item: unknown) => void): void {
+    this.touch(value);
+    if (!Array.isArray(value)) throw new SessionSourceInvalidError("not an array");
+    const length = this.own(value, "length");
+    if (!Number.isSafeInteger(length) || (length as number) < 0) throw new SessionSourceInvalidError("invalid array length");
+    if ((length as number) > max) throw new SessionSourceLimitError("array limit");
+    for (let index = 0; index < (length as number); index++) {
+      this.touch(); // Entry/content-block charge occurs before its descriptor is requested.
+      visit(this.own(value, index));
+    }
+  }
+
+  record(value: unknown): value is Record<string, unknown> {
+    this.rejectProxy(value);
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+}
+
+const textualContent = (content: unknown, traversal: SessionTraversal): string => {
+  if (typeof content === "string") return content;
+  const text: string[] = [];
+  traversal.array(content, SESSION_SOURCE_MAX_ENTRIES, (block) => {
+    // array() charged this content block even when it is excluded below.
+    if (!traversal.record(block)) return;
+    const type = traversal.own(block, "type");
+    if (type !== "text") return;
+    const value = traversal.own(block, "text");
+    if (typeof value === "string") text.push(value);
+  });
   return text.join("\n");
 };
 
-const projectSession = (ctx: ExtensionContext): SourceResult => {
+const projectSession = (ctx: ExtensionContext, signal?: AbortSignal): SourceResult => {
   try {
-    const entries = safeArray(ctx.sessionManager.buildContextEntries(), SESSION_SOURCE_MAX_ENTRIES);
+    throwIfAborted(signal);
+    const traversal = new SessionTraversal(signal);
+    const rawEntries = ctx.sessionManager.buildContextEntries();
+    traversal.touch(rawEntries); // Reject a root Proxy before Array.isArray or descriptor access.
     const parts: string[] = [];
     let bytes = 0;
     const add = (label: string, text: string): void => {
+      throwIfAborted(signal);
       if (!text.trim()) return;
-      const part = `${label}\n${text}`;
       const separatorBytes = parts.length === 0 ? 0 : 2;
+      if (label.length + text.length > SESSION_SOURCE_MAX_BYTES - bytes - separatorBytes)
+        throw new SessionSourceLimitError("session byte limit");
+      const part = `${label}\n${text}`;
       const partBytes = Buffer.byteLength(part, "utf8");
-      if (partBytes > SESSION_SOURCE_MAX_BYTES - bytes - separatorBytes) throw new RangeError("session byte limit");
+      if (partBytes > SESSION_SOURCE_MAX_BYTES - bytes - separatorBytes)
+        throw new SessionSourceLimitError("session byte limit");
       parts.push(part);
       bytes += separatorBytes + partBytes;
     };
-    for (const entry of entries) {
-      const type = own(entry, "type");
+    traversal.array(rawEntries, SESSION_SOURCE_MAX_ENTRIES, (entry) => {
+      // array() charged this entry before any descriptor access, including excluded entries.
+      const type = traversal.own(entry, "type");
       if (type === "message") {
-        const message = own(entry, "message");
-        const role = own(message, "role");
-        if (role !== "user" && role !== "assistant") continue;
-        add(`[${role}]`, textualContent(own(message, "content")));
+        const message = traversal.own(entry, "message");
+        const role = traversal.own(message, "role");
+        if (role !== "user" && role !== "assistant") return;
+        add(`[${role}]`, textualContent(traversal.own(message, "content"), traversal));
       } else if (type === "compaction") {
-        const summary = own(entry, "summary");
+        const summary = traversal.own(entry, "summary");
         if (typeof summary === "string") add("[compaction]", summary);
       } else if (type === "branch_summary") {
-        const summary = own(entry, "summary");
+        const summary = traversal.own(entry, "summary");
         if (typeof summary === "string") add("[branch-summary]", summary);
       } else if (type === "custom_message") {
-        const customType = own(entry, "customType");
-        if (typeof customType !== "string") throw new Error("invalid custom type");
-        add(`[custom:${customType}]`, textualContent(own(entry, "content")));
+        const customType = traversal.own(entry, "customType");
+        if (typeof customType !== "string") throw new SessionSourceInvalidError("invalid custom type");
+        add(`[custom:${customType}]`, textualContent(traversal.own(entry, "content"), traversal));
       }
-    }
+    });
     const context = parts.join("\n\n");
     if (!context.trim()) return failure("RLM_SOURCE_REQUIRED", "The active session branch has no eligible text source.");
     const compiled = compileShorthand({ objective: "placeholder" });
     if (!compiled.ok) throw new Error("shorthand invariant");
     return { ok: true, value: { program: compiled.value, sources: Object.freeze({ context }) } };
   } catch (error) {
-    return error instanceof RangeError
-      ? failure("RLM_SOURCE_LIMIT", "Session source exceeds 16 MiB or 10,000 active entries.")
+    if (wasAborted(error, signal)) throw error;
+    return error instanceof SessionSourceLimitError
+      ? failure("RLM_SOURCE_LIMIT", "Session source exceeds 16 MiB, 10,000 active entries, or 50,000 traversed nodes.")
       : failure("RLM_SOURCE_INVALID", "Session source could not be traversed safely.");
   }
 };
@@ -298,13 +358,19 @@ const withObjective = (captured: SourceResult, objective: string): SourceResult 
 };
 
 /** Parse and capture one of the four normative /rlm command forms. */
-export const captureCommandRequest = async (args: string, ctx: ExtensionContext): Promise<SourceResult> => {
+export const captureCommandRequest = async (
+  args: string,
+  ctx: ExtensionContext,
+  signal?: AbortSignal,
+): Promise<SourceResult> => {
+  throwIfAborted(signal);
   const input = args.trim();
   if (!input) return failure("RLM_SOURCE_REQUIRED", "A normative /rlm source form is required.");
   if (input.startsWith("{")) {
     let parsed: unknown;
     try { parsed = JSON.parse(input); }
     catch { return failure("RLM_SOURCE_INVALID", "Command JSON must be strict and contain no trailing content."); }
+    throwIfAborted(signal);
     return buildInlineRequest(parsed);
   }
   if (input.startsWith("--file")) {
@@ -312,13 +378,16 @@ export const captureCommandRequest = async (args: string, ctx: ExtensionContext)
     if (!matched || !matched[2]!.trim()) return failure("RLM_SOURCE_INVALID", "Malformed --file command form.");
     let trusted = false;
     try { trusted = ctx.isProjectTrusted(); } catch { /* fail closed */ }
+    throwIfAborted(signal);
     if (!trusted) return failure("RLM_SOURCE_INVALID", "File source requires a trusted project.");
-    return withObjective(await readTrustedProjectFile(ctx.cwd, matched[1]!), matched[2]!);
+    const captured = await readTrustedProjectFile(ctx.cwd, matched[1]!, signal);
+    throwIfAborted(signal);
+    return withObjective(captured, matched[2]!);
   }
   if (input.startsWith("--session")) {
     const matched = /^--session -- ([\s\S]+)$/.exec(input);
     if (!matched || !matched[1]!.trim()) return failure("RLM_SOURCE_INVALID", "Malformed --session command form.");
-    return withObjective(projectSession(ctx), matched[1]!);
+    return withObjective(projectSession(ctx, signal), matched[1]!);
   }
   if (input.startsWith("--")) return failure("RLM_SOURCE_INVALID", "Malformed /rlm command form.");
   return failure("RLM_SOURCE_REQUIRED", "Bare objectives are not accepted; provide an explicit source.");

@@ -9,6 +9,7 @@ import {
   captureCommandRequest,
   INLINE_SOURCE_MAX_BYTES,
   SESSION_SOURCE_MAX_ENTRIES,
+  SESSION_SOURCE_MAX_NODES,
 } from "./source.ts";
 import { FULL_ANSWER_MAX_BYTES, projectRunResult, resultContent, resultMetadata } from "./result.ts";
 
@@ -131,6 +132,36 @@ describe("strict source forms", () => {
     expect(await captureCommandRequest("--session -- Review", commandContext(process.cwd(), [entry])))
       .toMatchObject({ ok: false, error: { code: "RLM_SOURCE_INVALID" } });
     expect(invoked).toBe(false);
+  });
+
+  test("rejects root and recursively nested Proxies before invoking any trap", async () => {
+    let traps = 0;
+    const handler: ProxyHandler<object> = {
+      get() { traps++; throw new Error("get trap"); },
+      getOwnPropertyDescriptor() { traps++; throw new Error("descriptor trap"); },
+      getPrototypeOf() { traps++; throw new Error("prototype trap"); },
+      ownKeys() { traps++; throw new Error("keys trap"); },
+    };
+    const root = new Proxy([], handler);
+    expect(await captureCommandRequest("--session -- Review", commandContext(process.cwd(), root as never)))
+      .toMatchObject({ ok: false, error: { code: "RLM_SOURCE_INVALID" } });
+    expect(traps).toBe(0);
+
+    const nested = new Proxy({ role: "user", content: "hidden" }, handler);
+    expect(await captureCommandRequest("--session -- Review", commandContext(process.cwd(), [
+      { type: "message", message: nested },
+    ]))).toMatchObject({ ok: false, error: { code: "RLM_SOURCE_INVALID" } });
+    expect(traps).toBe(0);
+  });
+
+  test("uses one global traversal budget for a 10k-by-10k excluded-block adversary", async () => {
+    const excludedBlocks = Array.from({ length: SESSION_SOURCE_MAX_ENTRIES }, () => ({ type: "image", data: "excluded" }));
+    const entries = Array.from({ length: SESSION_SOURCE_MAX_ENTRIES }, () => ({
+      type: "message", message: { role: "user", content: excludedBlocks },
+    }));
+    const result = await captureCommandRequest("--session -- Review", commandContext(process.cwd(), entries));
+    expect(result).toMatchObject({ ok: false, error: { code: "RLM_SOURCE_LIMIT" } });
+    expect(SESSION_SOURCE_MAX_NODES).toBe(50_000);
   });
 });
 

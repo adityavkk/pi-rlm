@@ -178,12 +178,46 @@ const exceptionResult = (
   return failure(runId, code, message, error);
 };
 
-const terminalEvent = (result: PlannedResult): RlmEvent => {
+type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
+type AnswerCommitted = Extract<RlmEvent, { type: "answer_committed" }>;
+
+const isTerminalEvent = (event: RlmEvent): event is TerminalEvent =>
+  event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
+
+const fullAnswerOutput = (answer: AnswerCommitted): RunResult["output"] => {
+  if (answer.outputSha256 === undefined || answer.outputBytes === undefined) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(answer.outputSha256)
+    || answer.outputRef !== `ctx_${answer.outputSha256}`
+    || !Number.isSafeInteger(answer.outputBytes) || answer.outputBytes < 0) return undefined;
+  return { ref: answer.outputRef, sha256: answer.outputSha256, bytes: answer.outputBytes };
+};
+
+/** Current writers require one fully described root answer before completing. */
+const completionOutput = (
+  events: readonly RlmEvent[],
+  rootFrameId: string,
+  completionMode: NonNullable<PlannedResult["completionMode"]>,
+): RunResult["output"] => {
+  const rootAnswers = events.filter((event): event is AnswerCommitted =>
+    event.type === "answer_committed" && event.frameId === rootFrameId);
+  if (rootAnswers.length !== 1 || rootAnswers[0]?.completionMode !== completionMode) return undefined;
+  return fullAnswerOutput(rootAnswers[0]);
+};
+
+const terminalEvent = (
+  result: PlannedResult,
+  events: readonly RlmEvent[],
+  rootFrameId: string,
+): RlmEvent => {
   if (result.status === "completed") {
+    if (result.completionMode === undefined) throw new Error("completed run has no completion mode");
+    const output = completionOutput(events, rootFrameId, result.completionMode);
+    if (!output) throw new Error("completed run has no unique authoritative root answer");
     return {
       type: "run_completed",
       runId: result.runId,
-      completionMode: result.completionMode!,
+      completionMode: result.completionMode,
+      outputRef: output.ref,
     };
   }
   if (result.status === "cancelled") {
@@ -197,40 +231,40 @@ const terminalEvent = (result: PlannedResult): RlmEvent => {
   };
 };
 
-type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
+const terminalsForRun = (events: readonly RlmEvent[], expectedRunId: string): TerminalEvent[] =>
+  events.filter((event): event is TerminalEvent => isTerminalEvent(event) && event.runId === expectedRunId);
 
-const isTerminalEvent = (event: RlmEvent): event is TerminalEvent =>
-  event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
-
-const outputFromEvents = (
+export const outputFromEvents = (
   events: readonly RlmEvent[],
+  expectedRunId: string,
   rootFrameId: string,
   result: PlannedResult,
 ): RunResult["output"] => {
   if (result.status !== "completed" || result.completionMode === undefined) return undefined;
-  const committed = events.find((event): event is Extract<RlmEvent, { type: "answer_committed" }> =>
-    event.type === "answer_committed" && event.frameId === rootFrameId && event.completionMode === result.completionMode);
-  if (!committed || committed.outputSha256 === undefined || committed.outputBytes === undefined) return undefined;
-  if (!/^[0-9a-f]{64}$/.test(committed.outputSha256)
-    || committed.outputRef !== `ctx_${committed.outputSha256}`
-    || !Number.isSafeInteger(committed.outputBytes) || committed.outputBytes < 0) return undefined;
-  return { ref: committed.outputRef, sha256: committed.outputSha256, bytes: committed.outputBytes };
+  const terminals = terminalsForRun(events, expectedRunId);
+  if (terminals.length !== 1) return undefined;
+  const terminal = terminals[0];
+  if (terminal?.type !== "run_completed" || terminal.runId !== expectedRunId
+    || terminal.completionMode !== result.completionMode || terminal.outputRef === undefined) return undefined;
+  const output = completionOutput(events, rootFrameId, result.completionMode);
+  if (!output || terminal.outputRef !== output.ref) return undefined;
+  return output;
 };
 
 const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): PlannedResult => {
   if (event.type === "run_completed") {
+    if (initial.status !== "completed" || initial.completionMode !== event.completionMode)
+      return failure(initial.runId, "JOURNAL_FAILED", "run terminal does not match the planned completion");
     return {
-      runId: event.runId,
+      runId: initial.runId,
       status: "completed",
       completionMode: event.completionMode,
-      ...(initial.status === "completed" && initial.completionMode === event.completionMode && initial.answer !== undefined
-        ? { answer: initial.answer }
-        : {}),
+      ...(initial.answer !== undefined ? { answer: initial.answer } : {}),
     };
   }
   if (event.type === "run_cancelled") {
     return {
-      runId: event.runId,
+      runId: initial.runId,
       status: "cancelled",
       error: { code: event.code, message: event.message },
     };
@@ -239,7 +273,7 @@ const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): Plann
     initial.error?.code === event.code && initial.error.message === event.message
     ? initial.error.cause
     : undefined;
-  return failure(event.runId, event.code, event.message, matchingCause);
+  return failure(initial.runId, event.code, event.message, matchingCause);
 };
 
 /** Close every successfully opened frame, then append the sole run terminal. */
@@ -281,8 +315,16 @@ const finalize = async (
         ...(cause ? { cause } : {}),
       });
     }
-    const output = outputFromEvents(events, rootFrameId, result);
-    return { ...result, ...(output ? { output } : {}), ...(warnings.length > 0 ? { warnings } : {}), ledger: ledgerRef.current };
+    const output = outputFromEvents(events, initial.runId, rootFrameId, result);
+    const authoritative = result.status === "completed" && !output
+      ? failure(initial.runId, "JOURNAL_FAILED", "completed run has no authoritative journal output")
+      : result;
+    return {
+      ...authoritative,
+      ...(output && authoritative.status === "completed" ? { output } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ledger: ledgerRef.current,
+    };
   };
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -295,8 +337,11 @@ const finalize = async (
       }
       const scanned = await journal.readEvents();
       if (!scanned.ok) throw scanned.error;
-      const existingTerminal = scanned.value.find(isTerminalEvent);
-      if (existingTerminal) return finish(resultFromTerminal(existingTerminal, initial), scanned.value);
+      const existingTerminals = terminalsForRun(scanned.value, initial.runId);
+      if (existingTerminals.length > 1)
+        return finish(failure(initial.runId, "JOURNAL_FAILED", "run journal has multiple terminal events"), scanned.value);
+      if (existingTerminals.length === 1)
+        return finish(resultFromTerminal(existingTerminals[0]!, initial), scanned.value);
       if (drainFailure !== undefined && !observeDurableFailure(drainFailure)) {
         planned = failure(initial.runId, "JOURNAL_FAILED", "failed to finalize run journal", drainFailure);
       }
@@ -322,25 +367,27 @@ const finalize = async (
               : "closed";
         await appendDurably({ type: "frame_closed", frameId, state });
       }
-      const event = terminalEvent(planned);
-      if (event.type === "run_completed" && planned.completionMode === "fallback_extract") {
-        const events = await journal.readEvents();
-        if (events.ok) {
-          const answer = [...events.value].reverse().find((candidate) => candidate.type === "answer_committed");
-          await appendDurably(answer?.type === "answer_committed" ? { ...event, outputRef: answer.outputRef } : event);
-        } else await appendDurably(event);
-      } else await appendDurably(event);
+      const beforeTerminal = await journal.readEvents();
+      if (!beforeTerminal.ok) throw beforeTerminal.error;
+      const event = terminalEvent(planned, beforeTerminal.value, rootFrameId);
+      await appendDurably(event);
 
       const finalized = await journal.readEvents();
       if (!finalized.ok) throw finalized.error;
-      const committedTerminal = finalized.value.find(isTerminalEvent);
-      if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial), finalized.value);
+      const committedTerminals = terminalsForRun(finalized.value, initial.runId);
+      if (committedTerminals.length > 1)
+        return finish(failure(initial.runId, "JOURNAL_FAILED", "run journal has multiple terminal events"), finalized.value);
+      if (committedTerminals.length === 1)
+        return finish(resultFromTerminal(committedTerminals[0]!, initial), finalized.value);
       throw new Error("terminal event was not committed");
     } catch (error) {
       try {
         const rescued = await journal.readEvents();
-        const committedTerminal = rescued.ok ? rescued.value.find(isTerminalEvent) : undefined;
-        if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial), rescued.ok ? rescued.value : []);
+        const committedTerminals = rescued.ok ? terminalsForRun(rescued.value, initial.runId) : [];
+        if (committedTerminals.length > 1)
+          return finish(failure(initial.runId, "JOURNAL_FAILED", "run journal has multiple terminal events"), rescued.ok ? rescued.value : []);
+        if (committedTerminals.length === 1)
+          return finish(resultFromTerminal(committedTerminals[0]!, initial), rescued.ok ? rescued.value : []);
       } catch {
         // Preserve the original finalization failure classification.
       }

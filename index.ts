@@ -260,6 +260,12 @@ interface LaunchBinding {
   readonly promptSha256: string;
 }
 
+interface CommandLifecycle {
+  readonly controller: AbortController;
+  readonly sessionId: string;
+  readonly authorizationGeneration: number;
+}
+
 const denialCode = (denial: GrantDenial): string => `RLM_GRANT_${denial}`;
 
 const projectedToolResult = (projection: RlmResultProjection): AgentToolResult<RlmResultMetadata> => ({
@@ -373,39 +379,65 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
 
   const auditWarnings = (result: RunResult): void => {
     if (!result.warnings?.length) return;
-    pi.appendEntry("pi-rlm-run-warnings", {
-      runId: result.runId,
-      status: result.status,
-      codes: result.warnings.map((warning) => warning.code).slice(-8),
-    });
+    try {
+      pi.appendEntry("pi-rlm-run-warnings", {
+        runId: result.runId,
+        status: result.status,
+        codes: result.warnings.map((warning) => warning.code).slice(-8),
+      });
+    } catch {
+      // Warning audit is best-effort and cannot replace the authoritative result.
+    }
   };
 
-  const deliverCommandResult = (projection: RlmResultProjection): void => {
-    const metadata = resultMetadata(projection);
-    try { pi.appendEntry("pi-rlm-result", metadata); } catch { /* Best-effort metadata persistence. */ }
+  const sessionMatches = (
+    sessionId: string,
+    generation: number,
+    signal?: AbortSignal,
+    ctx?: ExtensionContext,
+  ): boolean => {
+    if (signal?.aborted || generation !== authorizationGeneration || !ctx) return false;
+    try { return ctx.sessionManager.getSessionId() === sessionId; }
+    catch { return false; }
+  };
+
+  const deliverCommandResult = (
+    projection: RlmResultProjection,
+    lifecycle: CommandLifecycle,
+    ctx: ExtensionContext,
+  ): void => {
+    let metadata: RlmResultMetadata;
+    let content: string;
+    try {
+      metadata = resultMetadata(projection);
+      content = resultContent(projection);
+    } catch {
+      const bounded = failureProjection("RLM_RESULT_DELIVERY_FAILED", "pi-rlm result delivery failed.");
+      metadata = resultMetadata(bounded);
+      content = resultContent(bounded);
+    }
+
+    // Each effect has its own boundary. Re-check immediately before each one.
+    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+    try { pi.appendEntry("pi-rlm-result", metadata); } catch { /* Message delivery remains independently useful. */ }
+    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
     try {
       pi.sendMessage({
         customType: "pi-rlm-result",
-        content: resultContent(projection),
+        content,
         details: metadata,
         display: true,
       }, { triggerTurn: false });
-    } catch (error) {
-      const candidate = error && typeof error === "object" ? error as { name?: unknown; code?: unknown } : undefined;
-      const name = typeof candidate?.name === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(candidate.name)
-        ? candidate.name
-        : "Error";
-      const causeCode = typeof candidate?.code === "string" && /^[A-Z0-9_-]{1,64}$/.test(candidate.code)
-        ? candidate.code
-        : undefined;
+    } catch {
+      // One bounded, non-recursive diagnostic attempt. Never retry delivery.
+      if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
       try {
         pi.appendEntry("pi-rlm-result-delivery-failed", {
           runId: metadata.runId,
           status: metadata.status,
           code: "RLM_RESULT_DELIVERY_FAILED",
-          cause: { name, ...(causeCode ? { code: causeCode } : {}) },
         });
-      } catch { /* A synchronous session write failure is already non-recoverable here. */ }
+      } catch { /* No further audit attempt: audit failures cannot recurse. */ }
     }
   };
 
@@ -442,50 +474,107 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   pi.registerCommand("rlm", {
     description: "Start a host-authorized pi-rlm run with an explicit source.",
     handler: async (args, ctx) => {
-      const built = await captureCommandRequest(args, ctx);
-      if (!built.ok) {
-        deliverCommandResult(failureProjection(built.error.code, built.error.message));
-        return;
-      }
-      const hash = requestSha256(built.value);
-      const grantId = createId();
-      const binding = {
-        sessionId: ctx.sessionManager.getSessionId(),
-        turnNonce: `slash:${grantId}`,
-        promptSha256: sha256(`/rlm ${args}`),
-      };
-      const authorization = mintAndConsume(
-        "slash_command",
-        binding,
-        binding,
-        hash,
-        hash,
-        `command:${grantId}`,
-      );
-      if (!authorization.ok) {
-        const code = denialCode(authorization.denial);
-        deliverCommandResult(failureProjection(code, "pi-rlm launch was denied."));
-        return;
-      }
-      audit(authorization.grant);
+      // Bind ownership before the first asynchronous source-capture checkpoint.
       const commandController = new AbortController();
+      let sessionId: string;
+      try { sessionId = ctx.sessionManager.getSessionId(); }
+      catch { return; }
+      const lifecycle: CommandLifecycle = {
+        controller: commandController,
+        sessionId,
+        authorizationGeneration,
+      };
       activeCommandRuns.add(commandController);
-      ctx.ui.setStatus("pi-rlm", "running...");
+
       try {
-        const result = await run(built.value, commandController.signal, "slash_command");
+        let built: Awaited<ReturnType<typeof captureCommandRequest>>;
+        try {
+          built = await captureCommandRequest(args, ctx, commandController.signal);
+        } catch (error) {
+          if (wasAborted(error, commandController.signal)
+            || !sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          deliverCommandResult(
+            failureProjection("RLM_SOURCE_FAILED", "pi-rlm source capture failed."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        if (!built.ok) {
+          deliverCommandResult(failureProjection(built.error.code, built.error.message), lifecycle, ctx);
+          return;
+        }
+
+        let authorization: ReturnType<typeof mintAndConsume>;
+        try {
+          const hash = requestSha256(built.value);
+          const grantId = createId();
+          const binding = {
+            sessionId,
+            turnNonce: `slash:${grantId}`,
+            promptSha256: sha256(`/rlm ${args}`),
+          };
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          authorization = mintAndConsume(
+            "slash_command",
+            binding,
+            binding,
+            hash,
+            hash,
+            `command:${grantId}`,
+          );
+        } catch {
+          deliverCommandResult(
+            failureProjection("RLM_GRANT_FAILED", "pi-rlm launch authorization failed."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+        if (!authorization.ok) {
+          const code = denialCode(authorization.denial);
+          deliverCommandResult(failureProjection(code, "pi-rlm launch was denied."), lifecycle, ctx);
+          return;
+        }
+
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        try { audit(authorization.grant); }
+        catch {
+          deliverCommandResult(
+            failureProjection("RLM_AUDIT_FAILED", "pi-rlm launch audit failed; no run was started."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        try { ctx.ui.setStatus("pi-rlm", "running..."); } catch { /* Best-effort transient status. */ }
+        let result: RunResult;
+        try {
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          result = await run(built.value, commandController.signal, "slash_command");
+        } catch (error) {
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          const cancelled = wasAborted(error, commandController.signal);
+          deliverCommandResult(failureProjection(
+            cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
+            cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
+            null,
+            cancelled ? "cancelled" : "failed",
+          ), lifecycle, ctx);
+          return;
+        }
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         auditWarnings(result);
-        deliverCommandResult(projectRunResult(result));
-      } catch (error) {
-        const cancelled = wasAborted(error, commandController.signal);
-        deliverCommandResult(failureProjection(
-          cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
-          cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
-          null,
-          cancelled ? "cancelled" : "failed",
-        ));
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        deliverCommandResult(projectRunResult(result), lifecycle, ctx);
       } finally {
         activeCommandRuns.delete(commandController);
-        ctx.ui.setStatus("pi-rlm", "");
+        if (sessionMatches(sessionId, lifecycle.authorizationGeneration, undefined, ctx)) {
+          try { ctx.ui.setStatus("pi-rlm", ""); } catch { /* Best-effort transient status. */ }
+        }
       }
     },
   });
@@ -537,12 +626,17 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           ), toolSignal);
         } catch (error) {
           if (wasAborted(error, toolSignal)) return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
-          throw error;
+          return projectedToolResult(failureProjection(
+            "RLM_CONFIRMATION_FAILED",
+            "pi-rlm confirmation failed; no run was started.",
+          ));
         }
         if (!approved) return denied("RLM_OPT_IN_REQUIRED: pi-rlm launch was not approved.");
         if (toolSignal.aborted) return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
         if (confirmationGeneration !== authorizationGeneration)
           return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before authorization consumption.");
+        if (ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+          return denied("RLM_GRANT_SESSION_MISMATCH: session changed before authorization consumption.");
 
         const current = buildInlineRequest(params);
         const actualHash = current.ok ? requestSha256(current.value) : "invalid-after-approval";
@@ -565,9 +659,24 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         consumedCorrelation = true;
         if (inputCorrelation === reservedCorrelation) inputCorrelation = undefined;
         consumedToolCalls.add(callKey);
-        audit(authorization.grant);
+        if (confirmationGeneration !== authorizationGeneration
+          || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+          return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch audit.");
+        try { audit(authorization.grant); }
+        catch {
+          return projectedToolResult(failureProjection(
+            "RLM_AUDIT_FAILED",
+            "pi-rlm launch audit failed; no run was started.",
+          ));
+        }
         try {
+          if (confirmationGeneration !== authorizationGeneration
+            || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+            return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch.");
           const result = await run(built.value, toolSignal, "confirmed");
+          if (confirmationGeneration !== authorizationGeneration
+            || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+            return denied("RLM_GRANT_GENERATION_MISMATCH: session changed while pi-rlm was running.");
           auditWarnings(result);
           return projectedToolResult(projectRunResult(result));
         } catch (error) {
@@ -579,6 +688,13 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
             cancelled ? "cancelled" : "failed",
           ));
         }
+      } catch (error) {
+        if (wasAborted(error, toolSignal))
+          return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
+        return projectedToolResult(failureProjection(
+          "RLM_TOOL_FAILED",
+          "pi-rlm tool authorization failed; no run was started.",
+        ));
       } finally {
         if (
           !consumedCorrelation &&
