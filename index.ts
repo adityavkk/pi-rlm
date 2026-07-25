@@ -33,6 +33,7 @@ import {
   preflightRunComponents,
   runProgram,
   type RunResult,
+  type RunWarning,
 } from "./src/runtime/index.ts";
 import {
   ManagedRunStore,
@@ -146,11 +147,39 @@ const confirmationMessage = (request: LaunchRequest, hash: string): string => {
   ].join("\n");
 };
 
+const warningSummary = (result: RunResult): string => result.warnings?.length
+  ? `\n\nWarnings: ${result.warnings.map((warning) => `${warning.code}: ${warning.message}`).join("; ")}`
+  : "";
+
 const summarize = (result: RunResult): string => {
+  const warnings = warningSummary(result);
   if (result.status === "completed")
-    return `pi-rlm ${result.completionMode === "fallback_extract" ? "completed via fallback extraction" : "completed"}.\n\nResult:\n${JSON.stringify(result.answer, null, 2)}\n\nUsage: ${result.ledger.usage.logicalCalls} calls, ${result.ledger.usage.attempts} attempts, ${result.ledger.usage.framesOpened} child frames.`;
-  if (result.status === "cancelled") return "pi-rlm cancelled.";
-  return `pi-rlm failed (${result.error?.code}): ${result.error?.message}`;
+    return `pi-rlm ${result.completionMode === "fallback_extract" ? "completed via fallback extraction" : "completed"}.\n\nResult:\n${JSON.stringify(result.answer, null, 2)}\n\nUsage: ${result.ledger.usage.logicalCalls} calls, ${result.ledger.usage.attempts} attempts, ${result.ledger.usage.framesOpened} child frames.${warnings}`;
+  if (result.status === "cancelled") return `pi-rlm cancelled.${warnings}`;
+  return `pi-rlm failed (${result.error?.code}): ${result.error?.message}${warnings}`;
+};
+
+const retentionWarning = (
+  result: RunResult,
+  code: Extract<RunWarning["code"], "RETENTION_METADATA_FAILED" | "RETENTION_CLEANUP_FAILED">,
+  error: unknown,
+): RunResult => {
+  const candidate = error && typeof error === "object" ? error as { name?: unknown; code?: unknown } : undefined;
+  const name = typeof candidate?.name === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(candidate.name)
+    ? candidate.name
+    : "Error";
+  const causeCode = typeof candidate?.code === "string" && /^[A-Z0-9_-]{1,64}$/.test(candidate.code)
+    ? candidate.code
+    : undefined;
+  const warning: RunWarning = {
+    code,
+    message: code === "RETENTION_METADATA_FAILED"
+      ? "authoritative run result retained, but lifecycle metadata finalization failed"
+      : "authoritative run result retained, but the post-run retention sweep failed",
+    cause: { name, ...(causeCode ? { code: causeCode } : {}) },
+  };
+  const warnings = [...(result.warnings ?? []), warning].slice(-8);
+  return { ...result, warnings };
 };
 
 export interface RlmRuntimeDependencies {
@@ -233,7 +262,7 @@ const executeRun = async (
     });
   } catch (primary) {
     const cleanupFailures: unknown[] = [];
-    try { await lease.finish("failed"); } catch (error) { cleanupFailures.push(error); }
+    try { await lease.abandon(); } catch (error) { cleanupFailures.push(error); }
     try { await store.cleanup(); } catch (error) { cleanupFailures.push(error); }
     if (cleanupFailures.length > 0)
       throw new RunRetentionError(
@@ -243,8 +272,10 @@ const executeRun = async (
       );
     throw primary;
   }
-  await lease.finish(result.status, result.runId);
-  await store.cleanup();
+  try { await lease.finish(result.status, result.runId); }
+  catch (error) { result = retentionWarning(result, "RETENTION_METADATA_FAILED", error); }
+  try { await store.cleanup(); }
+  catch (error) { result = retentionWarning(result, "RETENTION_CLEANUP_FAILED", error); }
   return result;
 };
 
@@ -383,6 +414,15 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     });
   };
 
+  const auditWarnings = (result: RunResult): void => {
+    if (!result.warnings?.length) return;
+    pi.appendEntry("pi-rlm-run-warnings", {
+      runId: result.runId,
+      status: result.status,
+      codes: result.warnings.map((warning) => warning.code).slice(-8),
+    });
+  };
+
   pi.on("input", (event, ctx) => {
     inputCorrelation = {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -451,6 +491,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       ctx.ui.setStatus("pi-rlm", "running...");
       try {
         const result = await run(built.value, commandController.signal, "slash_command");
+        auditWarnings(result);
         ctx.ui.notify(summarize(result), result.status === "completed" ? "info" : "error");
       } catch (error) {
         ctx.ui.notify(
@@ -543,6 +584,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         audit(authorization.grant);
         try {
           const result = await run(built.value, toolSignal, "confirmed");
+          auditWarnings(result);
           return { content: [{ type: "text", text: summarize(result) }], details: { status: result.status } };
         } catch (error) {
           return {

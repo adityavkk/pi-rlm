@@ -86,7 +86,11 @@ export interface RunError {
 }
 
 export interface RunWarning {
-  readonly code: "STATUS_CACHE_REFRESH_FAILED" | "JOURNAL_APPEND_CLEANUP_FAILED";
+  readonly code:
+    | "STATUS_CACHE_REFRESH_FAILED"
+    | "JOURNAL_APPEND_CLEANUP_FAILED"
+    | "RETENTION_METADATA_FAILED"
+    | "RETENTION_CLEANUP_FAILED";
   readonly message: string;
   readonly cause?: RunError["cause"];
 }

@@ -1,7 +1,14 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { compileShorthand } from "../core/program.ts";
+import { JournalStore } from "../shell/journal-store.ts";
+import type { ModelClient } from "../shell/model/client.ts";
+import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
+import type { ControllerDriver } from "./controller.ts";
+import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
+import { buildRunManifest, claimRunDirectory, RLM_DSL_VERSION } from "./run-manifest.ts";
 import {
   cleanupManagedRuns,
   defaultRunStateRoot,
@@ -9,23 +16,73 @@ import {
   RUN_ACTIVE_FILE,
   RUN_LIFECYCLE_FILE,
   RunRetentionError,
+  type ManagedRunLease,
   type RunLifecycleStatus,
 } from "./run-retention.ts";
 
 const root = () => mkdtemp(join(tmpdir(), "pi-rlm-retention-"));
-const runId = (digit: string) => `run_${digit.repeat(64)}`;
 const tokens = () => {
   let value = 0;
   return () => (++value).toString(16).padStart(32, "0");
 };
 const privateMode = async (path: string) => (await lstat(path)).mode & 0o777;
 
+const fixtureProgram = (() => {
+  const compiled = compileShorthand({ objective: "Retention fixture" });
+  if (!compiled.ok) throw new Error("failed to compile retention fixture");
+  return compiled.value;
+})();
+const fixtureBackend: InterpreterBackend = {
+  id: "retention-fixture", version: "1", async evalCell() { throw new Error("unused"); }, async dispose() {},
+};
+const fixtureModel: ModelClient = {
+  id: "retention-fixture",
+  identity: { id: "test/retention-model", version: "1", configuration: {} },
+  async complete() { throw new Error("unused"); },
+};
+const fixtureController: ControllerDriver = {
+  identity: { id: "test/retention-controller", version: "1", configuration: {} },
+  async next() { throw new Error("unused"); },
+  fork() { return this; },
+};
+
+const publishTerminal = async (
+  lease: ManagedRunLease,
+  status: Exclude<RunLifecycleStatus, "active">,
+  nonce: string,
+): Promise<string> => {
+  const document = buildRunManifest({
+    program: fixtureProgram,
+    sources: { context: "" },
+    profile: DEFAULT_PROFILE,
+    limits: resolveLimits(DEFAULT_PROFILE, 0),
+    backend: fixtureBackend,
+    model: fixtureModel,
+    controller: fixtureController,
+    dslVersion: RLM_DSL_VERSION,
+    createRunNonce: () => nonce,
+  });
+  await claimRunDirectory(lease.dir, document, undefined, lease.lifecycle.claimEntries);
+  const id = document.manifest.run.id;
+  await lease.lifecycle.onManifest(id);
+  const journal = new JournalStore(lease.dir);
+  if (status === "completed") await journal.append({ type: "run_completed", runId: id, completionMode: "answer" });
+  else if (status === "failed") await journal.append({ type: "run_failed", runId: id, code: "TEST_FAILURE", message: "fixture failed" });
+  else await journal.append({ type: "run_cancelled", runId: id, code: "CANCELLED", message: "run cancelled by owner" });
+  await lease.finish(status, id);
+  return id;
+};
+
 describe("managed run lifecycle", () => {
   test("uses platform state roots without a shared temporary directory", () => {
     expect(defaultRunStateRoot({ XDG_STATE_HOME: "/state" }, "linux", "/home/a")).toBe("/state/pi-rlm/runs");
+    expect(defaultRunStateRoot({ XDG_STATE_HOME: "  " }, "linux", "/home/a")).toBe("/home/a/.local/state/pi-rlm/runs");
     expect(defaultRunStateRoot({}, "linux", "/home/a")).toBe("/home/a/.local/state/pi-rlm/runs");
     expect(defaultRunStateRoot({}, "darwin", "/Users/a")).toContain("Library/Application Support/pi-rlm/runs");
+    expect(defaultRunStateRoot({ LOCALAPPDATA: " " }, "win32", "C:\\Users\\a")).toContain("AppData");
     expect(defaultRunStateRoot({ LOCALAPPDATA: "C:\\state" }, "win32", "C:\\Users\\a")).toContain("pi-rlm");
+    expect(() => new ManagedRunStore({ root: "relative/runs" })).toThrow(expect.objectContaining({ code: "RUN_RETENTION_ROOT_INVALID" }));
+    expect(() => new ManagedRunStore({ root: "   " })).toThrow(expect.objectContaining({ code: "RUN_RETENTION_ROOT_INVALID" }));
   });
 
   test("binds created, manifest, and terminal metadata with private modes", async () => {
@@ -40,14 +97,13 @@ describe("managed run lifecycle", () => {
     expect((await store.list()).runs[0]).toMatchObject({ activity: "owned", metadata: { status: "active", createdAtMs: 10 } });
 
     now = 20;
-    await lease.lifecycle.onManifest(runId("a"));
+    const id = await publishTerminal(lease, "completed", "bound-fixture");
     now = 30;
-    await lease.finish("completed", runId("a"));
     const listed = await store.list();
     expect(listed.issues).toEqual([]);
     expect(listed.runs[0]).toMatchObject({
       activity: "inactive",
-      metadata: { status: "completed", runId: runId("a"), createdAtMs: 10, updatedAtMs: 30, terminalAtMs: 30 },
+      metadata: { status: "completed", runId: id, createdAtMs: 10, updatedAtMs: 20, terminalAtMs: 20 },
     });
     await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -55,8 +111,7 @@ describe("managed run lifecycle", () => {
   test.each(["completed", "failed", "cancelled"] as const)("records %s as a retained terminal lifecycle", async (status) => {
     const store = new ManagedRunStore({ root: await root(), createToken: tokens() });
     const lease = await store.create();
-    await lease.lifecycle.onManifest(runId(status === "completed" ? "a" : status === "failed" ? "b" : "c"));
-    await lease.finish(status);
+    await publishTerminal(lease, status, `status-${status}`);
     expect((await store.list()).runs[0]?.metadata.status).toBe(status);
   });
 
@@ -67,6 +122,15 @@ describe("managed run lifecycle", () => {
     await lease.discard();
     await expect(lstat(dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  test("finish without strict manifest and terminal journal evidence leaves an active lifecycle", async () => {
+    const store = new ManagedRunStore({ root: await root(), createToken: tokens() });
+    const lease = await store.create();
+    await expect(lease.finish("failed", `run_${"a".repeat(64)}`)).rejects.toMatchObject({ code: "RUN_RETENTION_METADATA_FAILED" });
+    expect((await store.list()).runs[0]?.metadata.status).toBe("active");
+    await lease.abandon();
+    expect((await store.list()).runs[0]).toMatchObject({ metadata: { status: "active" }, activity: "stale" });
+  });
 });
 
 const terminalFixture = async (
@@ -76,9 +140,8 @@ const terminalFixture = async (
   bytes: number,
 ): Promise<string> => {
   const lease = await store.create();
-  await lease.lifecycle.onManifest(runId(id));
+  await publishTerminal(lease, status, `terminal-${id}`);
   await writeFile(join(lease.dir, "payload.bin"), Buffer.alloc(bytes), { mode: 0o600 });
-  await lease.finish(status);
   return lease.name;
 };
 
@@ -199,6 +262,76 @@ describe("bounded deterministic retention", () => {
     expect(failure).toBeInstanceOf(RunRetentionError);
     expect(failure).toMatchObject({ code: "RUN_RETENTION_POLICY_UNSATISFIED", result: { retained: [name] } });
   });
+
+  test("rereads a selected lifecycle under claim and retains a newly published lease", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", "lease-race", 1);
+    const listed = (await producer.list()).runs[0]!;
+    const sweeper = new ManagedRunStore({
+      root: path,
+      beforeCleanupDecision: async (runPath) => {
+        await writeFile(join(runPath, RUN_ACTIVE_FILE), JSON.stringify({
+          schemaVersion: 1,
+          pid: process.pid,
+          owner: listed.metadata.owner,
+          startedAtMs: listed.metadata.createdAtMs,
+        }), { mode: 0o600 });
+      },
+    });
+    const result = await sweeper.cleanup({ force: true });
+    expect(result.deleted).toEqual([]);
+    expect(result.retained).toContain(name);
+    expect(await lstat(listed.path)).toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
+  test("quarantine deletion preserves a replacement published at the old run name", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", "replacement", 1);
+    const oldPath = join(path, name);
+    const sweeper = new ManagedRunStore({
+      root: path,
+      createToken: tokens(),
+      removeDirectory: async (quarantine) => {
+        await mkdir(oldPath, { mode: 0o700 });
+        await writeFile(join(oldPath, "replacement"), "keep", { mode: 0o600 });
+        await rm(quarantine, { recursive: true });
+      },
+    });
+    expect((await sweeper.cleanup({ force: true })).deleted).toEqual([name]);
+    expect(await readFile(join(oldPath, "replacement"), "utf8")).toBe("keep");
+  });
+
+  test("serializes two concurrent cleanup decisions with one exclusive lifecycle claim", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", "concurrent", 1);
+    let releaseRemoval!: () => void;
+    const removalGate = new Promise<void>((resolve) => { releaseRemoval = resolve; });
+    let enteredRemoval!: () => void;
+    const removalEntered = new Promise<void>((resolve) => { enteredRemoval = resolve; });
+    let removals = 0;
+    const first = new ManagedRunStore({
+      root: path,
+      removeDirectory: async (quarantine) => {
+        removals++;
+        enteredRemoval();
+        await removalGate;
+        await rm(quarantine, { recursive: true });
+      },
+    });
+    const second = new ManagedRunStore({ root: path });
+    const firstWork = first.cleanup({ force: true });
+    await removalEntered;
+    let secondFailure: unknown;
+    try { await second.cleanup({ force: true }); } catch (error) { secondFailure = error; }
+    releaseRemoval();
+    const firstResult = await firstWork;
+    expect(firstResult.deleted).toEqual([name]);
+    expect(secondFailure).toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    expect(removals).toBe(1);
+  });
 });
 
 describe("malformed and link rejection", () => {
@@ -233,6 +366,32 @@ describe("malformed and link rejection", () => {
     expect((await store.list()).issues[0]).toMatchObject({ code: "SCAN_FAILED", runName: lease.name });
     await chmod(lease.dir, 0o700);
     await lease.discard();
+  });
+
+  test("stops a huge invalid root fanout at the single global entry cap", async () => {
+    const path = await root();
+    await Promise.all(Array.from({ length: 1_000 }, (_, index) => writeFile(join(path, `invalid-${index}`), "x")));
+    const store = new ManagedRunStore({ root: path, policy: { maxScanEntries: 1 } });
+    await expect(store.list()).rejects.toMatchObject({ code: "RUN_RETENTION_SCAN_LIMIT" });
+  });
+
+  test("retains and types a lifecycle status that disagrees with the authoritative terminal journal", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", "mismatch", 1);
+    const lifecyclePath = join(path, name, RUN_LIFECYCLE_FILE);
+    const lifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+    lifecycle["status"] = "failed";
+    await writeFile(lifecyclePath, `${JSON.stringify(lifecycle)}\n`, { mode: 0o600 });
+    await expect(producer.cleanup({ force: true })).rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    expect((await producer.list()).runs.map((run) => run.name)).toContain(name);
+  });
+
+  test("rejects a configured non-directory root", async () => {
+    const parent = await root();
+    const file = join(parent, "root-file");
+    await writeFile(file, "not a directory");
+    await expect(new ManagedRunStore({ root: file }).list()).rejects.toMatchObject({ code: "RUN_RETENTION_ROOT_INVALID" });
   });
 
   test("public cleanup API exposes dry-run and force controls", async () => {
