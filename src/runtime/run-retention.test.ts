@@ -226,9 +226,9 @@ describe("bounded deterministic retention", () => {
       const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
       const lease = await new ManagedRunStore({ root: ${JSON.stringify(path)} }).create();
       process.stdout.write(lease.name + "\\n");
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+      await Bun.stdin.text();
     `;
-    const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn([process.execPath, "-e", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const reader = child.stdout.getReader();
     const first = await reader.read();
     reader.releaseLock();
@@ -243,9 +243,114 @@ describe("bounded deterministic retention", () => {
     expect((await host.list()).runs[0]).toMatchObject({ name, activity: "live" });
     expect((await host.cleanup()).retained).toEqual([name]);
 
+    child.stdin.end();
+    await child.exited;
+    expect((await host.cleanup()).deleted).toEqual([name]);
+  });
+
+  test("a cleanup process cannot delete a run while another process publishes its lease under the lifecycle claim", async () => {
+    const path = await root();
+    const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const script = `
+      const fs = await import("node:fs/promises");
+      const { ManagedRunStore, RUN_ACTIVE_FILE } = await import(${JSON.stringify(moduleUrl)});
+      let paused = false;
+      const metadataFileSystem = {
+        async open(path, flags, mode) {
+          const handle = await fs.open(path, flags, mode);
+          return {
+            async writeFile(data, encoding) {
+              if (!paused && path.includes(RUN_ACTIVE_FILE)) {
+                paused = true;
+                process.stdout.write("CLAIMED\\n");
+                await Bun.stdin.text();
+              }
+              await handle.writeFile(data, encoding);
+            },
+            async sync() { await handle.sync(); },
+            async close() { await handle.close(); },
+          };
+        },
+        rename: fs.rename,
+        unlink: fs.unlink,
+      };
+      const lease = await new ManagedRunStore({ root: ${JSON.stringify(path)}, metadataFileSystem }).create();
+      process.stdout.write("READY " + lease.name + "\\n");
+      await new Promise(() => {});
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = child.stdout.getReader();
+    const claimed = new TextDecoder().decode((await reader.read()).value).trim();
+    expect(claimed).toBe("CLAIMED");
+    await expect(new ManagedRunStore({ root: path, policy: { abandonedGraceMs: 0 } }).cleanup())
+      .rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    child.stdin.end();
+    const ready = new TextDecoder().decode((await reader.read()).value).trim();
+    reader.releaseLock();
+    const name = ready.replace(/^READY /, "");
+    expect(name).toMatch(/^run-[a-f0-9]{32}$/);
+    const host = new ManagedRunStore({ root: path, policy: { abandonedGraceMs: 0 } });
+    expect((await host.cleanup()).retained).toContain(name);
     child.kill();
     await child.exited;
     expect((await host.cleanup()).deleted).toEqual([name]);
+  });
+
+  test("two process-isolated managers starting together delete one candidate at most once", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", "process-cleaners", 1);
+    const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const script = `
+      const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
+      const store = new ManagedRunStore({ root: ${JSON.stringify(path)} });
+      process.stdout.write("READY\\n");
+      await Bun.stdin.text();
+      try {
+        const result = await store.cleanup({ force: true });
+        process.stdout.write(JSON.stringify({ deleted: result.deleted }) + "\\n");
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ code: error?.code, deleted: error?.result?.deleted ?? [] }) + "\\n");
+      }
+    `;
+    const children = [0, 1].map(() => Bun.spawn([process.execPath, "-e", script], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    }));
+    const readers = children.map((child) => child.stdout.getReader());
+    for (const reader of readers)
+      expect(new TextDecoder().decode((await reader.read()).value).trim()).toBe("READY");
+    for (const child of children) child.stdin.end();
+    const outcomes: Array<{ deleted: string[]; code?: string }> = [];
+    for (const reader of readers) {
+      outcomes.push(JSON.parse(new TextDecoder().decode((await reader.read()).value).trim()));
+      reader.releaseLock();
+    }
+    await Promise.all(children.map((child) => child.exited));
+    expect(outcomes.flatMap((outcome) => outcome.deleted).filter((deleted) => deleted === name).length).toBeLessThanOrEqual(1);
+    await expect(lstat(join(path, name))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each(["stale", "ambiguous"] as const)("a %s cross-process lifecycle claim retains with a typed failure", async (kind) => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const name = await terminalFixture(producer, "completed", `process-claim-${kind}`, 1);
+    const claimPath = join(path, name, ".pi-rlm-lifecycle.claim");
+    const script = `
+      const { open } = await import("node:fs/promises");
+      const handle = await open(${JSON.stringify(claimPath)}, "wx", 0o600);
+      await handle.writeFile(JSON.stringify({ schemaVersion: 1, pid: process.pid }) + "\\n");
+      await handle.sync();
+      await handle.close();
+      process.stdout.write("READY\\n");
+      await new Promise(() => {});
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+    expect(new TextDecoder().decode((await child.stdout.getReader().read()).value).trim()).toBe("READY");
+    if (kind === "stale") { child.kill(); await child.exited; }
+    await expect(new ManagedRunStore({ root: path }).cleanup({ force: true }))
+      .rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED", result: { retained: [name] } });
+    expect((await lstat(join(path, name))).isDirectory()).toBe(true);
+    if (kind === "ambiguous") { child.kill(); await child.exited; }
   });
 
   test("cleanup failure is typed, observable, and reports the retained run", async () => {

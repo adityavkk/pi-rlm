@@ -156,6 +156,24 @@ export class RunRetentionError extends Error {
   ) { super(message); }
 }
 
+export interface RunRetentionMetadataFileHandle {
+  close(): Promise<void>;
+  sync(): Promise<void>;
+  writeFile(data: string, encoding: BufferEncoding): Promise<void>;
+}
+
+export interface RunRetentionMetadataFileSystem {
+  open(path: string, flags: string | number, mode?: number): Promise<RunRetentionMetadataFileHandle>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  unlink(path: string): Promise<void>;
+}
+
+const nodeMetadataFileSystem: RunRetentionMetadataFileSystem = {
+  open: async (path, flags, mode) => open(path, flags, mode),
+  rename,
+  unlink,
+};
+
 export interface ManagedRunStoreOptions {
   readonly root?: string;
   readonly policy?: Partial<RunRetentionPolicy>;
@@ -163,6 +181,8 @@ export interface ManagedRunStoreOptions {
   readonly createToken?: () => string;
   /** true: live, false: definitely absent, undefined: unsupported/ambiguous. */
   readonly processProbe?: (pid: number) => boolean | undefined;
+  /** Fault-test seam for atomic lifecycle metadata publication. */
+  readonly metadataFileSystem?: RunRetentionMetadataFileSystem;
   /** Fault-test seam. Production default is recursive node:fs removal. */
   readonly removeDirectory?: (path: string) => Promise<void>;
   /** Fault-test seam immediately before a selected run's lifecycle claim. */
@@ -274,14 +294,20 @@ const syncDirectory = async (dir: string): Promise<void> => {
   if (primary !== undefined) throw primary;
 };
 
-const privateJson = async (dir: string, name: string, value: object, token: string): Promise<void> => {
+const privateJson = async (
+  dir: string,
+  name: string,
+  value: object,
+  token: string,
+  fileSystem: RunRetentionMetadataFileSystem,
+): Promise<void> => {
   const target = join(dir, name);
   const temp = join(dir, `.${name}.${token}.tmp`);
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let handle: RunRetentionMetadataFileHandle | undefined;
   let tempCreated = false;
   let primary: unknown;
   try {
-    handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    handle = await fileSystem.open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     tempCreated = true;
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
     await handle.sync();
@@ -295,7 +321,7 @@ const privateJson = async (dir: string, name: string, value: object, token: stri
   }
   if (primary !== undefined) {
     if (tempCreated) {
-      try { await unlink(temp); } catch (cleanup) {
+      try { await fileSystem.unlink(temp); } catch (cleanup) {
         throw new AtomicWriteCleanupError(
           new AggregateError([primary, cleanup], "metadata write and temporary-file cleanup both failed"),
           await boundedSurvivor(temp, "temporary-file"),
@@ -304,8 +330,8 @@ const privateJson = async (dir: string, name: string, value: object, token: stri
     }
     throw primary;
   }
-  try { await rename(temp, target); } catch (error) {
-    try { await unlink(temp); } catch (cleanup) {
+  try { await fileSystem.rename(temp, target); } catch (error) {
+    try { await fileSystem.unlink(temp); } catch (cleanup) {
       throw new AtomicWriteCleanupError(
         new AggregateError([error, cleanup], "metadata rename and temporary-file cleanup both failed"),
         await boundedSurvivor(temp, "temporary-file"),
@@ -313,7 +339,13 @@ const privateJson = async (dir: string, name: string, value: object, token: stri
     }
     throw error;
   }
-  await syncDirectory(dir);
+  const directory = await fileSystem.open(dir, "r");
+  let syncFailure: unknown;
+  try { await directory.sync(); } catch (error) { syncFailure = error; }
+  try { await directory.close(); } catch (cleanup) {
+    throw syncFailure === undefined ? cleanup : new AggregateError([syncFailure, cleanup], "metadata directory sync and close both failed");
+  }
+  if (syncFailure !== undefined) throw syncFailure;
 };
 
 const readBoundedJson = async (path: string, limit = METADATA_LIMIT_BYTES): Promise<unknown> => {
@@ -387,6 +419,7 @@ export class ManagedRunStore {
   private readonly now: () => number;
   private readonly createToken: () => string;
   private readonly probe: (pid: number) => boolean | undefined;
+  private readonly metadataFileSystem: RunRetentionMetadataFileSystem;
   private readonly remover: (path: string) => Promise<void>;
   private readonly beforeDecision: (path: string) => Promise<void>;
   private rootIdentity: RootIdentity | undefined;
@@ -400,6 +433,7 @@ export class ManagedRunStore {
     this.now = options.now ?? Date.now;
     this.createToken = options.createToken ?? (() => randomBytes(16).toString("hex"));
     this.probe = options.processProbe ?? processProbe;
+    this.metadataFileSystem = options.metadataFileSystem ?? nodeMetadataFileSystem;
     this.remover = options.removeDirectory ?? ((path) => rm(path, { recursive: true, force: false }));
     this.beforeDecision = options.beforeCleanupDecision ?? (async () => {});
   }
@@ -562,8 +596,8 @@ export class ManagedRunStore {
       await mkdir(dir, { mode: 0o700 });
       created = true;
       const claimed = await this.withLifecycleClaim(dir, false, async () => {
-        await privateJson(dir, RUN_LIFECYCLE_FILE, metadata, this.token());
-        await privateJson(dir, RUN_ACTIVE_FILE, { schemaVersion: 1, pid: process.pid, owner, startedAtMs: createdAtMs }, this.token());
+        await privateJson(dir, RUN_LIFECYCLE_FILE, metadata, this.token(), this.metadataFileSystem);
+        await privateJson(dir, RUN_ACTIVE_FILE, { schemaVersion: 1, pid: process.pid, owner, startedAtMs: createdAtMs }, this.token(), this.metadataFileSystem);
       });
       if (claimed.state !== "acquired") throw new Error("managed lifecycle claim unexpectedly busy");
       activeOwners.set(dir, owner);
@@ -593,7 +627,7 @@ export class ManagedRunStore {
       if (metadata.status !== "active" || (metadata.runId !== undefined && metadata.runId !== runId))
         throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed run identity changed before manifest binding");
       const updated = { ...metadata, runId, updatedAtMs: this.time() };
-      try { await privateJson(dir, RUN_LIFECYCLE_FILE, updated, this.token()); }
+      try { await privateJson(dir, RUN_LIFECYCLE_FILE, updated, this.token(), this.metadataFileSystem); }
       catch (cause) {
         const survivors = cause instanceof AtomicWriteCleanupError ? [cause.survivor] : [];
         throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "failed to persist run lifecycle metadata", cause, undefined, survivors);
@@ -645,7 +679,7 @@ export class ManagedRunStore {
         ? { ...metadata, status, runId, updatedAtMs: now, terminalAtMs: now }
         : metadata;
       if (metadata.status === "active") {
-        try { await privateJson(dir, RUN_LIFECYCLE_FILE, updated, this.token()); }
+        try { await privateJson(dir, RUN_LIFECYCLE_FILE, updated, this.token(), this.metadataFileSystem); }
         catch (cause) {
           const survivors = cause instanceof AtomicWriteCleanupError ? [cause.survivor] : [];
           throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "failed to persist terminal run lifecycle", cause, undefined, survivors);
@@ -825,7 +859,8 @@ export class ManagedRunStore {
       if (errorCode(error) === "ENOENT") return "gone";
       throw error;
     }
-    if (claimed.state === "busy") return "retained";
+    if (claimed.state === "busy")
+      throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "managed lifecycle claim is stale or ambiguous; retained without deletion");
     return removed ? "deleted" : "retained";
   }
 

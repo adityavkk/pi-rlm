@@ -1,10 +1,17 @@
-import { lstat, mkdtemp, readFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "./src/core/journal.ts";
 import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controller.ts";
-import { DEFAULT_PROFILE, ManagedRunStore, type RunResult } from "./src/runtime/index.ts";
+import {
+  DEFAULT_PROFILE,
+  ManagedRunStore,
+  RUN_LIFECYCLE_FILE,
+  type ManagedRunStoreOptions,
+  type RunResult,
+  type RunRetentionMetadataFileSystem,
+} from "./src/runtime/index.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
@@ -174,6 +181,106 @@ const pendingOfflineRuntime = (dir: string): {
       createRunDirectory: async () => dir,
     },
   };
+};
+
+type MetadataFault = "write" | "sync" | "rename" | "directory-sync";
+type ResultStatus = RunResult["status"];
+
+const metadataFaultFileSystem = (fault: MetadataFault): RunRetentionMetadataFileSystem => {
+  let terminalPending = false;
+  return {
+    async open(path, flags, mode) {
+      const handle = await open(path, flags, mode);
+      let terminalHandle = false;
+      return {
+        async writeFile(data, encoding) {
+          terminalHandle = path.includes(RUN_LIFECYCLE_FILE)
+            && /\"status\":\"(?:completed|failed|cancelled)\"/.test(data);
+          if (terminalHandle) {
+            terminalPending = true;
+            if (fault === "write") throw Object.assign(new Error("injected terminal metadata write failure"), { code: "EIO" });
+          }
+          await handle.writeFile(data, encoding);
+        },
+        async sync() {
+          if (terminalHandle && fault === "sync")
+            throw Object.assign(new Error("injected terminal metadata sync failure"), { code: "EIO" });
+          if (flags === "r" && terminalPending && fault === "directory-sync")
+            throw Object.assign(new Error("injected terminal directory sync failure"), { code: "EIO" });
+          await handle.sync();
+        },
+        async close() { await handle.close(); },
+      };
+    },
+    async rename(from, to) {
+      if (terminalPending && to.endsWith(RUN_LIFECYCLE_FILE) && fault === "rename")
+        throw Object.assign(new Error("injected terminal metadata rename failure"), { code: "EIO" });
+      await rename(from, to);
+    },
+    unlink,
+  };
+};
+
+const managedStatusRun = async (
+  status: ResultStatus,
+  runRetention: ManagedRunStoreOptions,
+  createRunNonce?: () => string,
+): Promise<{ readonly result: ToolResult; readonly harness: ReturnType<typeof harness>; readonly journalRunId?: string }> => {
+  let started!: () => void;
+  const controllerStarted = new Promise<void>((resolve) => { started = resolve; });
+  const never = new Promise<Cell>(() => {});
+  const controller: ControllerDriver = {
+    identity: { id: "test/retention-result-controller", version: "1", configuration: { status } },
+    async next() {
+      if (status === "failed") throw new Error("expected controller failure");
+      if (status === "cancelled") { started(); return never; }
+      return { reasoning: "done", code: "answer({ answer: 'done' })" };
+    },
+    fork() { return this; },
+  };
+  const backend: InterpreterBackend = {
+    id: "retention-result-backend", version: "1",
+    async evalCell(options) {
+      options.effect("answer", { value: { answer: "done" } });
+      return { kind: "value", result: undefined, hasResult: false, workspace: {}, workspaceInvalidPaths: [] };
+    },
+    async dispose() {},
+  };
+  const model: ModelClient = {
+    id: "retention-result-model",
+    identity: { id: "test/retention-result-model", version: "1", configuration: {} },
+    async complete() { throw new Error("unexpected provider call"); },
+  };
+  const h = harness({ runtime: {
+    resolveProfile: () => ({ ...DEFAULT_PROFILE, wallMs: 10_000 }),
+    createBackend: () => backend,
+    createModel: () => model,
+    createController: () => controller,
+    createRunNonce,
+    runRetention,
+  } });
+  await h.startTurn(`Run managed ${status} fixture`);
+  const owner = new AbortController();
+  const pending = rlmTool(h).execute(`retention-${status}`, { objective: `Managed ${status}` }, owner.signal, undefined, h.ctx);
+  if (status === "cancelled") { await controllerStarted; owner.abort(); }
+  const result = await pending;
+  const entries = await readdir(runRetention.root!);
+  const retained = entries.find((entry) => entry.startsWith("run-") || entry.startsWith(".pi-rlm-quarantine-"));
+  let journalRunId: string | undefined;
+  if (retained) {
+    try {
+      const raw = await readFile(join(runRetention.root!, retained, "events.jsonl"), "utf8");
+      const events = raw.trim().split("\n").flatMap((line) => {
+        const parsed = JSON.parse(line) as RlmEvent | { events: RlmEvent[] };
+        return "events" in parsed ? parsed.events : [parsed];
+      });
+      journalRunId = events.find((event) =>
+        event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled")?.runId;
+    } catch (error) {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+  }
+  return { result, harness: h, journalRunId };
 };
 
 const assertCancelledJournal = async (dir: string): Promise<string> => {
@@ -555,6 +662,66 @@ describe("pi-rlm extension wiring", () => {
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  const metadataFaultCases = (["completed", "failed", "cancelled"] as const)
+    .flatMap((status) => (["write", "sync", "rename", "directory-sync"] as const).map((fault) => [status, fault] as const));
+  test.each(metadataFaultCases)(
+    "authoritative %s result survives terminal metadata %s failure with one warning",
+    async (status, fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
+      const { result, harness: h, journalRunId } = await managedStatusRun(status, {
+        root: stateRoot,
+        metadataFileSystem: metadataFaultFileSystem(fault),
+      });
+      expect(result.details?.status).toBe(status);
+      expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
+      const text = result.content[0]?.text ?? "";
+      expect(text.match(/RETENTION_METADATA_FAILED/g)).toHaveLength(1);
+      expect(text).not.toContain("failed before producing a result");
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["runId"]).toBe(journalRunId);
+      expect(warningAudit?.data["status"]).toBe(status);
+      expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_METADATA_FAILED")).toHaveLength(1);
+    },
+  );
+
+  const cleanupFaultCases = (["completed", "failed", "cancelled"] as const)
+    .flatMap((status) => (["scan", "delete"] as const).map((fault) => [status, fault] as const));
+  test.each(cleanupFaultCases)(
+    "authoritative %s result survives post-run cleanup %s failure with one warning",
+    async (status, fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
+      const retention: ManagedRunStoreOptions = fault === "scan"
+        ? { root: stateRoot, policy: { maxScanEntries: 1 } }
+        : {
+            root: stateRoot,
+            policy: { terminalMaxAgeMs: 0 },
+            removeDirectory: async () => { throw Object.assign(new Error("injected delete failure"), { code: "EIO" }); },
+          };
+      const { result, harness: h, journalRunId } = await managedStatusRun(status, retention);
+      expect(result.details?.status).toBe(status);
+      expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
+      const text = result.content[0]?.text ?? "";
+      expect(text.match(/RETENTION_CLEANUP_FAILED/g)).toHaveLength(1);
+      expect(text).not.toContain("failed before producing a result");
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["runId"]).toBe(journalRunId);
+      expect(warningAudit?.data["status"]).toBe(status);
+      expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_CLEANUP_FAILED")).toHaveLength(1);
+    },
+  );
+
+  test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-"));
+    const { result } = await managedStatusRun("failed", { root: stateRoot }, () => " invalid nonce ");
+    expect(result.details?.status).toBe("error");
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.runs).toHaveLength(1);
+    expect(listing.runs[0]).toMatchObject({ activity: "stale", metadata: { status: "active" } });
+    expect(listing.runs[0]?.metadata.runId).toBeUndefined();
+    expect(listing.runs[0]?.metadata.terminalAtMs).toBeUndefined();
+    await expect(readFile(join(listing.runs[0]!.path, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("default runtime uses retained managed state while injected directories keep legacy ownership", async () => {
