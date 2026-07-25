@@ -57,21 +57,37 @@ const makeBatchRecord = (events: readonly RlmEvent[]): JournalBatchRecord => {
   return { type: BATCH_RECORD_TYPE, version: BATCH_RECORD_VERSION, batchId: `batch_${checksum}`, checksum, events };
 };
 
-const sameOutput = (
-  cell: Extract<RlmEvent, { type: "cell_committed" }>,
-  answer: Extract<RlmEvent, { type: "answer_committed" }>,
-): boolean => cell.outputRef === answer.outputRef && cell.outputRefSha256 === answer.outputSha256
-  && cell.outputRefBytes === answer.outputBytes;
+type CellCommitted = Extract<RlmEvent, { type: "cell_committed" }>;
+type AnswerCommitted = Extract<RlmEvent, { type: "answer_committed" }>;
 
-/** Only the two transactions emitted by the runtime are valid batch payloads. */
+const hasFullCellOutput = (cell: CellCommitted): boolean =>
+  typeof cell.outputRef === "string" && typeof cell.outputRefSha256 === "string"
+  && SHA256.test(cell.outputRefSha256) && cell.outputRef === `ctx_${cell.outputRefSha256}`
+  && Number.isSafeInteger(cell.outputRefBytes) && (cell.outputRefBytes as number) >= 0;
+
+const hasFullAnswerOutput = (answer: AnswerCommitted): boolean =>
+  SHA256.test(answer.outputSha256 ?? "") && answer.outputRef === `ctx_${answer.outputSha256}`
+  && Number.isSafeInteger(answer.outputBytes) && (answer.outputBytes as number) >= 0;
+
+const sameOutput = (cell: CellCommitted, answer: AnswerCommitted): boolean =>
+  hasFullCellOutput(cell) && hasFullAnswerOutput(answer) && cell.outputRef === answer.outputRef
+  && cell.outputRefSha256 === answer.outputSha256 && cell.outputRefBytes === answer.outputBytes;
+
+/** Only the two exact transactions emitted by the runtime are valid version-1 batch payloads. */
 const validBatchSemantics = (events: readonly RlmEvent[]): boolean => {
+  const answers = events.filter((event): event is AnswerCommitted => event.type === "answer_committed");
+  if (answers.length > 1) return false;
+
+  // Fallback extraction is persisted separately from a controller cell as citation + fully identified answer.
   if (events.length === 2 && events[0]?.type === "fallback_evidence_cited" && events[1]?.type === "answer_committed") {
-    return events[0].frameId === events[1].frameId && events[1].completionMode === "fallback_extract";
+    return events[0].frameId === events[1].frameId && events[1].completionMode === "fallback_extract"
+      && hasFullAnswerOutput(events[1]);
   }
+
   const cellIndexes = events.flatMap((event, index) => event.type === "cell_committed" ? [index] : []);
   if (cellIndexes.length !== 1) return false;
   const cellIndex = cellIndexes[0] as number;
-  const cell = events[cellIndex] as Extract<RlmEvent, { type: "cell_committed" }>;
+  const cell = events[cellIndex] as CellCommitted;
   if (cellIndex !== events.length - 1 && cellIndex !== events.length - 2) return false;
   for (let index = 0; index < cellIndex; index++) {
     const progress = events[index];

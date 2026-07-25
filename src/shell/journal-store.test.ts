@@ -351,6 +351,68 @@ describe("JournalStore", () => {
       type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: "ctx_short",
       outputSha256: digestA, outputBytes: 1,
     }).ok).toBe(false);
+
+    // Version-1 batches are stricter, but legacy single records remain ref-only compatible.
+    expect(parseRlmEvent({ ...cell(), outputRef: refA }).ok).toBe(true);
+    expect(parseRlmEvent({
+      type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA,
+    }).ok).toBe(true);
+  });
+
+  test("requires complete identical answer metadata in exact answer transactions", async () => {
+    const fullCell = {
+      ...cell(), outputRef: refA, outputRefSha256: digestA, outputRefBytes: 4,
+    } as Extract<RlmEvent, { type: "cell_committed" }>;
+    const refOnlyCell = { ...cell(), outputRef: refA } as Extract<RlmEvent, { type: "cell_committed" }>;
+    const fullAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      type: "answer_committed", frameId: "f0", completionMode: "answer",
+      outputRef: refA, outputSha256: digestA, outputBytes: 4,
+    };
+    const fallbackCitation: RlmEvent = {
+      type: "fallback_evidence_cited", frameId: "f0", evidenceRefs: ["evidence-1"], evidenceRefsHash: digestA,
+    };
+    const refOnlyAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: refA,
+    };
+    const fallbackAnswer: Extract<RlmEvent, { type: "answer_committed" }> = {
+      ...fullAnswer, completionMode: "fallback_extract",
+    };
+
+    await expect(new JournalStore(dir).appendBatch([fullCell, fullAnswer])).resolves.toMatchObject({
+      events: ["committed", "committed"],
+    });
+    const fallbackDir = await mkdtemp(join(tmpdir(), "pi-rlm-fallback-batch-"));
+    await expect(new JournalStore(fallbackDir).appendBatch([fallbackCitation, fallbackAnswer])).resolves.toMatchObject({
+      events: ["committed", "committed"],
+    });
+
+    const digestC = "c".repeat(64);
+    const refC = `ctx_${digestC}`;
+    const invalid: readonly (readonly RlmEvent[])[] = [
+      [fullCell, refOnlyAnswer],
+      [refOnlyCell, fullAnswer],
+      [{ ...fullCell, outputRef: refC, outputRefSha256: digestC }, fullAnswer],
+      [{ ...fullCell, outputRefBytes: 5 }, fullAnswer],
+      [fullCell, { ...fullAnswer, frameId: "other" }],
+      [fullCell, { ...fullAnswer, completionMode: "fallback_extract" }],
+      [fullAnswer, fullCell],
+      [fullCell, fullAnswer, fallbackCitation],
+      [fullCell, fullAnswer, fullAnswer],
+      [fallbackCitation, { ...refOnlyAnswer, completionMode: "fallback_extract" }],
+      [fallbackCitation, fallbackAnswer, completed],
+      [fallbackCitation, fallbackAnswer, fallbackAnswer],
+    ];
+    for (const [index, events] of invalid.entries()) {
+      const target = await mkdtemp(join(tmpdir(), `pi-rlm-invalid-answer-batch-${index}-`));
+      try {
+        await new JournalStore(target).appendBatch(events);
+        throw new Error("expected invalid answer batch rejection");
+      } catch (error) {
+        expect(error).toBeInstanceOf(JournalAppendError);
+        expect((error as JournalAppendError).phase).toBe("event");
+        expect((error as JournalAppendError).cause).toEqual(expect.objectContaining({ code: "JOURNAL_CORRUPT" }));
+      }
+    }
   });
 
   test("rejects malformed, noncanonical, and non-cell batches before expansion", async () => {
