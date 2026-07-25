@@ -7,6 +7,8 @@ import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controlle
 import {
   DEFAULT_PROFILE,
   ManagedRunStore,
+  RUN_ACTIVE_FILE,
+  RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
   type ManagedRunStoreOptions,
   type RunResult,
@@ -218,6 +220,38 @@ const metadataFaultFileSystem = (fault: MetadataFault): RunRetentionMetadataFile
       await rename(from, to);
     },
     unlink,
+  };
+};
+
+type ReleaseFault = "unlink" | "rename" | "sync";
+const releaseFaultFileSystem = (fault: ReleaseFault): RunRetentionMetadataFileSystem => {
+  let tombstoneMoved = false;
+  return {
+    async open(path, flags, mode) {
+      const handle = await open(path, flags, mode);
+      return {
+        writeFile: (data, encoding) => handle.writeFile(data, encoding),
+        async sync() {
+          if (fault === "sync" && tombstoneMoved && flags === "r")
+            throw Object.assign(new Error("injected inactive tombstone sync failure"), { code: "EIO" });
+          await handle.sync();
+        },
+        close: () => handle.close(),
+      };
+    },
+    async rename(from, to) {
+      if (from.endsWith(RUN_ACTIVE_FILE)) {
+        if (fault === "rename") throw Object.assign(new Error("injected inactive tombstone rename failure"), { code: "EIO" });
+        await rename(from, to);
+        tombstoneMoved = true;
+        return;
+      }
+      await rename(from, to);
+    },
+    async unlink(path) {
+      if (path.endsWith(RUN_ACTIVE_FILE)) throw Object.assign(new Error("injected active marker unlink failure"), { code: "EIO" });
+      await unlink(path);
+    },
   };
 };
 
@@ -683,6 +717,46 @@ describe("pi-rlm extension wiring", () => {
       expect(warningAudit?.data["runId"]).toBe(journalRunId);
       expect(warningAudit?.data["status"]).toBe(status);
       expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_METADATA_FAILED")).toHaveLength(1);
+      const listing = await new ManagedRunStore({ root: stateRoot }).list();
+      expect(listing.runs).toHaveLength(1);
+      expect(listing.runs[0]?.activity).not.toBe("owned");
+      await expect(readFile(join(listing.runs[0]!.path, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await new ManagedRunStore({
+        root: stateRoot,
+        policy: { abandonedGraceMs: 0 },
+      }).cleanup({ force: true })).deleted).toEqual([listing.runs[0]!.name]);
+    },
+  );
+
+  test("active marker unlink fault uses a tombstone without adding a warning", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-release-"));
+    const { result } = await managedStatusRun("completed", {
+      root: stateRoot,
+      metadataFileSystem: releaseFaultFileSystem("unlink"),
+    });
+    expect(result.warnings?.filter((warning) => warning.code === "RETENTION_METADATA_FAILED") ?? []).toEqual([]);
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.runs[0]?.activity).toBe("inactive");
+    expect(await readdir(listing.runs[0]!.path)).toContain(
+      `${RUN_INACTIVE_FILE_PREFIX}${listing.runs[0]!.metadata.owner}.json`,
+    );
+  });
+
+  test.each(["rename", "sync"] as const)(
+    "compounded inactive tombstone %s fault adds exactly one bounded metadata warning",
+    async (fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-release-"));
+      const { result, harness: h } = await managedStatusRun("completed", {
+        root: stateRoot,
+        metadataFileSystem: releaseFaultFileSystem(fault),
+      });
+      expect(result.details?.status).toBe("completed");
+      expect((result.content[0]?.text ?? "").match(/RETENTION_METADATA_FAILED/g)).toHaveLength(1);
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["codes"]).toEqual(["RETENTION_METADATA_FAILED"]);
+      const listing = await new ManagedRunStore({ root: stateRoot }).list();
+      expect(listing.runs[0]?.activity).not.toBe("owned");
+      expect(listing.runs[0]?.activity).toBe(fault === "rename" ? "ambiguous" : "inactive");
     },
   );
 

@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -14,6 +14,7 @@ import {
   defaultRunStateRoot,
   ManagedRunStore,
   RUN_ACTIVE_FILE,
+  RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
   RunRetentionError,
   type ManagedRunLease,
@@ -123,13 +124,75 @@ describe("managed run lifecycle", () => {
     await expect(lstat(dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("finish without strict manifest and terminal journal evidence leaves an active lifecycle", async () => {
+  test("finish without strict manifest and terminal journal evidence releases an abandoned lifecycle", async () => {
     const store = new ManagedRunStore({ root: await root(), createToken: tokens() });
     const lease = await store.create();
     await expect(lease.finish("failed", `run_${"a".repeat(64)}`)).rejects.toMatchObject({ code: "RUN_RETENTION_METADATA_FAILED" });
-    expect((await store.list()).runs[0]?.metadata.status).toBe("active");
-    await lease.abandon();
     expect((await store.list()).runs[0]).toMatchObject({ metadata: { status: "active" }, activity: "stale" });
+    await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("marker unlink failure falls back to an owner-bound inactive tombstone", async () => {
+    const path = await root();
+    const metadataFileSystem = {
+      async open(path: string, flags: string | number, mode?: number) { return open(path, flags, mode); },
+      rename,
+      async unlink(path: string) {
+        if (path.endsWith(RUN_ACTIVE_FILE)) throw Object.assign(new Error("injected active marker unlink failure"), { code: "EIO" });
+        await unlink(path);
+      },
+    };
+    const store = new ManagedRunStore({ root: path, createToken: tokens(), metadataFileSystem });
+    const lease = await store.create();
+    await publishTerminal(lease, "completed", "marker-unlink-fallback");
+    const listed = (await store.list()).runs[0]!;
+    expect(listed.activity).toBe("inactive");
+    expect(await readdir(lease.dir)).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listed.metadata.owner}.json`);
+    await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).deleted).toEqual([lease.name]);
+  });
+
+  test.each(["rename", "sync"] as const)("compounded tombstone %s failure releases in-process ownership with a typed error", async (fault) => {
+    const path = await root();
+    let tombstoneMoved = false;
+    const metadataFileSystem = {
+      async open(path: string, flags: string | number, mode?: number) {
+        const handle = await open(path, flags, mode);
+        return {
+          writeFile: (data: string, encoding: BufferEncoding) => handle.writeFile(data, encoding),
+          async sync() {
+            if (fault === "sync" && tombstoneMoved && flags === "r")
+              throw Object.assign(new Error("injected tombstone directory sync failure"), { code: "EIO" });
+            await handle.sync();
+          },
+          close: () => handle.close(),
+        };
+      },
+      async rename(from: string, to: string) {
+        if (from.endsWith(RUN_ACTIVE_FILE)) {
+          if (fault === "rename") throw Object.assign(new Error("injected tombstone rename failure"), { code: "EIO" });
+          await rename(from, to);
+          tombstoneMoved = true;
+          return;
+        }
+        await rename(from, to);
+      },
+      async unlink(path: string) {
+        if (path.endsWith(RUN_ACTIVE_FILE)) throw Object.assign(new Error("injected active marker unlink failure"), { code: "EIO" });
+        await unlink(path);
+      },
+    };
+    const store = new ManagedRunStore({ root: path, createToken: tokens(), metadataFileSystem });
+    const lease = await store.create();
+    await expect(publishTerminal(lease, "completed", `marker-${fault}`)).rejects.toMatchObject({
+      code: "RUN_RETENTION_METADATA_FAILED",
+      cause: expect.any(AggregateError),
+    });
+    const listed = (await store.list()).runs[0]!;
+    expect(listed.activity).not.toBe("owned");
+    expect(listed.activity).toBe(fault === "rename" ? "ambiguous" : "inactive");
+    if (fault === "sync")
+      expect(await readdir(lease.dir)).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listed.metadata.owner}.json`);
   });
 });
 
@@ -282,8 +345,8 @@ describe("bounded deterministic retention", () => {
     const reader = child.stdout.getReader();
     const claimed = new TextDecoder().decode((await reader.read()).value).trim();
     expect(claimed).toBe("CLAIMED");
-    await expect(new ManagedRunStore({ root: path, policy: { abandonedGraceMs: 0 } }).cleanup())
-      .rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    expect((await new ManagedRunStore({ root: path, policy: { abandonedGraceMs: 0 } }).cleanup()).skipped)
+      .toEqual([{ runName: expect.stringMatching(/^run-/), reason: "already_claimed" }]);
     child.stdin.end();
     const ready = new TextDecoder().decode((await reader.read()).value).trim();
     reader.releaseLock();
@@ -296,41 +359,62 @@ describe("bounded deterministic retention", () => {
     expect((await host.cleanup()).deleted).toEqual([name]);
   });
 
-  test("two process-isolated managers starting together delete one candidate at most once", async () => {
+  test("two process-isolated managers list the same candidate before exactly one deletes it", async () => {
     const path = await root();
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
     const name = await terminalFixture(producer, "completed", "process-cleaners", 1);
     const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
     const script = `
       const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
-      const store = new ManagedRunStore({ root: ${JSON.stringify(path)} });
-      process.stdout.write("READY\\n");
-      await Bun.stdin.text();
-      try {
-        const result = await store.cleanup({ force: true });
-        process.stdout.write(JSON.stringify({ deleted: result.deleted }) + "\\n");
-      } catch (error) {
-        process.stdout.write(JSON.stringify({ code: error?.code, deleted: error?.result?.deleted ?? [] }) + "\\n");
-      }
+      const store = new ManagedRunStore({
+        root: ${JSON.stringify(path)},
+        beforeCleanupDecision: async () => {
+          process.stdout.write("LISTED\\n");
+          await Bun.stdin.text();
+        },
+      });
+      const result = await store.cleanup({ force: true });
+      process.stdout.write(JSON.stringify({ deleted: result.deleted, skipped: result.skipped }) + "\\n");
     `;
     const children = [0, 1].map(() => Bun.spawn([process.execPath, "-e", script], {
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     }));
     const readers = children.map((child) => child.stdout.getReader());
     for (const reader of readers)
-      expect(new TextDecoder().decode((await reader.read()).value).trim()).toBe("READY");
+      expect(new TextDecoder().decode((await reader.read()).value).trim()).toBe("LISTED");
     for (const child of children) child.stdin.end();
-    const outcomes: Array<{ deleted: string[]; code?: string }> = [];
+    const outcomes: Array<{ deleted: string[]; skipped: Array<{ runName: string; reason: string }> }> = [];
     for (const reader of readers) {
       outcomes.push(JSON.parse(new TextDecoder().decode((await reader.read()).value).trim()));
       reader.releaseLock();
     }
     await Promise.all(children.map((child) => child.exited));
-    expect(outcomes.flatMap((outcome) => outcome.deleted).filter((deleted) => deleted === name).length).toBeLessThanOrEqual(1);
-    await expect(lstat(join(path, name))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(outcomes.flatMap((outcome) => outcome.deleted)).toEqual([name]);
+    expect(outcomes.flatMap((outcome) => outcome.skipped)).toEqual([
+      { runName: name, reason: expect.stringMatching(/^already_(?:removed|claimed)$/) },
+    ]);
+    expect(await readdir(path)).toEqual([]);
   });
 
-  test.each(["stale", "ambiguous"] as const)("a %s cross-process lifecycle claim retains with a typed failure", async (kind) => {
+  test.each(["manifest.json", "events.jsonl", RUN_LIFECYCLE_FILE])(
+    "missing %s evidence remains a typed retained run",
+    async (evidence) => {
+      const path = await root();
+      const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+      const name = await terminalFixture(producer, "completed", `missing-${evidence}`, 1);
+      await unlink(join(path, name, evidence));
+      let failure: unknown;
+      try { await producer.cleanup({ force: true }); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({
+        code: expect.stringMatching(/^RUN_RETENTION_(?:CLEANUP_FAILED|POLICY_UNSATISFIED)$/),
+        result: { deleted: [], skipped: [], retained: [name] },
+      });
+      expect((await lstat(join(path, name))).isDirectory()).toBe(true);
+      expect((failure as RunRetentionError).result?.issues.some((issue) => issue.runName === name)).toBe(true);
+    },
+  );
+
+  test.each(["stale", "ambiguous"] as const)("a %s cross-process lifecycle claim is skipped as already claimed", async (kind) => {
     const path = await root();
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
     const name = await terminalFixture(producer, "completed", `process-claim-${kind}`, 1);
@@ -347,8 +431,8 @@ describe("bounded deterministic retention", () => {
     const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
     expect(new TextDecoder().decode((await child.stdout.getReader().read()).value).trim()).toBe("READY");
     if (kind === "stale") { child.kill(); await child.exited; }
-    await expect(new ManagedRunStore({ root: path }).cleanup({ force: true }))
-      .rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED", result: { retained: [name] } });
+    expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).skipped)
+      .toEqual([{ runName: name, reason: "already_claimed" }]);
     expect((await lstat(join(path, name))).isDirectory()).toBe(true);
     if (kind === "ambiguous") { child.kill(); await child.exited; }
   });

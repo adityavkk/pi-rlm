@@ -23,6 +23,7 @@ import { readRunManifest, RUN_MANIFEST_FILE } from "./run-manifest.ts";
 export const RUN_LIFECYCLE_FILE = ".pi-rlm-lifecycle.json";
 export const RUN_ACTIVE_FILE = ".pi-rlm-active.json";
 export const RUN_LIFECYCLE_CLAIM_FILE = ".pi-rlm-lifecycle.claim";
+export const RUN_INACTIVE_FILE_PREFIX = ".pi-rlm-inactive-";
 export const MANAGED_RUN_CLAIM_ENTRIES = Object.freeze([
   RUN_LIFECYCLE_FILE,
   RUN_ACTIVE_FILE,
@@ -125,8 +126,17 @@ export interface RunCleanupOptions {
   readonly force?: boolean;
 }
 
+export type RunCleanupSkipReason = "already_removed" | "already_claimed";
+
+export interface RunCleanupSkipped {
+  readonly runName: string;
+  readonly reason: RunCleanupSkipReason;
+}
+
 export interface RunCleanupResult extends ManagedRunListing {
+  /** Names whose inode this cleanup invocation successfully removed. */
   readonly deleted: readonly string[];
+  readonly skipped: readonly RunCleanupSkipped[];
   readonly wouldDelete: readonly string[];
   readonly retained: readonly string[];
 }
@@ -367,7 +377,10 @@ interface LifecycleClaimContext {
   restore(): void;
 }
 
-type ClaimResult<T> = { readonly state: "acquired"; readonly value: T } | { readonly state: "busy" };
+type ClaimResult<T> =
+  | { readonly state: "acquired"; readonly value: T }
+  | { readonly state: "busy" }
+  | { readonly state: "missing" };
 
 export class ManagedRunLease {
   private runId: string | undefined;
@@ -391,18 +404,53 @@ export class ManagedRunLease {
 
   async finish(status: Exclude<RunLifecycleStatus, "active">, runId?: string): Promise<void> {
     if (this.closed) return;
-    const identity = runId ?? this.runId;
-    if (identity === undefined || !RUN_ID.test(identity) || (this.runId !== undefined && identity !== this.runId))
-      throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "terminal lifecycle requires the bound manifest run identity");
-    this.metadata = await this.store.finishLease(this.dir, this.metadata, status, identity);
-    this.closed = true;
+    let primary: unknown;
+    try {
+      const identity = runId ?? this.runId;
+      if (identity === undefined || !RUN_ID.test(identity) || (this.runId !== undefined && identity !== this.runId))
+        throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "terminal lifecycle requires the bound manifest run identity");
+      this.metadata = await this.store.finishLease(this.dir, this.metadata, status, identity);
+    } catch (error) { primary = error; }
+    finally {
+      try { await this.store.releaseLease(this.dir, this.metadata); }
+      catch (release) {
+        primary = primary === undefined
+          ? release
+          : new RunRetentionError(
+              "RUN_RETENTION_METADATA_FAILED",
+              "terminal lifecycle finalization and active lease release both failed",
+              new AggregateError([primary, release], "terminal lifecycle and lease release both failed"),
+              undefined,
+              release instanceof RunRetentionError ? release.survivors : [],
+            );
+      }
+      this.closed = true;
+    }
+    if (primary !== undefined) throw primary;
   }
 
   /** Release a run which threw before returning an authoritative terminal result. */
   async abandon(): Promise<void> {
     if (this.closed) return;
-    this.metadata = await this.store.abandonLease(this.dir, this.metadata);
-    this.closed = true;
+    let primary: unknown;
+    try { this.metadata = await this.store.abandonLease(this.dir, this.metadata); }
+    catch (error) { primary = error; }
+    finally {
+      try { await this.store.releaseLease(this.dir, this.metadata); }
+      catch (release) {
+        primary = primary === undefined
+          ? release
+          : new RunRetentionError(
+              "RUN_RETENTION_METADATA_FAILED",
+              "abandonment validation and active lease release both failed",
+              new AggregateError([primary, release], "abandonment validation and lease release both failed"),
+              undefined,
+              release instanceof RunRetentionError ? release.survivors : [],
+            );
+      }
+      this.closed = true;
+    }
+    if (primary !== undefined) throw primary;
   }
 
   /** Remove an allocation that never became visible to its cancelled caller. */
@@ -523,13 +571,18 @@ export class ManagedRunStore {
     allowBusy: boolean,
     operation: (context: LifecycleClaimContext) => Promise<T>,
   ): Promise<ClaimResult<T>> {
-    await this.ensureRunPath(dir);
+    try { await this.ensureRunPath(dir); }
+    catch (cause) {
+      if (allowBusy && errorCode(cause) === "ENOENT") return { state: "missing" };
+      throw cause;
+    }
     const claimPath = join(dir, RUN_LIFECYCLE_CLAIM_FILE);
     let handle: Awaited<ReturnType<typeof open>>;
     try {
       handle = await open(claimPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     } catch (cause) {
       if (allowBusy && errorCode(cause) === "EEXIST") return { state: "busy" };
+      if (allowBusy && errorCode(cause) === "ENOENT") return { state: "missing" };
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "failed to acquire managed lifecycle claim", cause);
     }
 
@@ -599,7 +652,7 @@ export class ManagedRunStore {
         await privateJson(dir, RUN_LIFECYCLE_FILE, metadata, this.token(), this.metadataFileSystem);
         await privateJson(dir, RUN_ACTIVE_FILE, { schemaVersion: 1, pid: process.pid, owner, startedAtMs: createdAtMs }, this.token(), this.metadataFileSystem);
       });
-      if (claimed.state !== "acquired") throw new Error("managed lifecycle claim unexpectedly busy");
+      if (claimed.state !== "acquired") throw new Error("managed lifecycle claim unexpectedly unavailable");
       activeOwners.set(dir, owner);
       return new ManagedRunLease(this, name, dir, metadata);
     } catch (cause) {
@@ -634,7 +687,7 @@ export class ManagedRunStore {
       }
       return updated;
     });
-    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is busy");
+    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is unavailable");
     return claimed.value;
   }
 
@@ -685,11 +738,9 @@ export class ManagedRunStore {
           throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "failed to persist terminal run lifecycle", cause, undefined, survivors);
         }
       }
-      await unlink(join(dir, RUN_ACTIVE_FILE));
-      activeOwners.delete(dir);
       return updated;
     });
-    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is busy");
+    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is unavailable");
     return claimed.value;
   }
 
@@ -698,12 +749,44 @@ export class ManagedRunStore {
       const metadata = await this.ownedState(dir, expected);
       if (metadata.status !== "active")
         throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "thrown run unexpectedly has terminal lifecycle metadata");
-      await unlink(join(dir, RUN_ACTIVE_FILE));
-      activeOwners.delete(dir);
       return metadata;
     });
-    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is busy");
+    if (claimed.state !== "acquired") throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed lifecycle claim is unavailable");
     return claimed.value;
+  }
+
+  /** In-process ownership ends before any fallible filesystem release operation. */
+  async releaseLease(dir: string, expected: RunLifecycleMetadata): Promise<void> {
+    activeOwners.delete(dir);
+    const marker = join(dir, RUN_ACTIVE_FILE);
+    try {
+      await this.metadataFileSystem.unlink(marker);
+      return;
+    } catch (cause) {
+      if (errorCode(cause) === "ENOENT") return;
+      const inactive = join(dir, `${RUN_INACTIVE_FILE_PREFIX}${expected.owner}.json`);
+      try {
+        await this.metadataFileSystem.rename(marker, inactive);
+        const directory = await this.metadataFileSystem.open(dir, "r");
+        let syncFailure: unknown;
+        try { await directory.sync(); } catch (error) { syncFailure = error; }
+        try { await directory.close(); } catch (cleanup) {
+          syncFailure = syncFailure === undefined
+            ? cleanup
+            : new AggregateError([syncFailure, cleanup], "inactive tombstone directory sync and close both failed");
+        }
+        if (syncFailure !== undefined) throw syncFailure;
+        return;
+      } catch (fallback) {
+        throw new RunRetentionError(
+          "RUN_RETENTION_METADATA_FAILED",
+          "failed to release active run lease",
+          new AggregateError([cause, fallback], "active marker unlink and inactive tombstone fallback both failed"),
+          undefined,
+          [await boundedSurvivor(inactive, "temporary-file")],
+        );
+      }
+    }
   }
 
   private async scanTree(path: string, budget: ScanBudget, depth = 0): Promise<number> {
@@ -786,9 +869,14 @@ export class ManagedRunStore {
   private async quarantine(
     run: ScannedRunInfo,
     context: LifecycleClaimContext,
-  ): Promise<void> {
+  ): Promise<"deleted" | "already_removed"> {
     await this.verifyRootIdentity();
-    const stable = await lstat(run.path);
+    let stable: Awaited<ReturnType<typeof lstat>>;
+    try { stable = await lstat(run.path); }
+    catch (cause) {
+      if (errorCode(cause) === "ENOENT") return "already_removed";
+      throw cause;
+    }
     if (stable.isSymbolicLink() || !stable.isDirectory() || stable.dev !== run.identity.dev || stable.ino !== run.identity.ino)
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "removal target identity changed before quarantine");
     const quarantine = join(this.root, `.pi-rlm-quarantine-${this.token()}`);
@@ -796,13 +884,21 @@ export class ManagedRunStore {
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "unsafe quarantine path");
     try { await lstat(quarantine); throw new Error("quarantine path already exists"); }
     catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-    await rename(run.path, quarantine);
+    try { await rename(run.path, quarantine); }
+    catch (cause) {
+      if (errorCode(cause) === "ENOENT") return "already_removed";
+      throw cause;
+    }
     context.consume();
-    const moved = await lstat(quarantine);
+    let moved: Awaited<ReturnType<typeof lstat>>;
+    try { moved = await lstat(quarantine); }
+    catch (cause) {
+      if (errorCode(cause) === "ENOENT") return "already_removed";
+      throw cause;
+    }
     if (moved.isSymbolicLink() || !moved.isDirectory() || moved.dev !== run.identity.dev || moved.ino !== run.identity.ino) {
-      try {
-        await lstat(run.path);
-      } catch (error) {
+      try { await lstat(run.path); }
+      catch (error) {
         if (errorCode(error) === "ENOENT") {
           await rename(quarantine, run.path);
           context.restore();
@@ -813,11 +909,16 @@ export class ManagedRunStore {
         "quarantined run identity changed; retained without deletion",
         undefined,
         undefined,
-        [await boundedSurvivor(context ? quarantine : run.path, "quarantine")],
+        [await boundedSurvivor(quarantine, "quarantine")],
       );
     }
     try { await this.remover(quarantine); }
     catch (cause) {
+      if (errorCode(cause) === "ENOENT") return "already_removed";
+      try { await lstat(quarantine); }
+      catch (missing) {
+        if (errorCode(missing) === "ENOENT") return "already_removed";
+      }
       throw new RunRetentionError(
         "RUN_RETENTION_CLEANUP_FAILED",
         "failed to remove quarantined managed run",
@@ -826,42 +927,51 @@ export class ManagedRunStore {
         [await boundedSurvivor(quarantine, "quarantine")],
       );
     }
+    try {
+      await lstat(quarantine);
+      throw new RunRetentionError(
+        "RUN_RETENTION_CLEANUP_FAILED",
+        "quarantined managed run remained after removal",
+        undefined,
+        undefined,
+        [await boundedSurvivor(quarantine, "quarantine")],
+      );
+    } catch (cause) {
+      if (errorCode(cause) === "ENOENT") return "deleted";
+      throw cause;
+    }
   }
 
-  private async removeCandidate(run: ScannedRunInfo, now: number): Promise<"deleted" | "retained" | "gone"> {
+  private async removeCandidate(
+    run: ScannedRunInfo,
+    now: number,
+  ): Promise<"deleted" | "retained" | RunCleanupSkipReason> {
     await this.beforeDecision(run.path);
-    let claimed: ClaimResult<void>;
-    let removed = false;
-    try {
-      claimed = await this.withLifecycleClaim(run.path, true, async (context) => {
-        const identity = await this.ensureRunPath(run.path);
-        if (identity.dev !== run.identity.dev || identity.ino !== run.identity.ino)
-          throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "run identity changed after retention listing");
-        const metadata = parseLifecycle(await readBoundedJson(join(run.path, RUN_LIFECYCLE_FILE)));
-        if (!this.sameLifecycle(metadata, run.metadata))
-          throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "run lifecycle changed after retention listing");
-        const activity = await this.activity(run.path, metadata);
-        if (activity !== "inactive" && activity !== "stale") return;
-        if (metadata.status === "active") {
-          if (now - metadata.updatedAtMs < this.policy.abandonedGraceMs) return;
-        } else {
-          if (!metadata.runId) throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "terminal lifecycle has no manifest run identity");
-          try { await this.validateTerminalEvidence(run.path, metadata.runId, metadata.status); }
-          catch (cause) {
-            throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "terminal lifecycle evidence is invalid", cause);
-          }
+    let outcome: "deleted" | "retained" | RunCleanupSkipReason = "retained";
+    const claimed = await this.withLifecycleClaim(run.path, true, async (context) => {
+      const identity = await this.ensureRunPath(run.path);
+      if (identity.dev !== run.identity.dev || identity.ino !== run.identity.ino)
+        throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "run identity changed after retention listing");
+      const metadata = parseLifecycle(await readBoundedJson(join(run.path, RUN_LIFECYCLE_FILE)));
+      if (!this.sameLifecycle(metadata, run.metadata))
+        throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "run lifecycle changed after retention listing");
+      const activity = await this.activity(run.path, metadata);
+      if (activity !== "inactive" && activity !== "stale") return;
+      if (metadata.status === "active") {
+        if (now - metadata.updatedAtMs < this.policy.abandonedGraceMs) return;
+      } else {
+        if (!metadata.runId) throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "terminal lifecycle has no manifest run identity");
+        try { await this.validateTerminalEvidence(run.path, metadata.runId, metadata.status); }
+        catch (cause) {
+          throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "terminal lifecycle evidence is invalid", cause);
         }
-        await this.scanTree(run.path, { entries: 0, bytes: 0 });
-        await this.quarantine(run, context);
-        removed = true;
-      });
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return "gone";
-      throw error;
-    }
-    if (claimed.state === "busy")
-      throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "managed lifecycle claim is stale or ambiguous; retained without deletion");
-    return removed ? "deleted" : "retained";
+      }
+      await this.scanTree(run.path, { entries: 0, bytes: 0 });
+      outcome = await this.quarantine(run, context);
+    });
+    if (claimed.state === "busy") return "already_claimed";
+    if (claimed.state === "missing") return "already_removed";
+    return outcome;
   }
 
   async discardOwned(name: string, path: string, expected: RunLifecycleMetadata): Promise<void> {
@@ -884,7 +994,7 @@ export class ManagedRunStore {
         await this.quarantine(run, context);
         activeOwners.delete(path);
       });
-      if (claimed.state !== "acquired") throw new Error("managed lifecycle claim unexpectedly busy");
+      if (claimed.state !== "acquired") throw new Error("managed lifecycle claim unexpectedly unavailable");
     } catch (cause) {
       if (cause instanceof RunRetentionError) throw cause;
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "failed to remove unused run allocation", cause);
@@ -896,7 +1006,8 @@ export class ManagedRunStore {
     const run = listing.runs.find((candidate) => candidate.name === name && candidate.path === path);
     if (!run) throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target was not a validated run");
     const outcome = await this.removeCandidate(run, this.time());
-    if (outcome === "retained") throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target became active or ambiguous");
+    if (outcome === "retained" || outcome === "already_claimed")
+      throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target became active or ambiguous");
   }
 
   async cleanup(options: RunCleanupOptions = {}): Promise<RunCleanupResult> {
@@ -938,31 +1049,40 @@ export class ManagedRunStore {
         return (at - bt) || a.name.localeCompare(b.name);
       });
     const deleted: string[] = [];
+    const skipped: RunCleanupSkipped[] = [];
     const issues = [...listing.issues];
     if (!options.dryRun) {
       for (const run of ordered) {
         try {
           const outcome = await this.removeCandidate(run, now);
-          if (outcome === "deleted" || outcome === "gone") deleted.push(run.name);
+          if (outcome === "deleted") deleted.push(run.name);
+          else if (outcome === "already_removed" || outcome === "already_claimed")
+            skipped.push({ runName: run.name, reason: outcome });
         } catch (cause) {
           issues.push({ code: "CLEANUP_FAILED", message: "failed to remove managed run", runName: run.name, cause });
         }
       }
     }
-    const plannedDeleted = new Set(options.dryRun ? ordered.map((run) => run.name) : deleted);
-    const retainedRuns = internal.runs.filter((run) => !plannedDeleted.has(run.name));
+    const handled = new Set(options.dryRun
+      ? ordered.map((run) => run.name)
+      : [...deleted, ...skipped.map((entry) => entry.runName)]);
+    const retainedRuns = internal.runs.filter((run) => !handled.has(run.name));
     const retainedTerminal = retainedRuns.filter((run) => run.metadata.status !== "active");
     const policyUnsatisfied = retainedTerminal.length > this.policy.maxTerminalRuns
       || retainedTerminal.reduce((sum, run) => sum + run.bytes, 0) > this.policy.maxTerminalBytes
       || retainedTerminal.some((run) => now - run.metadata.terminalAtMs! >= this.policy.terminalMaxAgeMs);
     if (!options.dryRun && policyUnsatisfied)
       issues.push({ code: "POLICY_UNSATISFIED", message: "active, ambiguous, or failed removals prevent terminal retention bounds" });
+    const invalidRetained = listing.issues
+      .filter((issue) => issue.code === "SCAN_FAILED" && issue.runName !== undefined && RUN_NAME.test(issue.runName))
+      .map((issue) => issue.runName!);
     const result: RunCleanupResult = {
       ...listing,
       issues,
       deleted,
+      skipped,
       wouldDelete: options.dryRun ? ordered.map((run) => run.name) : [],
-      retained: retainedRuns.map((run) => run.name).sort(),
+      retained: [...new Set([...retainedRuns.map((run) => run.name), ...invalidRetained])].sort(),
     };
     if (!options.dryRun && issues.length > 0) {
       const code = policyUnsatisfied ? "RUN_RETENTION_POLICY_UNSATISFIED" : "RUN_RETENTION_CLEANUP_FAILED";
