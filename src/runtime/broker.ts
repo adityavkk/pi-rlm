@@ -94,6 +94,12 @@ const strictJson = (text: string): { ok: true; value: JsonValue } | { ok: false 
 
 const now = (state: RunState): number => state.clock.now();
 
+const checkpointCall = (state: RunState, signal: AbortSignal, deadlineMs?: number): void => {
+  throwIfAborted(signal);
+  if (deadlineMs !== undefined && state.clock.now() >= deadlineMs)
+    throw new DslError("BUDGET_DEADLINE", "deadline reached during call");
+};
+
 interface KeyClaim {
   readonly frame: FrameRef;
   readonly kind: CallKind;
@@ -333,9 +339,9 @@ export const dispatchCall = async (
   throwIfAborted(signal);
   switch (name) {
     case "llm":
-      return llm(state, frame, asObject(args), signal);
+      return llm(state, frame, asObject(args), signal, false, deadlineMs);
     case "llm.batch":
-      return llmBatch(state, frame, asObject(args), recurse, signal);
+      return llmBatch(state, frame, asObject(args), recurse, signal, deadlineMs);
     case "recurse":
       return recurse(args, signal, deadlineMs);
     case "agent": {
@@ -547,37 +553,50 @@ export const retainCallResult = async (
   result: GuestCallResult,
   event: Extract<RlmEvent, { type: "call_committed" }>,
   signal: AbortSignal,
+  deadlineMs?: number,
 ): Promise<GuestCallResult> => {
-  throwIfAborted(signal);
+  checkpointCall(state, signal, deadlineMs);
   const release = await state.contextSemaphore.acquire(signal);
   if (!release) {
-    throwIfAborted(signal);
+    checkpointCall(state, signal, deadlineMs);
     throw new Error("stored-byte persistence lock unavailable");
   }
   try {
+    checkpointCall(state, signal, deadlineMs);
     const cached = state.callCache.get(result.callId);
     if (cached) return cached;
+
+    let journalCommitted = false;
+    let journalFailure: JournalAppendError | undefined;
+    try {
+      const outcome = await waitForAbort(state.journal.append(event), signal);
+      const observed = outcome as {
+        readonly event?: "committed" | "ignored_after_terminal";
+        readonly statusCache?: { readonly state: string; readonly error?: JournalAppendError };
+      } | undefined;
+      journalCommitted = observed?.event === undefined || observed.event === "committed";
+      if (observed?.statusCache?.state === "failed" && observed.statusCache.error)
+        journalFailure = observed.statusCache.error;
+    } catch (error) {
+      if (!(error instanceof JournalAppendError) || !error.eventDurable) throw error;
+      journalCommitted = true;
+      journalFailure = error;
+    }
+    if (!journalCommitted) throw new Error("call journal event ignored after terminal");
+
+    checkpointCall(state, signal, deadlineMs);
     const reserved = reserveStoredBytes(state.ledger, retainedJsonBytes(result as unknown as JsonValue));
     if (!reserved.ok) return errResult(result.callId, reserved.error, result.usage, false);
     try {
-      let journalCommitted = false;
-      try {
-        const outcome = await state.journal.append(event);
-        const disposition = (outcome as { readonly event?: "committed" | "ignored_after_terminal" } | undefined)?.event;
-        journalCommitted = disposition === undefined || disposition === "committed";
-      } catch (error) {
-        journalCommitted = error instanceof JournalAppendError && error.eventDurable;
-        if (!journalCommitted) throw error;
-      }
-      if (!journalCommitted) throw new Error("call journal event ignored after terminal");
       state.callCache.set(result.callId, result);
       reserved.value.commit();
-      return result;
     } catch (error) {
       if (state.callCache.get(result.callId) === result) state.callCache.delete(result.callId);
       reserved.value.rollback();
       throw error;
     }
+    if (journalFailure) throw journalFailure;
+    return result;
   } finally {
     release();
   }
@@ -607,6 +626,7 @@ const llm = async (
   spec: JsonObject,
   signal: AbortSignal,
   identityBound = false,
+  deadlineMs?: number,
 ): Promise<GuestCallResult> => {
   const normalized = normalizeLlmSpec(state, spec);
   const { key, prompt, model, thinking, contextIds: ctxIds, schema, maxOutputTokens, identity } = normalized;
@@ -644,7 +664,7 @@ const llm = async (
 
       release = await state.semaphore.acquire(signal);
       if (!release) return cancelled(usage);
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
 
       const contexts = await waitForAbort(Promise.all(ctxIds.map((id) => state.store.load(id))), signal);
       throwIfAborted(signal);
@@ -667,7 +687,7 @@ const llm = async (
       pendingTokenReservation = reserveTokens;
 
       const firstRaw = await waitForAbort(state.model.complete(request), signal);
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
       const first = normalizeModelResponse(firstRaw, limits);
       if (!first) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
       const firstSettlement = settle(state, reserveTokens, first.usage.totalTokens ?? 0);
@@ -693,7 +713,7 @@ const llm = async (
             state.ledger.current = repairReserve.value;
             pendingTokenReservation = repairReserveTokens;
             const repairRaw = await waitForAbort(state.model.complete(repairRequest), signal);
-            throwIfAborted(signal);
+            checkpointCall(state, signal, deadlineMs);
             const repair = normalizeModelResponse(repairRaw, limits);
             if (!repair) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
             const combined = addUsage(usage, repair.usage);
@@ -715,7 +735,7 @@ const llm = async (
         value = first.text;
       }
 
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
       const result = okResult(callId, value, usage, false);
       const retained = await retainCallResult(state, result, {
         type: "call_committed",
@@ -726,12 +746,13 @@ const llm = async (
         cached: false,
         ok: true,
         usage,
-      }, signal);
+      }, signal, deadlineMs);
       logicalReserved = false;
       return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled(usage);
       logicalReserved = false;
+      if (error instanceof JournalAppendError) throw error;
       if (error instanceof PiModelError) {
         const failure = normalizePiFailure(error, usageLimits(state));
         if (failure) {
@@ -777,6 +798,7 @@ const llmBatch = async (
   spec: JsonObject,
   recurse: RecurseFn,
   signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<unknown> => {
   void recurse;
   reqStr(spec, "key");
@@ -793,8 +815,8 @@ const llmBatch = async (
       throwIfAborted(signal);
       const index = cursor++;
       if (index >= items.length) return;
-      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true);
-      throwIfAborted(signal);
+      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true, deadlineMs);
+      checkpointCall(state, signal, deadlineMs);
       results[index] = result;
     }
   });

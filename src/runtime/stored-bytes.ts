@@ -19,16 +19,24 @@ export const reserveStoredBytes = (
   const reserved = reserveBytes(ledger.current, bytes);
   if (!reserved.ok) return err(reserved.error);
   ledger.current = reserved.value;
+  let remaining = bytes;
   let active = true;
+  const release = (released: number): void => {
+    if (!active || !Number.isSafeInteger(released) || released < 0 || released > remaining)
+      throw new Error("invalid stored-byte reservation release");
+    if (released > 0) ledger.current = releaseBytes(ledger.current, released);
+    remaining -= released;
+  };
   return ok({
     commit: () => {
       if (!active) return;
       active = false;
     },
+    release,
     rollback: () => {
       if (!active) return;
+      release(remaining);
       active = false;
-      ledger.current = releaseBytes(ledger.current, bytes);
     },
   });
 };

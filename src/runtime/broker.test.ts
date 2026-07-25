@@ -9,17 +9,18 @@ import { systemClock } from "../shell/clock.ts";
 import { ContextStore } from "../shell/context-store.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
-import { JournalStore } from "../shell/journal-store.ts";
+import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import { ManualClock } from "../shell/clock.ts";
 import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
-import { dispatchCall, tokenReservation } from "./broker.ts";
-import type { GuestCallResult } from "./call-result.ts";
+import { dispatchCall, retainCallResult, tokenReservation } from "./broker.ts";
+import { type GuestCallResult, okResult } from "./call-result.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, RunState } from "./state.ts";
+import { retainedJsonBytes } from "./stored-bytes.ts";
 
 const within = async <T>(promise: Promise<T>, timeoutMs = 250): Promise<T> => {
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -468,6 +469,100 @@ describe("dispatchCall cancellation ownership", () => {
     expect(state.callCache.size).toBe(0);
     expect(state.ledger.current.usage.storedBytes).toBe(0);
     const events = await state.journal.readEvents();
-    expect(events.ok && events.value.some((event) => event.type === "call_committed")).toBe(false);
+    expect(events.ok && events.value.filter((event) => event.type === "call_committed")).toHaveLength(2);
+  });
+
+  test("cancellation while waiting for retention ownership leaves no cache reservation", async () => {
+    const state = await brokerState(new MockModelClient(() => "unused"), "run_retention_wait_abort");
+    const held = await state.contextSemaphore.acquire();
+    if (!held) throw new Error("expected held semaphore");
+    const abort = new AbortController();
+    const result = okResult("call_wait_abort", "value", ZERO_CALL_USAGE, false);
+    const pending = retainCallResult(state, result, {
+      type: "call_committed",
+      frameId: testFrame.frameId,
+      callId: result.callId,
+      kind: "llm",
+      key: "wait-abort",
+      cached: false,
+      ok: true,
+      usage: ZERO_CALL_USAGE,
+    }, abort.signal);
+
+    abort.abort();
+    await expect(within(pending)).rejects.toMatchObject({ name: "OperationAbortedError" });
+    held();
+    expect(state.callCache.size).toBe(0);
+    expect(state.ledger.current.usage.storedBytes).toBe(0);
+  });
+
+  test("cancellation during journal append cannot commit late cache bytes", async () => {
+    const base = await brokerState(new MockModelClient(() => "unused"), "run_retention_append_abort");
+    let started!: () => void;
+    let resolveAppend!: (outcome: Awaited<ReturnType<JournalStore["append"]>>) => void;
+    const appendStarted = new Promise<void>((resolve) => { started = resolve; });
+    const appendPending = new Promise<Awaited<ReturnType<JournalStore["append"]>>>((resolve) => { resolveAppend = resolve; });
+    const state: RunState = {
+      ...base,
+      journal: { append: () => { started(); return appendPending; } } as unknown as JournalStore,
+    };
+    const abort = new AbortController();
+    const result = okResult("call_append_abort", "value", ZERO_CALL_USAGE, false);
+    const pending = retainCallResult(state, result, {
+      type: "call_committed",
+      frameId: testFrame.frameId,
+      callId: result.callId,
+      kind: "llm",
+      key: "append-abort",
+      cached: false,
+      ok: true,
+      usage: ZERO_CALL_USAGE,
+    }, abort.signal);
+
+    await within(appendStarted);
+    abort.abort();
+    await expect(within(pending)).rejects.toMatchObject({ name: "OperationAbortedError" });
+    resolveAppend({ event: "committed", statusCache: { state: "refreshed" } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.callCache.size).toBe(0);
+    expect(state.ledger.current.usage.storedBytes).toBe(0);
+  });
+
+  test("durable status refresh failure retains one cache charge and propagates once", async () => {
+    const base = await brokerState(new MockModelClient(() => "unused"), "run_retention_durable_failure");
+    const injected = new JournalAppendError("status_cache", true, new Error("injected refresh failure"));
+    let appends = 0;
+    const state: RunState = {
+      ...base,
+      journal: {
+        append: async () => {
+          appends++;
+          return { event: "committed", statusCache: { state: "failed", error: injected } } as const;
+        },
+      } as unknown as JournalStore,
+    };
+    const result = okResult("call_durable_failure", "durable", ZERO_CALL_USAGE, false);
+    const event = {
+      type: "call_committed",
+      frameId: testFrame.frameId,
+      callId: result.callId,
+      kind: "llm",
+      key: "durable-failure",
+      cached: false,
+      ok: true,
+      usage: ZERO_CALL_USAGE,
+    } as const;
+
+    await expect(retainCallResult(state, result, event, new AbortController().signal)).rejects.toBe(injected);
+    const charged = retainedJsonBytes(result as never);
+    expect(state.callCache.get(result.callId)).toBe(result);
+    expect(state.ledger.current.usage.storedBytes).toBe(charged);
+    expect(appends).toBe(1);
+
+    const duplicate = await retainCallResult(state, result, event, new AbortController().signal);
+    expect(duplicate).toBe(result);
+    expect(state.ledger.current.usage.storedBytes).toBe(charged);
+    expect(appends).toBe(1);
   });
 });

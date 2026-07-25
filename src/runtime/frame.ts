@@ -21,6 +21,7 @@ import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
+import { JournalAppendError } from "../shell/journal-store.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
 import { bindKeys, dispatchCall, resolveContextRefs, retainCallResult } from "./broker.ts";
 import { persistAnswer } from "./answer-persistence.ts";
@@ -382,12 +383,13 @@ const runChild = async (
         cached: false,
         ok: callResult.ok,
         usage: ZERO_CALL_USAGE,
-      }, signal);
+      }, signal, deadlineMs);
       logicalReserved = false;
       return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled();
       logicalReserved = false;
+      if (error instanceof JournalAppendError) throw error;
       return errResult(callId, callError("FAILED", "child frame failed"), ZERO_CALL_USAGE, false);
     } finally {
       if (logicalReserved && signal.aborted) state.ledger.current = releaseLogicalCall(state.ledger.current);
