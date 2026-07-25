@@ -1,20 +1,22 @@
 /**
  * Durable event journal (imperative shell).
  *
- * `events.jsonl` is append-only and authoritative; each append is flushed with
- * fsync. Before appending, an unterminated tail is removed back to the last
- * verified newline and the repair is fsynced. `status.json` is a rebuildable
- * cache written atomically via a synced temp file, rename, and directory fsync.
+ * `events.jsonl` is append-only and authoritative. Logical batches are one
+ * canonical, checksummed JSONL record, so no prefix of a cell commit can be
+ * read as authoritative. Legacy single-event records remain readable.
  */
 
 import { createHash } from "node:crypto";
 import { open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
+import { type JsonValue, canonicalStringify, isJsonObject } from "../core/json.ts";
 import { reduceStatus, type RlmEvent, type RunStatus } from "../core/journal.ts";
 import { err, ok, type Result } from "../core/result.ts";
 
-const lineHash = (line: string): string => createHash("sha256").update(line).digest("hex").slice(0, 12);
+const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
+const lineHash = (line: string): string => sha256(line).slice(0, 12);
+const BATCH_RECORD_TYPE = "journal_batch";
 
 export interface JournalFileHandle {
   appendFile(data: string, encoding: BufferEncoding): Promise<void>;
@@ -37,16 +39,36 @@ const nodeFileSystem: JournalFileSystem = {
   rename,
 };
 
+interface JournalBatchRecord {
+  readonly type: typeof BATCH_RECORD_TYPE;
+  readonly batchId: string;
+  readonly checksum: string;
+  readonly events: readonly RlmEvent[];
+}
+
+const makeBatchRecord = (events: readonly RlmEvent[]): JournalBatchRecord => {
+  const checksum = sha256(canonicalStringify(events as unknown as JsonValue));
+  return { type: BATCH_RECORD_TYPE, batchId: `batch_${checksum}`, checksum, events };
+};
+
+const recordLine = (record: RlmEvent | JournalBatchRecord): string =>
+  `${canonicalStringify(record as unknown as JsonValue)}\n`;
+
 interface JournalScan {
   readonly events: RlmEvent[];
   readonly verifiedBytes: number;
+  readonly batchIds: ReadonlySet<string>;
 }
+
+const corruptLine = (lineNumber: number, line: string): InterpreterError =>
+  interpreterError("JOURNAL_CORRUPT", `corrupt journal line ${lineNumber} (${lineHash(line)})`);
 
 const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => {
   const verifiedBytes = raw.length === 0 || raw[raw.length - 1] === 0x0a
     ? raw.length
     : raw.lastIndexOf(0x0a) + 1;
   const events: RlmEvent[] = [];
+  const batchIds = new Set<string>();
   let lineStart = 0;
   let lineNumber = 0;
 
@@ -54,17 +76,29 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
     if (raw[i] !== 0x0a) continue;
     const line = Buffer.from(raw.subarray(lineStart, i)).toString("utf8");
     if (line.length > 0) {
+      let parsed: unknown;
       try {
-        events.push(JSON.parse(line) as RlmEvent);
+        parsed = JSON.parse(line);
       } catch {
-        return err(interpreterError("JOURNAL_CORRUPT", `corrupt journal line ${lineNumber} (${lineHash(line)})`));
+        return err(corruptLine(lineNumber, line));
+      }
+      if (isJsonObject(parsed) && parsed["type"] === BATCH_RECORD_TYPE) {
+        const batchEvents = parsed["events"];
+        if (!Array.isArray(batchEvents)) return err(corruptLine(lineNumber, line));
+        const expected = makeBatchRecord(batchEvents as RlmEvent[]);
+        if (parsed["batchId"] !== expected.batchId || parsed["checksum"] !== expected.checksum)
+          return err(corruptLine(lineNumber, line));
+        if (!batchIds.has(expected.batchId)) events.push(...expected.events);
+        batchIds.add(expected.batchId);
+      } else {
+        events.push(parsed as RlmEvent);
       }
     }
     lineStart = i + 1;
     lineNumber++;
   }
 
-  return ok({ events, verifiedBytes });
+  return ok({ events, verifiedBytes, batchIds });
 };
 
 const isMissing = (error: unknown): boolean =>
@@ -83,7 +117,6 @@ const sameProgressIdentity = (
 
 export type JournalAppendPhase = "event" | "status_cache";
 
-/** Distinguishes authoritative event failures from rebuildable cache failures. */
 export class JournalAppendError extends Error {
   override readonly name = "JournalAppendError";
 
@@ -127,74 +160,125 @@ export class JournalStore {
     this.statusPath = join(dir, "status.json");
   }
 
-  /** Append one event through the same authoritative queue used by batches. */
-  async append(event: RlmEvent): Promise<JournalAppendOutcome> {
-    const outcome = await this.appendBatch([event]);
-    return { event: outcome.events[0] as JournalAppendDisposition, statusCache: outcome.statusCache };
+  append(event: RlmEvent): Promise<JournalAppendOutcome> {
+    return this.enqueue([event], false).then((outcome) => ({
+      event: outcome.events[0] as JournalAppendDisposition,
+      statusCache: outcome.statusCache,
+    }));
   }
 
-  /**
-   * Repair any torn tail, append a contiguous event batch durably, then refresh
-   * status. The queue slot is acquired synchronously when this method is called;
-   * that acquisition order defines global journal order.
-   */
+  /** Append one logical batch as exactly one canonical, checksummed JSONL record. */
   appendBatch(batch: readonly RlmEvent[]): Promise<JournalBatchAppendOutcome> {
     if (batch.length === 0) throw new RangeError("journal batch must contain at least one event");
+    return this.enqueue(batch, true);
+  }
+
+  private enqueue(batch: readonly RlmEvent[], batched: boolean): Promise<JournalBatchAppendOutcome> {
     const run = async (): Promise<JournalBatchAppendOutcome> => {
       let eventDurable = false;
-      const dispositions: JournalAppendDisposition[] = [];
       let finalEvents: RlmEvent[] = [];
       let refreshStatus = true;
+      let dispositions: JournalAppendDisposition[] = [];
       let handle: JournalFileHandle | undefined;
+      let failure: JournalAppendError | undefined;
+
       try {
         handle = await this.fileSystem.open(this.eventsPath, "a+");
-        const raw = await handle.readFile();
-        const scanned = scanJournal(raw);
+        let raw = await handle.readFile();
+        let scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
-        const existingEvents = scanned.value.events;
         if (scanned.value.verifiedBytes !== raw.length) {
           await handle.truncate(scanned.value.verifiedBytes);
           await handle.sync();
+          raw = raw.subarray(0, scanned.value.verifiedBytes);
+          scanned = scanJournal(raw);
+          if (!scanned.ok) throw scanned.error;
         }
+        const baseBytes = scanned.value.verifiedBytes;
+        const existingEvents = scanned.value.events;
+        finalEvents = existingEvents;
 
         let terminalSeen = existingEvents.some(isTerminal);
         const progressIdentities = existingEvents.filter(isProgress);
         const accepted: RlmEvent[] = [];
-        for (const event of batch) {
-          // The first run terminal remains authoritative within a batch too.
-          if (terminalSeen) {
-            dispositions.push("ignored_after_terminal");
-          } else if (isProgress(event) && progressIdentities.some((existing) =>
-            sameProgressIdentity(existing, event))) {
-            dispositions.push("deduplicated");
-          } else {
-            dispositions.push("committed");
-            accepted.push(event);
-            if (isProgress(event)) progressIdentities.push(event);
-            if (isTerminal(event)) terminalSeen = true;
+        const acceptedIndexes: number[] = [];
+        dispositions = batch.map(() => "ignored_after_terminal");
+        let exactReplay = false;
+
+        if (!terminalSeen && batched) {
+          const terminalIndex = batch.findIndex(isTerminal);
+          const candidate = terminalIndex < 0 ? batch : batch.slice(0, terminalIndex + 1);
+          const candidateId = makeBatchRecord(candidate).batchId;
+          if (scanned.value.batchIds.has(candidateId)) {
+            dispositions = batch.map((_event, index) =>
+              terminalIndex >= 0 && index > terminalIndex ? "ignored_after_terminal" : "deduplicated");
+            refreshStatus = false;
+            exactReplay = true;
           }
         }
 
-        finalEvents = [...existingEvents, ...accepted];
-        refreshStatus = accepted.length > 0 || batch.some(isTerminal);
-        if (accepted.length > 0) {
-          await handle.appendFile(accepted.map((event) => `${JSON.stringify(event)}\n`).join(""), "utf8");
-          await handle.sync();
-          eventDurable = true;
-        }
-      } catch (error) {
-        throw error instanceof JournalAppendError
-          ? error
-          : new JournalAppendError("event", eventDurable, error);
-      } finally {
-        if (handle) {
-          try {
-            await handle.close();
-          } catch (error) {
-            throw new JournalAppendError("event", eventDurable, error);
+        if (exactReplay) {
+          // Exact batch replay: no physical append and no cache-derived inference.
+        } else if (terminalSeen) {
+          refreshStatus = batch.some(isTerminal);
+        } else {
+          for (let index = 0; index < batch.length; index++) {
+            const event = batch[index] as RlmEvent;
+            if (terminalSeen) continue;
+            if (isProgress(event) && progressIdentities.some((existing) => sameProgressIdentity(existing, event))) {
+              dispositions[index] = "deduplicated";
+              continue;
+            }
+            dispositions[index] = "committed";
+            accepted.push(event);
+            acceptedIndexes.push(index);
+            if (isProgress(event)) progressIdentities.push(event);
+            if (isTerminal(event)) terminalSeen = true;
+          }
+
+          refreshStatus = accepted.length > 0 || batch.some(isTerminal);
+          if (accepted.length > 0) {
+            const record = batched ? makeBatchRecord(accepted) : accepted[0] as RlmEvent;
+            if (batched && scanned.value.batchIds.has((record as JournalBatchRecord).batchId)) {
+              for (const index of acceptedIndexes) dispositions[index] = "deduplicated";
+              refreshStatus = false;
+            } else {
+              const line = recordLine(record);
+              try {
+                await handle.appendFile(line, "utf8");
+              } catch (cause) {
+                eventDurable = await this.reconcileRejectedAppend(handle, baseBytes, line, batched
+                  ? (record as JournalBatchRecord).batchId
+                  : undefined);
+                throw new JournalAppendError("event", eventDurable, cause);
+              }
+              try {
+                await handle.sync();
+                eventDurable = true;
+              } catch (cause) {
+                eventDurable = await this.reconcileRejectedAppend(handle, baseBytes, line, batched
+                  ? (record as JournalBatchRecord).batchId
+                  : undefined);
+                throw new JournalAppendError("event", eventDurable, cause);
+              }
+              finalEvents = [...existingEvents, ...accepted];
+            }
           }
         }
+      } catch (cause) {
+        failure = cause instanceof JournalAppendError
+          ? cause
+          : new JournalAppendError("event", eventDurable, cause);
       }
+
+      if (handle) {
+        try {
+          await handle.close();
+        } catch (cause) {
+          failure ??= new JournalAppendError("event", eventDurable, cause);
+        }
+      }
+      if (failure) throw failure;
 
       if (!refreshStatus) return { events: dispositions, statusCache: { state: "skipped" } };
       try {
@@ -211,7 +295,28 @@ export class JournalStore {
     return queued;
   }
 
-  /** Cache refresh failures observed by append callers and retained for run diagnostics. */
+  private async reconcileRejectedAppend(
+    handle: JournalFileHandle,
+    baseBytes: number,
+    line: string,
+    expectedBatchId?: string,
+  ): Promise<boolean> {
+    const raw = await this.fileSystem.readFile(this.eventsPath);
+    const expected = Buffer.from(line, "utf8");
+    const suffix = raw.subarray(baseBytes);
+    const exactBytes = suffix.length === expected.length && suffix.equals(expected);
+    const scanned = exactBytes ? scanJournal(raw) : undefined;
+    const exactRecord = exactBytes && scanned?.ok === true && scanned.value.verifiedBytes === raw.length
+      && (expectedBatchId === undefined || scanned.value.batchIds.has(expectedBatchId));
+    if (exactRecord) {
+      await handle.sync();
+      return true;
+    }
+    await handle.truncate(baseBytes);
+    await handle.sync();
+    return false;
+  }
+
   statusCacheFailures(): readonly JournalAppendError[] {
     return this.cacheFailures;
   }
@@ -256,7 +361,6 @@ export class JournalStore {
     return events.ok ? ok(reduceStatus(events.value)) : events;
   }
 
-  /** Await all queued appends. */
   async drain(): Promise<void> {
     await this.queue;
   }

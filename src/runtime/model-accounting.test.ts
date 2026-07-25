@@ -45,12 +45,12 @@ const program = (withEvidenceInput = false): RlmProgram => {
   return normalized.value;
 };
 
-const events = async (dir: string): Promise<RlmEvent[]> =>
-  (await readFile(join(dir, "events.jsonl"), "utf8"))
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as RlmEvent);
+const events = async (dir: string): Promise<RlmEvent[]> => {
+  const { JournalStore } = await import("../shell/journal-store.ts");
+  const result = await new JournalStore(dir).readEvents();
+  if (!result.ok) throw result.error;
+  return result.value;
+};
 
 const usageResponse = (
   text: string,

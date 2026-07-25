@@ -31,12 +31,12 @@ beforeAll(async () => {
 });
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-e2e-"));
-const journalEvents = async (dir: string): Promise<RlmEvent[]> =>
-  (await readFile(join(dir, "events.jsonl"), "utf8"))
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as RlmEvent);
+const journalEvents = async (dir: string): Promise<RlmEvent[]> => {
+  const { JournalStore } = await import("../shell/journal-store.ts");
+  const result = await new JournalStore(dir).readEvents();
+  if (!result.ok) throw result.error;
+  return result.value;
+};
 
 const program = (overrides: Partial<RlmProgram> = {}): RlmProgram => {
   const base = normalizeProgram({

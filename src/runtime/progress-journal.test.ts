@@ -22,12 +22,18 @@ beforeAll(async () => {
 });
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-progress-"));
-const events = async (dir: string): Promise<RlmEvent[]> =>
+const events = async (dir: string): Promise<RlmEvent[]> => {
+  const result = await new JournalStore(dir).readEvents();
+  if (!result.ok) throw result.error;
+  return result.value;
+};
+
+const journalRecords = async (dir: string): Promise<Record<string, unknown>[]> =>
   (await readFile(join(dir, "events.jsonl"), "utf8"))
     .trim()
     .split("\n")
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as RlmEvent);
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 
 const program = () => {
   const normalized = normalizeProgram({
@@ -89,6 +95,31 @@ class RefreshFailureJournal extends JournalStore {
   }
 }
 
+const rejectCompleteCellBatchFileSystem = (dir: string): JournalFileSystem => {
+  const eventsPath = join(dir, "events.jsonl");
+  let rejected = false;
+  const wrap = (path: string, handle: JournalFileHandle): JournalFileHandle => ({
+    appendFile: async (data, encoding) => {
+      if (path === eventsPath && !rejected && data.includes('"type":"cell_committed"')) {
+        rejected = true;
+        await handle.appendFile(data, encoding);
+        throw new Error("injected rejection after complete batch line");
+      }
+      await handle.appendFile(data, encoding);
+    },
+    close: () => handle.close(),
+    readFile: () => handle.readFile(),
+    sync: () => handle.sync(),
+    truncate: (length) => handle.truncate(length),
+    writeFile: (data, encoding) => handle.writeFile(data, encoding),
+  });
+  return {
+    open: async (path, flags) => wrap(path, await open(path, flags)),
+    readFile: async (path) => readFile(path),
+    rename,
+  };
+};
+
 const delayedFirstCellBatchFileSystem = (dir: string): {
   readonly fileSystem: JournalFileSystem;
   readonly delayed: () => boolean;
@@ -131,6 +162,10 @@ describe("authoritative progress journal effects", () => {
     const ordered = (await events(dir)).filter((event) =>
       event.type === "phase" || event.type === "emit" || event.type === "cell_committed" || event.type === "answer_committed");
     expect(ordered.map((event) => event.type)).toEqual(["phase", "emit", "cell_committed", "answer_committed"]);
+    const batches = (await journalRecords(dir)).filter((record) => record["type"] === "journal_batch");
+    expect(batches).toHaveLength(1);
+    expect((batches[0]?.["events"] as RlmEvent[]).map((event) => event.type))
+      .toEqual(["phase", "emit", "cell_committed", "answer_committed"]);
     expect(ordered.slice(0, 2)).toMatchObject([
       { type: "phase", iteration: 1, ordinal: 0, name: "inspect" },
       { type: "emit", iteration: 1, ordinal: 1, message: "halfway" },
@@ -179,12 +214,33 @@ describe("authoritative progress journal effects", () => {
       expect(journalEvents.some((event) =>
         event.type === "phase" || event.type === "emit" || event.type === "cell_committed" ||
         event.type === "answer_committed")).toBe(false);
+      expect((await journalRecords(dir)).filter((record) => record["type"] === "journal_batch")).toHaveLength(0);
       expect(journalEvents.filter((event) =>
         event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled")).toHaveLength(1);
       expect(reduceStatus(journalEvents).state).toBe("failed");
       expect(Object.values(reduceStatus(journalEvents).frames).some((frame) => frame.phase !== undefined)).toBe(false);
     });
   }
+
+  test("keeps answer bytes when a complete checksummed batch line is written then rejected", async () => {
+    const dir = await tmp();
+    const journal = new JournalStore(dir, rejectCompleteCellBatchFileSystem(dir));
+    const result = await run(dir, new MockController([{
+      reasoning: "durable ambiguous write",
+      code: "phase('durable'); answer({ answer: 'kept' }); 'ok'",
+    }]), { journal });
+
+    expect(result).toMatchObject({ status: "failed", error: { code: "JOURNAL_FAILED" } });
+    expect(result.ledger.usage.storedBytes).toBeGreaterThan(0);
+    const journalEvents = await events(dir);
+    expect(journalEvents.filter((event) => event.type === "cell_committed")).toHaveLength(1);
+    expect(journalEvents.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+    const answer = journalEvents.find((event): event is Extract<RlmEvent, { type: "answer_committed" }> =>
+      event.type === "answer_committed");
+    expect(answer).toBeDefined();
+    expect(answer?.outputRef).toMatch(/^ctx_[a-f0-9]+$/);
+    expect((await journalRecords(dir)).filter((record) => record["type"] === "journal_batch")).toHaveLength(1);
+  });
 
   test("continues after a durable event with rebuildable cache refresh failure", async () => {
     const dir = await tmp();
@@ -195,6 +251,7 @@ describe("authoritative progress journal effects", () => {
     }]), { journal });
 
     expect(result.status).toBe("completed");
+    expect(result.ledger.usage.storedBytes).toBeGreaterThan(0);
     expect(result.warnings?.map((warning) => warning.code)).toContain("STATUS_CACHE_REFRESH_FAILED");
     expect((await events(dir)).filter((event) => event.type === "phase")).toHaveLength(1);
   });

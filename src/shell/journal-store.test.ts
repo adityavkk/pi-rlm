@@ -225,6 +225,97 @@ describe("JournalStore", () => {
       .toEqual(["run_started", "phase", "emit", "run_completed"]);
   });
 
+  test("makes every rejected batch-write prefix non-authoritative except the exact checksummed line", async () => {
+    const batch: RlmEvent[] = [
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "working" },
+      {
+        type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "done", codeHash: "hash",
+        hasResult: true, outputPreview: "done", outputRef: "ctx_answer",
+      },
+      { type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: "ctx_answer" },
+    ];
+    const completeDir = await mkdtemp(join(tmpdir(), "pi-rlm-journal-complete-"));
+    const completeStore = new JournalStore(completeDir);
+    await completeStore.append(started);
+    await completeStore.appendBatch(batch);
+    const completeRaw = await readFile(join(completeDir, "events.jsonl"), "utf8");
+    const completeLine = `${completeRaw.trimEnd().split("\n").at(-1)}\n`;
+    const completeRecord = JSON.parse(completeLine) as Record<string, unknown>;
+    expect(completeRecord["type"]).toBe("journal_batch");
+    expect(completeRecord["batchId"]).toMatch(/^batch_[a-f0-9]{64}$/);
+    expect(completeRecord["checksum"]).toMatch(/^[a-f0-9]{64}$/);
+
+    const replay = await completeStore.appendBatch(batch);
+    expect(replay.events).toEqual(["deduplicated", "deduplicated", "deduplicated"]);
+    expect(await readFile(join(completeDir, "events.jsonl"), "utf8")).toBe(completeRaw);
+
+    const lineBytes = Buffer.byteLength(completeLine, "utf8");
+    for (let prefixBytes = 0; prefixBytes <= lineBytes; prefixBytes++) {
+      const faultDir = await mkdtemp(join(tmpdir(), "pi-rlm-journal-prefix-"));
+      const eventsPath = join(faultDir, "events.jsonl");
+      await writeFile(eventsPath, `${JSON.stringify(started)}\n`);
+      let rejected = false;
+      const fileSystem: JournalFileSystem = {
+        ...nodeFileSystem,
+        open: async (path, flags) => {
+          const handle = await nodeFileSystem.open(path, flags);
+          if (path !== eventsPath) return handle;
+          return {
+            appendFile: async (data, encoding) => {
+              if (rejected || !data.includes('"type":"journal_batch"')) {
+                await handle.appendFile(data, encoding);
+                return;
+              }
+              rejected = true;
+              const prefix = Buffer.from(data, "utf8").subarray(0, prefixBytes).toString("utf8");
+              if (prefix.length > 0) await handle.appendFile(prefix, encoding);
+              throw new Error(`injected rejection after ${prefixBytes} bytes`);
+            },
+            close: () => handle.close(),
+            readFile: () => handle.readFile(),
+            sync: () => handle.sync(),
+            truncate: (length) => handle.truncate(length),
+            writeFile: (data, encoding) => handle.writeFile(data, encoding),
+          };
+        },
+      };
+      const store = new JournalStore(faultDir, fileSystem);
+      let failure: unknown;
+      try {
+        await store.appendBatch(batch);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(JournalAppendError);
+      expect((failure as JournalAppendError).eventDurable).toBe(prefixBytes === lineBytes);
+
+      const read = await store.readEvents();
+      expect(read.ok).toBe(true);
+      if (read.ok) {
+        const committed = read.value.filter((event) =>
+          event.type === "phase" || event.type === "cell_committed" || event.type === "answer_committed");
+        expect(committed).toHaveLength(prefixBytes === lineBytes ? 3 : 0);
+        expect(committed.filter((event) => "outputRef" in event)).toHaveLength(prefixBytes === lineBytes ? 2 : 0);
+      }
+      const records = (await readFile(eventsPath, "utf8")).trim().split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(records.filter((record) => record["type"] === "journal_batch"))
+        .toHaveLength(prefixBytes === lineBytes ? 1 : 0);
+    }
+  }, 30_000);
+
+  test("rejects a complete batch record whose checksum was changed", async () => {
+    const store = new JournalStore(dir);
+    await store.appendBatch([{ type: "emit", frameId: "f0", iteration: 1, ordinal: 0, message: "hello" }]);
+    const path = join(dir, "events.jsonl");
+    const record = JSON.parse((await readFile(path, "utf8")).trim()) as Record<string, unknown>;
+    record["checksum"] = "0".repeat(64);
+    await writeFile(path, `${JSON.stringify(record)}\n`);
+    const read = await store.readEvents();
+    expect(read.ok).toBe(false);
+    if (!read.ok) expect(read.error.code).toBe("JOURNAL_CORRUPT");
+  });
+
   test("syncs status content before rename and the containing directory after", async () => {
     const { fileSystem, operations } = instrumentedFileSystem(dir);
     await new JournalStore(dir, fileSystem).append(started);

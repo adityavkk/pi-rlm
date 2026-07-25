@@ -98,7 +98,8 @@ export const persistAnswer = async (
       if (outcome.events.some((event) => event === "ignored_after_terminal"))
         throw new Error("answer journal batch ignored after terminal");
       referenced = journalEvents.some((event, index) =>
-        "outputRef" in event && event.outputRef === descriptor.id && outcome.events[index] === "committed");
+        "outputRef" in event && event.outputRef === descriptor.id &&
+        (outcome.events[index] === "committed" || outcome.events[index] === "deduplicated"));
       if (!referenced) throw new Error("answer journal batch did not commit its artifact reference");
     } catch (error) {
       if (error instanceof JournalAppendError && error.eventDurable)
