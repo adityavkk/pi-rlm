@@ -96,10 +96,12 @@ pi-rlm is built as a functional core with an imperative shell.
 - The **extension** (`index.ts`) is the thin Pi boundary.
 
 The controller loop is deliberately strict. Each iteration reserves one
-controller turn, asks the driver for exactly one cell, transforms it (a trailing
+controller turn separately from provider attempts, asks the driver for exactly one cell, transforms it (a trailing
 expression becomes an implicit return so the model sees a REPL-style value),
 runs it in a fresh QuickJS context, records an immutable trajectory entry, and
-appends an authoritative journal event. Lexical variables do not leak between
+appends an authoritative journal event. Every controller, leaf, repair, child,
+and fallback completion crosses one atomic accounting boundary; see the model
+invocation accounting matrix in `docs/ARCHITECTURE.md`. Lexical variables do not leak between
 cells; durable state goes in the `workspace` object, which is validated as JSON
 or content-addressed handles so a run can be replayed.
 

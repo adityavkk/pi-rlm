@@ -128,3 +128,43 @@ run-manifest hashes, and control metadata are excluded: this journal is the
 authoritative control plane and must remain writable to record exhaustion and
 terminal state. The v1 checkpoint bridge stores no snapshots. Provider-token
 accounting remains separate from stored bytes.
+
+## Model invocation accounting
+
+`src/runtime/provider.ts` is the only production location that calls
+`ModelClient.complete`. It validates the complete request, estimates all system,
+prompt, context, and enforced-output tokens, then atomically reserves the
+logical operation (on its first attempt), attempt, tokens, and concurrency slot
+before entering the provider. Every exit settles finite reported tokens, cost,
+and duration; `finally` releases token and concurrency reservations. Reported
+token overshoot remains charged and blocks later reservations.
+
+| Path | Logical operations | Attempts | Usage ownership |
+| --- | ---: | ---: | --- |
+| Controller turn, valid primary | 1 | 1 | controller trajectory, `provider_attempted`, tree ledger |
+| Controller malformed primary + repair | 1 | 2 | combined on the same turn operation |
+| Leaf `llm`, valid primary | 1 | 1 | `CallResult`, `call_committed`, tree ledger |
+| Leaf structured repair | 1 | 2 | combined on the same leaf operation |
+| Provider fallback extractor | 1 | provider completions | extractor provider events and tree ledger |
+| External custom extractor | 1 | 1 explicit opaque operation | zero reported tokens/cost, measured host duration |
+| `recurse` | 1 frame operation | 0 itself | subtree provider usage copied into its result, never re-settled |
+| Child-frame controller/leaf | their own operations | each provider completion | tree ledger once; propagated to ancestor recurse scopes |
+| Cache/coalesced waiter | 0 additional | 0 additional | cached committed result |
+
+Controller turns and provider attempts are independent limits. A controller
+turn is not entered when no attempt remains. `maxAttempts: 0` therefore invokes
+neither the controller nor a provider. A repair reserves its second attempt
+before spend.
+
+Extractor implementations declare `accountingMode`. `provider` extractors must
+use the supplied completion capability and fail if they return without doing
+so. `external` extractors never receive a raw model client; because arbitrary
+external code cannot report internal provider accounting, the runtime charges
+one explicit logical operation and attempt. This is an opaque-operation
+contract, not a claim about hidden transport token usage.
+
+Pi 0.80.10's public `ModelRuntime.completeSimple` options support `maxRetries`.
+`PiModelClient` sets it to `0`, verified with an adapter fake, so one boundary
+attempt maps to one Pi transport request. Provider-side processing or replay
+below the SDK boundary remains unobservable; the ledger reports only usage Pi
+returns and never invents transport attempts.

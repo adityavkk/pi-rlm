@@ -229,3 +229,28 @@ describe("PiModelClient stop reasons", () => {
     });
   }
 });
+
+describe("PiModelClient retry policy", () => {
+  test("sets the pinned public maxRetries option to zero", async () => {
+    let observedOptions: unknown;
+    const runtime = {
+      getModel: () => ({ provider: "test-provider", id: "test-model" }),
+      completeSimple: async (_model: unknown, _context: unknown, options: unknown) => {
+        observedOptions = options;
+        return {
+          role: "assistant",
+          api: "test-api",
+          provider: "test-provider",
+          model: "test-model",
+          timestamp: 1,
+          usage: REPORTED_USAGE,
+          stopReason: "stop",
+          content: [{ type: "text", text: "ok" }],
+        };
+      },
+    } as unknown as ModelRuntime;
+
+    await new PiModelClient(runtime, "test-provider/test-model").complete({ prompt: "test" });
+    expect(observedOptions).toMatchObject({ maxRetries: 0 });
+  });
+});
