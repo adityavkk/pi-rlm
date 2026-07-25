@@ -386,7 +386,7 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject, signal: A
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled(usage);
       logicalReserved = false;
-      return errResult(callId, callError("FAILED", (error as Error).message), usage, false);
+      return errResult(callId, callError("FAILED", "model completion failed"), usage, false);
     } finally {
       if (pendingTokenReservation > 0) {
         state.ledger.current = settle(state, pendingTokenReservation, 0);

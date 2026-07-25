@@ -61,6 +61,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.completionMode).toBe("answer");
@@ -90,6 +91,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "child-result" });
@@ -133,6 +135,7 @@ describe("runProgram e2e", () => {
       model: new MockModelClient(() => "unused"),
       backend,
       dir,
+      signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, cellWallMs: 50 },
     });
 
@@ -171,6 +174,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.answer).toEqual({ answer: "same" });
     expect(model.callCount).toBe(1);
@@ -193,6 +197,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 2 },
       extractor,
     });
@@ -211,6 +216,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 1 },
     });
     expect(result.status).toBe("failed");
@@ -236,6 +242,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxLogicalCalls: 1 },
     });
     expect(result.status).toBe("completed");
@@ -256,6 +263,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "fixed" });
@@ -274,6 +282,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ toString: "fixed" });
@@ -298,6 +307,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir: await tmp(),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "INVALID_SPEC,INVALID_SPEC" });
@@ -327,6 +337,7 @@ describe("runProgram e2e", () => {
       model,
       backend,
       dir,
+      signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, storedByteLimit: 164 },
     });
     expect(result.status).toBe("completed");

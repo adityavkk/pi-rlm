@@ -21,12 +21,12 @@ export type ExtractorResult =
   | { readonly ok: false; readonly code: "FALLBACK_EVIDENCE_TRUNCATED" | "FAILED"; readonly message: string };
 
 export interface Extractor {
-  extract(evidence: ExtractorEvidence): Promise<ExtractorResult>;
+  extract(evidence: ExtractorEvidence, signal: AbortSignal): Promise<ExtractorResult>;
 }
 
 export class FunctionExtractor implements Extractor {
-  constructor(private readonly fn: (evidence: ExtractorEvidence) => Promise<ExtractorResult> | ExtractorResult) {}
-  async extract(evidence: ExtractorEvidence): Promise<ExtractorResult> {
-    return this.fn(evidence);
+  constructor(private readonly fn: (evidence: ExtractorEvidence, signal: AbortSignal) => Promise<ExtractorResult> | ExtractorResult) {}
+  async extract(evidence: ExtractorEvidence, signal: AbortSignal): Promise<ExtractorResult> {
+    return this.fn(evidence, signal);
   }
 }

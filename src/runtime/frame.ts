@@ -10,7 +10,7 @@
  */
 
 import { budgetView, openFrame, reserveControllerTurn } from "../core/budget.ts";
-import { type CallError, callError, type InterpreterError } from "../core/errors.ts";
+import { type CallError, callError, type InterpreterError, interpreterError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import { isJsonObject, type JsonValue } from "../core/json.ts";
 import { headTailPreview } from "../core/preview.ts";
@@ -20,6 +20,7 @@ import { validateWorkspace } from "../core/workspace.ts";
 import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
+import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
 import { contextControl, dispatchCall, withContextMutation } from "./broker.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
@@ -32,6 +33,7 @@ export interface FrameResult {
   readonly exhausted: boolean;
   readonly terminal?: InterpreterError;
   readonly cancelled?: true;
+  readonly deadline?: true;
   readonly workspace?: JsonValue;
   readonly entries?: readonly TrajectoryEntry[];
 }
@@ -67,7 +69,7 @@ export const runFrame = async (
   state: RunState,
   frame: FrameRef,
   controller: ControllerDriver,
-  signal?: AbortSignal,
+  signal: AbortSignal,
   ownerDeadlineMs = Number.POSITIVE_INFINITY,
 ): Promise<FrameResult> => {
   let workspace: JsonValue = {};
@@ -83,7 +85,10 @@ export const runFrame = async (
   for (let iteration = 1; ; iteration++) {
     if (signal?.aborted) return cancelled();
     const turn = reserveControllerTurn(state.ledger.current, state.clock.now());
-    if (!turn.ok) return { exhausted: true, workspace, entries };
+    if (!turn.ok)
+      return turn.error.code === "DEADLINE"
+        ? { exhausted: false, deadline: true, workspace, entries }
+        : { exhausted: true, workspace, entries };
     state.ledger.current = turn.value;
 
     const projection = projectTrajectory(entries, state.profile.trajectory);
@@ -140,9 +145,9 @@ export const runFrame = async (
         answered = true;
         candidate = args["value"] as JsonValue;
       } else if (name === "phase" && isJsonObject(args)) {
-        void state.journal.append({ type: "phase", frameId: frame.frameId, ordinal: phaseOrdinal++, name: String(args["name"]) });
+        void state.journal.append({ type: "phase", frameId: frame.frameId, ordinal: phaseOrdinal++, name: String(args["name"]) }).catch(() => {});
       } else if (name === "emit" && isJsonObject(args)) {
-        void state.journal.append({ type: "emit", frameId: frame.frameId, ordinal: emitOrdinal++, message: String(args["message"] ?? "") });
+        void state.journal.append({ type: "emit", frameId: frame.frameId, ordinal: emitOrdinal++, message: String(args["message"] ?? "") }).catch(() => {});
       }
     };
 
@@ -151,22 +156,28 @@ export const runFrame = async (
       state.ledger.current.limits.deadlineMs,
       ownerDeadlineMs,
     );
-    const outcome = await state.backend.evalCell({
-      source: transformed.value.source,
-      deadlineMs: cellDeadline,
-      memoryBytes: state.profile.memoryBytes,
-      globals: {
-        objective: frame.objective,
-        inputs: frame.inputs as unknown as JsonValue,
-        variables: frame.inputs as unknown as JsonValue,
-        budget: budgetView(state.ledger.current, frame.depth) as unknown as JsonValue,
-        workspace,
-      },
-      ...(signal ? { signal } : {}),
-      dispatch: (n, a, cellSignal, deadlineMs) => dispatchCall(state, frame, n, a, recurseFn, cellSignal, deadlineMs),
-      effect,
-    });
-    if (signal?.aborted) return cancelled();
+    let outcome: CellEvalOutcome;
+    try {
+      outcome = await waitForAbort(state.backend.evalCell({
+        source: transformed.value.source,
+        deadlineMs: cellDeadline,
+        memoryBytes: state.profile.memoryBytes,
+        globals: {
+          objective: frame.objective,
+          inputs: frame.inputs as unknown as JsonValue,
+          variables: frame.inputs as unknown as JsonValue,
+          budget: budgetView(state.ledger.current, frame.depth) as unknown as JsonValue,
+          workspace,
+        },
+        signal,
+        dispatch: (n, a, cellSignal, deadlineMs) => dispatchCall(state, frame, n, a, recurseFn, cellSignal, deadlineMs),
+        effect,
+      }), signal);
+    } catch (error) {
+      if (wasAborted(error, signal)) return cancelled();
+      return { exhausted: false, terminal: interpreterError("WORKER_EXIT", "interpreter backend failed") };
+    }
+    if (signal.aborted) return cancelled();
 
     if (outcome.kind === "terminal") {
       await state.journal.append({

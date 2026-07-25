@@ -28,6 +28,6 @@ export interface Cell {
 }
 
 export interface ControllerDriver {
-  next(state: FrameState, signal?: AbortSignal): Promise<Cell>;
+  next(state: FrameState, signal: AbortSignal): Promise<Cell>;
   fork(childObjective: string, childFrameId: string): ControllerDriver;
 }

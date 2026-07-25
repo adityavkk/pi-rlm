@@ -1,12 +1,8 @@
-/**
- * Run orchestrator (imperative shell): wires state, snapshots inputs, opens the
- * root frame, runs the controller loop, and applies fallback extraction on
- * turn exhaustion. The event journal is authoritative and flushed before the
- * result returns.
- */
+/** Top-level run orchestration and exactly-once durable finalization. */
 
 import { createLedger, type Ledger, releaseBytes, reserveBytes } from "../core/budget.ts";
 import { identityHash } from "../core/ids.ts";
+import type { FrameState, RlmEvent } from "../core/journal.ts";
 import type { JsonValue } from "../core/json.ts";
 import { programIdentity, type RlmProgram } from "../core/program.ts";
 import { projectTrajectory } from "../core/trajectory.ts";
@@ -21,8 +17,9 @@ import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
-import type { ControllerDriver } from "./controller.ts";
+import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { contextControl, withContextMutation } from "./broker.ts";
+import type { ControllerDriver } from "./controller.ts";
 import type { Extractor } from "./extractor.ts";
 import { runFrame } from "./frame.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
@@ -38,19 +35,168 @@ export interface RunInput {
   readonly model: ModelClient;
   readonly backend: InterpreterBackend;
   readonly dir: string;
+  /** Required owner cancellation for this run only. */
+  readonly signal: AbortSignal;
   readonly clock?: Clock;
   readonly profile?: Profile;
   readonly extractor?: Extractor;
 }
 
+export interface RunError {
+  readonly code: string;
+  readonly message: string;
+  /** Non-secret classification of the original exception. */
+  readonly cause?: { readonly name: string; readonly code?: string };
+}
+
 export interface RunResult {
   readonly runId: string;
-  readonly status: "completed" | "failed";
+  readonly status: "completed" | "failed" | "cancelled";
   readonly completionMode?: "answer" | "fallback_extract";
   readonly answer?: JsonValue;
-  readonly error?: { readonly code: string; readonly message: string };
+  readonly error?: RunError;
   readonly ledger: Ledger;
 }
+
+type Phase = "journal" | "source" | "controller" | "extractor" | "context";
+type PlannedResult = Omit<RunResult, "ledger">;
+
+const safeCause = (error: unknown): RunError["cause"] => {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as { name?: unknown; code?: unknown };
+  const name = typeof candidate.name === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(candidate.name)
+    ? candidate.name
+    : "Error";
+  const code = typeof candidate.code === "string" && /^[A-Z0-9_-]{1,64}$/.test(candidate.code)
+    ? candidate.code
+    : undefined;
+  return { name, ...(code ? { code } : {}) };
+};
+
+const failure = (runId: string, code: string, message: string, cause?: unknown): PlannedResult => ({
+  runId,
+  status: "failed",
+  error: {
+    code,
+    message,
+    ...(() => { const classified = safeCause(cause); return classified ? { cause: classified } : {}; })(),
+  },
+});
+
+const cancellation = (runId: string): PlannedResult => ({
+  runId,
+  status: "cancelled",
+  error: { code: "CANCELLED", message: "run cancelled by owner" },
+});
+
+const exceptionResult = (
+  runId: string,
+  phase: Phase,
+  error: unknown,
+  scope: AbortScope,
+): PlannedResult => {
+  if (wasAborted(error, scope.signal)) {
+    return scope.timedOut
+      ? failure(runId, "BUDGET_DEADLINE", "run deadline reached")
+      : cancellation(runId);
+  }
+  const code = phase === "journal"
+    ? "JOURNAL_FAILED"
+    : phase === "source"
+      ? "SOURCE_FAILED"
+      : phase === "extractor"
+        ? "EXTRACTOR_FAILED"
+        : phase === "context"
+          ? "CONTEXT_FAILED"
+          : "CONTROLLER_FAILED";
+  const message = phase === "journal"
+    ? "failed to persist run journal"
+    : phase === "source"
+      ? "failed to snapshot run inputs"
+      : phase === "extractor"
+        ? "fallback extraction failed"
+        : phase === "context"
+          ? "failed to commit run context"
+          : "controller execution failed";
+  return failure(runId, code, message, error);
+};
+
+const terminalEvent = (result: PlannedResult): RlmEvent => {
+  if (result.status === "completed") {
+    return {
+      type: "run_completed",
+      runId: result.runId,
+      completionMode: result.completionMode!,
+    };
+  }
+  if (result.status === "cancelled") {
+    return { type: "run_cancelled", runId: result.runId, code: "CANCELLED", message: "run cancelled by owner" };
+  }
+  return {
+    type: "run_failed",
+    runId: result.runId,
+    code: result.error?.code ?? "FAILED",
+    message: result.error?.message ?? "run failed",
+  };
+};
+
+const isTerminalEvent = (event: RlmEvent): boolean =>
+  event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
+
+/** Close every successfully opened frame, then append the sole run terminal. */
+const finalize = async (
+  journal: JournalStore,
+  rootFrameId: string,
+  initial: PlannedResult,
+  ledgerRef: { current: Ledger },
+): Promise<RunResult> => {
+  let planned = initial;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await journal.drain().catch(() => undefined);
+      const scanned = await journal.readEvents();
+      if (!scanned.ok) throw scanned.error;
+      if (scanned.value.some(isTerminalEvent)) return { ...planned, ledger: ledgerRef.current };
+
+      const openOrder: string[] = [];
+      const open = new Set<string>();
+      for (const event of scanned.value) {
+        if (event.type === "frame_opened" && !open.has(event.frameId)) {
+          open.add(event.frameId);
+          openOrder.push(event.frameId);
+        } else if (event.type === "frame_closed") {
+          open.delete(event.frameId);
+        }
+      }
+      for (const frameId of openOrder.reverse()) {
+        if (!open.has(frameId)) continue;
+        const state: FrameState = planned.status === "cancelled"
+          ? "cancelled"
+          : planned.status === "failed"
+            ? "failed"
+            : frameId === rootFrameId
+              ? "answered"
+              : "closed";
+        await journal.append({ type: "frame_closed", frameId, state });
+      }
+      const event = terminalEvent(planned);
+      if (event.type === "run_completed" && planned.completionMode === "fallback_extract") {
+        const events = await journal.readEvents();
+        if (events.ok) {
+          const answer = [...events.value].reverse().find((candidate) => candidate.type === "answer_committed");
+          if (answer?.type === "answer_committed")
+            await journal.append({ ...event, outputRef: answer.outputRef });
+          else await journal.append(event);
+        } else await journal.append(event);
+      } else await journal.append(event);
+      await journal.drain();
+      return { ...planned, ledger: ledgerRef.current };
+    } catch (error) {
+      planned = failure(initial.runId, "JOURNAL_FAILED", "failed to finalize run journal", error);
+    }
+  }
+  return { ...planned, ledger: ledgerRef.current };
+};
 
 export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const clock = input.clock ?? systemClock;
@@ -58,13 +204,22 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const startMs = clock.now();
   const limits = resolveLimits(profile, startMs);
   const ledgerRef = { current: createLedger(limits) };
-
   const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`).slice(0, 16)}`;
-
+  const rootFrameId = `${runId}:f0`;
+  const journal = new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
+  const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
+  let phase: Phase = "journal";
+  let planned: PlannedResult | undefined;
+
   const sourceControl = (): ContextOperationControl => ({
+    checkpoint: () => {
+      throwIfAborted(scope.signal);
+      if (clock.now() >= limits.deadlineMs) throw new Error("run deadline reached");
+    },
     maxOutputBytes: Math.max(0, ledgerRef.current.limits.storedByteLimit - ledgerRef.current.usage.storedBytes),
     reserveBytes: (bytes) => {
+      throwIfAborted(scope.signal);
       const reserved = reserveBytes(ledgerRef.current, bytes);
       if (!reserved.ok) throw new ContextBudgetError(reserved.error.message);
       ledgerRef.current = reserved.value;
@@ -78,98 +233,124 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       };
     },
   });
-  const inputs: Record<string, ContextDescriptor> = {};
-  for (const declared of input.program.inputs) {
-    const text = input.sources[declared.name] ?? "";
-    inputs[declared.name] = await store.ingestText(declared.name, text, "text/plain", sourceControl());
-  }
 
-  const journal = new JournalStore(input.dir);
-  const manifestHash = sha256(
-    JSON.stringify({
+  try {
+    const manifestHash = sha256(JSON.stringify({
       program: programIdentity(input.program),
       profile: profile.name,
       dsl: RLM_DSL_VERSION,
       backend: input.backend.id,
-    }),
-  );
-  await journal.append({ type: "run_started", runId, manifestHash, limits });
+    }));
+    await journal.append({ type: "run_started", runId, manifestHash, limits });
+    throwIfAborted(scope.signal);
 
-  const rootFrameId = `${runId}:f0`;
-  await journal.append({ type: "frame_opened", frameId: rootFrameId, parentFrameId: null, depth: 0, objective: input.program.objective });
-
-  const state: RunState = {
-    runId,
-    startMs,
-    profile,
-    clock,
-    hasher: sha256,
-    program: input.program,
-    ledger: ledgerRef,
-    store,
-    artifacts: new Map(),
-    model: input.model,
-    journal,
-    backend: input.backend,
-    callCache: new Map(),
-    inflight: new Map(),
-    semaphore: new Semaphore(profile.maxConcurrency),
-    contextSemaphore: new Semaphore(1),
-    frameSeq: { current: 1 },
-  };
-
-  const rootFrame: FrameRef = {
-    frameId: rootFrameId,
-    depth: 0,
-    objective: input.program.objective,
-    inputs,
-    outputs: input.program.outputs,
-  };
-
-  const result = await runFrame(state, rootFrame, input.controller);
-
-  const finish = async (r: RunResult): Promise<RunResult> => {
-    await journal.drain();
-    return r;
-  };
-
-  if (result.terminal) {
-    await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "failed" });
-    await journal.append({ type: "run_failed", runId, code: result.terminal.code, message: result.terminal.message });
-    return finish({ runId, status: "failed", error: { code: result.terminal.code, message: result.terminal.message }, ledger: ledgerRef.current });
-  }
-
-  if (result.answer !== undefined) {
-    await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "answered" });
-    await journal.append({ type: "run_completed", runId, completionMode: "answer" });
-    return finish({ runId, status: "completed", completionMode: "answer", answer: result.answer, ledger: ledgerRef.current });
-  }
-
-  // Turn exhaustion: optional fallback extraction over bounded evidence.
-  if (input.extractor) {
-    const evidence = {
-      outputContract: input.program.outputs,
-      workspace: result.workspace ?? {},
-      trajectory: projectTrajectory(result.entries ?? [], profile.trajectory),
-    };
-    const extracted = await input.extractor.extract(evidence);
-    if (extracted.ok) {
-      const ref = await withContextMutation(state, () =>
-        store.derive(
-          { key: `fallback:${rootFrameId}`, value: extracted.value },
-          contextControl(state, state.ledger.current.limits.deadlineMs, undefined, true),
-        ));
-      await journal.append({ type: "answer_committed", frameId: rootFrameId, completionMode: "fallback_extract", outputRef: ref.id });
-      await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "answered" });
-      await journal.append({ type: "run_completed", runId, completionMode: "fallback_extract", outputRef: ref.id });
-      return finish({ runId, status: "completed", completionMode: "fallback_extract", answer: extracted.value, ledger: ledgerRef.current });
+    phase = "source";
+    const inputs: Record<string, ContextDescriptor> = {};
+    for (const declared of input.program.inputs) {
+      throwIfAborted(scope.signal);
+      const text = input.sources[declared.name] ?? "";
+      inputs[declared.name] = await waitForAbort(
+        store.ingestText(declared.name, text, "text/plain", sourceControl()),
+        scope.signal,
+      );
     }
-    await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "failed" });
-    await journal.append({ type: "run_failed", runId, code: extracted.code, message: extracted.message });
-    return finish({ runId, status: "failed", error: { code: extracted.code, message: extracted.message }, ledger: ledgerRef.current });
+    throwIfAborted(scope.signal);
+
+    phase = "journal";
+    await journal.append({
+      type: "frame_opened",
+      frameId: rootFrameId,
+      parentFrameId: null,
+      depth: 0,
+      objective: input.program.objective,
+    });
+    throwIfAborted(scope.signal);
+
+    const state: RunState = {
+      runId,
+      startMs,
+      profile,
+      clock,
+      hasher: sha256,
+      program: input.program,
+      ledger: ledgerRef,
+      store,
+      artifacts: new Map(),
+      model: input.model,
+      journal,
+      backend: input.backend,
+      callCache: new Map(),
+      inflight: new Map(),
+      semaphore: new Semaphore(profile.maxConcurrency),
+      contextSemaphore: new Semaphore(1),
+      frameSeq: { current: 1 },
+    };
+    const rootFrame: FrameRef = {
+      frameId: rootFrameId,
+      depth: 0,
+      objective: input.program.objective,
+      inputs,
+      outputs: input.program.outputs,
+    };
+
+    phase = "controller";
+    const result = await runFrame(state, rootFrame, input.controller, scope.signal, limits.deadlineMs);
+    throwIfAborted(scope.signal);
+    if (result.deadline) {
+      planned = failure(runId, "BUDGET_DEADLINE", "run deadline reached");
+    } else if (result.cancelled) {
+      planned = cancellation(runId);
+    } else if (result.terminal) {
+      planned = failure(runId, result.terminal.code, result.terminal.message);
+    } else if (result.answer !== undefined) {
+      planned = {
+        runId,
+        status: "completed",
+        completionMode: "answer",
+        answer: result.answer,
+      };
+    } else if (input.extractor) {
+      phase = "extractor";
+      const evidence = {
+        outputContract: input.program.outputs,
+        workspace: result.workspace ?? {},
+        trajectory: projectTrajectory(result.entries ?? [], profile.trajectory),
+      };
+      const extracted = await waitForAbort(input.extractor.extract(evidence, scope.signal), scope.signal);
+      throwIfAborted(scope.signal);
+      if (extracted.ok) {
+        phase = "context";
+        const ref = await withContextMutation(state, () =>
+          store.derive(
+            { key: `fallback:${rootFrameId}`, value: extracted.value },
+            contextControl(state, limits.deadlineMs, scope.signal, true),
+          ), scope.signal);
+        throwIfAborted(scope.signal);
+        phase = "journal";
+        await journal.append({
+          type: "answer_committed",
+          frameId: rootFrameId,
+          completionMode: "fallback_extract",
+          outputRef: ref.id,
+        });
+        throwIfAborted(scope.signal);
+        planned = {
+          runId,
+          status: "completed",
+          completionMode: "fallback_extract",
+          answer: extracted.value,
+        };
+      } else {
+        planned = failure(runId, extracted.code, extracted.message);
+      }
+    } else {
+      planned = failure(runId, "NO_ANSWER", "controller exhausted without answer");
+    }
+  } catch (error) {
+    planned = exceptionResult(runId, phase, error, scope);
+  } finally {
+    scope.dispose();
   }
 
-  await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "failed" });
-  await journal.append({ type: "run_failed", runId, code: "NO_ANSWER", message: "controller exhausted its turns without a valid answer" });
-  return finish({ runId, status: "failed", error: { code: "NO_ANSWER", message: "controller exhausted without answer" }, ledger: ledgerRef.current });
+  return finalize(journal, rootFrameId, planned ?? failure(runId, "FAILED", "run failed"), ledgerRef);
 };

@@ -36,6 +36,7 @@ const harness = (options: { ttl?: number } = {}) => {
   const confirmations: Array<{ title: string; message: string }> = [];
   const runs: unknown[] = [];
   const initializationAuditCounts: number[] = [];
+  const runSignals: AbortSignal[] = [];
   let sessionId = "session-1";
   let clock = 100;
   let nextId = 0;
@@ -70,8 +71,9 @@ const harness = (options: { ttl?: number } = {}) => {
   };
 
   createRlmExtension({
-    executeRun: async (request) => {
+    executeRun: async (request, signal) => {
       initializationAuditCounts.push(audits.length);
+      runSignals.push(signal);
       runs.push(request);
       return failedRun;
     },
@@ -96,6 +98,7 @@ const harness = (options: { ttl?: number } = {}) => {
     confirmations,
     runs,
     initializationAuditCounts,
+    runSignals,
     ctx,
     emit,
     startTurn,
@@ -386,6 +389,39 @@ describe("pi-rlm extension wiring", () => {
     const result = await rlmTool(h).execute("call-ambient", { objective: "Review" }, undefined, undefined, h.ctx);
     expect(result.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
     expect(h.runs).toHaveLength(0);
+  });
+
+  test("tool cancellation during confirmation mints no grant and starts no runtime", async () => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    let resolveConfirmation!: (approved: boolean) => void;
+    h.setConfirm(() => new Promise<boolean>((resolve) => { resolveConfirmation = resolve; }));
+    const owner = new AbortController();
+    const pending = rlmTool(h).execute("call-cancel-confirm", { objective: "Review" }, owner.signal, undefined, h.ctx);
+    await Promise.resolve();
+    owner.abort();
+    const result = await pending;
+    resolveConfirmation(true);
+    await Promise.resolve();
+
+    expect(result.content[0]?.text).toContain("RLM_CANCELLED");
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+  });
+
+  test("tool execute signal owns the authorized run and consumed calls cannot replay", async () => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    const owner = new AbortController();
+    const tool = rlmTool(h);
+    const first = await tool.execute("call-owned", { objective: "Review" }, owner.signal, undefined, h.ctx);
+    owner.abort();
+    const replay = await tool.execute("call-owned", { objective: "Review" }, new AbortController().signal, undefined, h.ctx);
+
+    expect(first.details?.status).toBe("failed");
+    expect(h.runSignals).toEqual([owner.signal]);
+    expect(replay.content[0]?.text).toContain("RLM_GRANT_REPLAY");
+    expect(h.runs).toHaveLength(1);
   });
 
   test("runtime initialization is not called when no consumable turn grant exists", async () => {
