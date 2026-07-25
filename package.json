@@ -39,6 +39,7 @@
     "test": "bun test",
     "test:core": "bun test src/core",
     "test:runtime": "bun test src/runtime",
+    "smoke:packed": "bash scripts/smoke-packed-install.sh",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
@@ -47,16 +48,16 @@
     ]
   },
   "dependencies": {
-    "@jitl/quickjs-singlefile-mjs-release-asyncify": "0.32.0",
     "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
     "acorn": "^8.14.0",
-    "quickjs-emscripten": "^0.32.0"
+    "quickjs-emscripten-core": "0.32.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
-    "@earendil-works/pi-tui": "0.80.10"
+    "@earendil-works/pi-tui": "0.80.10",
+    "typebox": "1.1.38"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-agent-core": {
@@ -78,6 +79,7 @@
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
-    "@earendil-works/pi-tui": "0.80.10"
+    "@earendil-works/pi-tui": "0.80.10",
+    "typebox": "1.1.38"
   }
 }
