@@ -40,7 +40,7 @@ export class ModelController implements ControllerDriver {
     private readonly options: ModelControllerOptions = {},
   ) {}
 
-  async next(state: FrameState, signal?: AbortSignal): Promise<Cell> {
+  async next(state: FrameState, signal: AbortSignal): Promise<Cell> {
     throwIfAborted(signal);
     const user = buildTurnMessage(state);
     const request = {

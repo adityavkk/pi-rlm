@@ -9,4 +9,4 @@ export * from "./extractor.ts";
 export * from "./semaphore.ts";
 export type { FrameResult } from "./frame.ts";
 export type { RunState, FrameRef, ArtifactDescriptor } from "./state.ts";
-export { runProgram, RLM_DSL_VERSION, type RunInput, type RunResult } from "./run.ts";
+export { runProgram, RLM_DSL_VERSION, type RunInput, type RunResult, type RunWarning } from "./run.ts";

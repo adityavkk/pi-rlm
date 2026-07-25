@@ -38,6 +38,7 @@ describe("ModelController drives a real controller loop offline", () => {
       model: new MockModelClient(() => "unused"),
       backend,
       dir: await mkdtemp(join(tmpdir(), "pi-rlm-mc-")),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "ABC" });
@@ -54,6 +55,7 @@ describe("ModelController drives a real controller loop offline", () => {
       model: new MockModelClient(() => "unused"),
       backend,
       dir: await mkdtemp(join(tmpdir(), "pi-rlm-mc-")),
+      signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "ok" });

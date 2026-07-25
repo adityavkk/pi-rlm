@@ -1,7 +1,14 @@
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import type { RunResult } from "./src/runtime/index.ts";
+import type { RlmEvent } from "./src/core/journal.ts";
+import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controller.ts";
+import { DEFAULT_PROFILE, type RunResult } from "./src/runtime/index.ts";
+import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
-import register, { createRlmExtension, LAUNCH_SNIPPET } from "./index.ts";
+import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
+import register, { createRlmExtension, LAUNCH_SNIPPET, type RlmRuntimeDependencies } from "./index.ts";
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -27,7 +34,7 @@ const failedRun = {
   error: { code: "TEST_FAILURE", message: "test run finished" },
 } as unknown as RunResult;
 
-const harness = (options: { ttl?: number } = {}) => {
+const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
   const events = new Map<string, EventHandler[]>();
@@ -36,6 +43,7 @@ const harness = (options: { ttl?: number } = {}) => {
   const confirmations: Array<{ title: string; message: string }> = [];
   const runs: unknown[] = [];
   const initializationAuditCounts: number[] = [];
+  const runSignals: AbortSignal[] = [];
   let sessionId = "session-1";
   let clock = 100;
   let nextId = 0;
@@ -70,11 +78,16 @@ const harness = (options: { ttl?: number } = {}) => {
   };
 
   createRlmExtension({
-    executeRun: async (request) => {
-      initializationAuditCounts.push(audits.length);
-      runs.push(request);
-      return failedRun;
-    },
+    ...(options.runtime
+      ? { runtime: options.runtime }
+      : {
+          executeRun: async (request, signal) => {
+            initializationAuditCounts.push(audits.length);
+            runSignals.push(signal);
+            runs.push(request);
+            return failedRun;
+          },
+        }),
     now: () => clock,
     createId: () => `host-${++nextId}`,
     grantTtlMs: options.ttl,
@@ -96,6 +109,7 @@ const harness = (options: { ttl?: number } = {}) => {
     confirmations,
     runs,
     initializationAuditCounts,
+    runSignals,
     ctx,
     emit,
     startTurn,
@@ -116,6 +130,61 @@ const harness = (options: { ttl?: number } = {}) => {
 };
 
 const rlmTool = (h: ReturnType<typeof harness>): CapturedTool => h.tools.find((tool) => tool.name === "rlm_run")!;
+
+const pendingOfflineRuntime = (dir: string): {
+  readonly dependencies: RlmRuntimeDependencies;
+  readonly started: Promise<void>;
+  readonly resolveLate: (cell: Cell) => void;
+} => {
+  let markStarted!: () => void;
+  let resolveLate!: (cell: Cell) => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const lateCell = new Promise<Cell>((resolve) => { resolveLate = resolve; });
+  const controller: ControllerDriver = {
+    async next(_state: FrameState): Promise<Cell> {
+      markStarted();
+      return lateCell;
+    },
+    fork() { return this; },
+  };
+  const backend: InterpreterBackend = {
+    id: "offline-extension-test",
+    async evalCell(_options: CellEvalOptions): Promise<CellEvalOutcome> {
+      throw new Error("late controller cell reached interpreter");
+    },
+    async dispose() {},
+  };
+  const model: ModelClient = {
+    id: "offline-extension-test",
+    async complete(): Promise<ModelResponse> {
+      throw new Error("offline extension test made a provider call");
+    },
+  };
+  return {
+    started,
+    resolveLate,
+    dependencies: {
+      resolveProfile: () => ({ ...DEFAULT_PROFILE, wallMs: 10_000 }),
+      createBackend: () => backend,
+      createModel: () => model,
+      createController: () => controller,
+      createRunDirectory: async () => dir,
+    },
+  };
+};
+
+const assertCancelledJournal = async (dir: string): Promise<string> => {
+  const raw = await readFile(join(dir, "events.jsonl"), "utf8");
+  const events = raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as RlmEvent);
+  expect(events.filter((event) =>
+    event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled")).toEqual([
+    expect.objectContaining({ type: "run_cancelled" }),
+  ]);
+  expect(events.filter((event) => event.type === "frame_closed")).toEqual([
+    expect.objectContaining({ type: "frame_closed", state: "cancelled" }),
+  ]);
+  return raw;
+};
 
 const oldAmbientBypass = process.env["PI_RLM_ALLOW_UNSOLICITED"];
 afterEach(() => {
@@ -386,6 +455,78 @@ describe("pi-rlm extension wiring", () => {
     const result = await rlmTool(h).execute("call-ambient", { objective: "Review" }, undefined, undefined, h.ctx);
     expect(result.content[0]?.text).toContain("RLM_OPT_IN_REQUIRED");
     expect(h.runs).toHaveLength(0);
+  });
+
+  test("tool cancellation during confirmation mints no grant and starts no runtime", async () => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    let resolveConfirmation!: (approved: boolean) => void;
+    h.setConfirm(() => new Promise<boolean>((resolve) => { resolveConfirmation = resolve; }));
+    const owner = new AbortController();
+    const pending = rlmTool(h).execute("call-cancel-confirm", { objective: "Review" }, owner.signal, undefined, h.ctx);
+    await Promise.resolve();
+    owner.abort();
+    const result = await pending;
+    resolveConfirmation(true);
+    await Promise.resolve();
+
+    expect(result.content[0]?.text).toContain("RLM_CANCELLED");
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+  });
+
+  test("tool execute signal owns the authorized run and consumed calls cannot replay", async () => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    const owner = new AbortController();
+    const tool = rlmTool(h);
+    const first = await tool.execute("call-owned", { objective: "Review" }, owner.signal, undefined, h.ctx);
+    owner.abort();
+    const replay = await tool.execute("call-owned", { objective: "Review" }, new AbortController().signal, undefined, h.ctx);
+
+    expect(first.details?.status).toBe("failed");
+    expect(h.runSignals).toEqual([owner.signal]);
+    expect(replay.content[0]?.text).toContain("RLM_GRANT_REPLAY");
+    expect(h.runs).toHaveLength(1);
+  });
+
+  test("tool signal cancels the production executeRun path with one closed terminal and no late commit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-tool-"));
+    const offline = pendingOfflineRuntime(dir);
+    const h = harness({ runtime: offline.dependencies });
+    await h.startTurn("Use pi-rlm for this offline run");
+    const owner = new AbortController();
+    const pending = rlmTool(h).execute("call-real-cancel", { objective: "Wait offline" }, owner.signal, undefined, h.ctx);
+    await offline.started;
+    owner.abort();
+    const result = await pending;
+
+    expect(result.details?.status).toBe("cancelled");
+    const terminalSnapshot = await assertCancelledJournal(dir);
+    offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(terminalSnapshot);
+  });
+
+  test.each([
+    ["session_before_switch", { reason: "resume", targetSessionFile: "/tmp/next.jsonl" }],
+    ["session_before_fork", { entryId: "entry-1", position: "at" }],
+    ["session_start", { reason: "new", previousSessionFile: "/tmp/previous.jsonl" }],
+    ["session_shutdown", {}],
+  ])("%s cancels a real pending /rlm run without late commits", async (eventName, event) => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-command-"));
+    const offline = pendingOfflineRuntime(dir);
+    const h = harness({ runtime: offline.dependencies });
+    const pending = h.commands.get("rlm")!.handler("Wait offline", h.ctx);
+    await offline.started;
+    await h.emit(eventName, event);
+    await pending;
+
+    expect(h.notifications.at(-1)).toContain("cancelled");
+    const terminalSnapshot = await assertCancelledJournal(dir);
+    offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(terminalSnapshot);
   });
 
   test("runtime initialization is not called when no consumable turn grant exists", async () => {

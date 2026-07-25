@@ -70,10 +70,37 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
 const isMissing = (error: unknown): boolean =>
   typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 
+const isTerminal = (event: RlmEvent): boolean =>
+  event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
+
+export type JournalAppendPhase = "event" | "status_cache";
+
+/** Distinguishes authoritative event failures from rebuildable cache failures. */
+export class JournalAppendError extends Error {
+  override readonly name = "JournalAppendError";
+
+  constructor(
+    readonly phase: JournalAppendPhase,
+    readonly eventDurable: boolean,
+    override readonly cause: unknown,
+  ) {
+    super(phase === "event" ? "failed to append journal event" : "failed to refresh journal status cache");
+  }
+}
+
+export interface JournalAppendOutcome {
+  readonly event: "committed" | "ignored_after_terminal";
+  readonly statusCache:
+    | { readonly state: "refreshed" }
+    | { readonly state: "skipped" }
+    | { readonly state: "failed"; readonly error: JournalAppendError };
+}
+
 export class JournalStore {
   private readonly eventsPath: string;
   private readonly statusPath: string;
-  private queue: Promise<void> = Promise.resolve();
+  private queue: Promise<unknown> = Promise.resolve();
+  private readonly cacheFailures: JournalAppendError[] = [];
 
   constructor(
     private readonly dir: string,
@@ -84,29 +111,68 @@ export class JournalStore {
   }
 
   /** Repair any torn tail, append one event durably, then refresh status. Serialized. */
-  append(event: RlmEvent): Promise<void> {
-    const run = async (): Promise<void> => {
+  append(event: RlmEvent): Promise<JournalAppendOutcome> {
+    const run = async (): Promise<JournalAppendOutcome> => {
       const line = `${JSON.stringify(event)}\n`;
-      const handle = await this.fileSystem.open(this.eventsPath, "a+");
-      let events: RlmEvent[];
+      let eventDurable = false;
+      let disposition: JournalAppendOutcome["event"] = "committed";
+      let finalEvents: RlmEvent[] = [];
+      let refreshStatus = true;
+      let handle: JournalFileHandle | undefined;
       try {
+        handle = await this.fileSystem.open(this.eventsPath, "a+");
         const raw = await handle.readFile();
         const scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
-        events = scanned.value.events;
+        const events = scanned.value.events;
         if (scanned.value.verifiedBytes !== raw.length) {
           await handle.truncate(scanned.value.verifiedBytes);
           await handle.sync();
         }
-        await handle.appendFile(line, "utf8");
-        await handle.sync();
+        // The first run terminal is authoritative. This also drops callbacks
+        // that were queued after finalization without creating late events.
+        if (events.some(isTerminal)) {
+          disposition = "ignored_after_terminal";
+          finalEvents = events;
+          refreshStatus = isTerminal(event);
+        } else {
+          await handle.appendFile(line, "utf8");
+          await handle.sync();
+          eventDurable = true;
+          finalEvents = [...events, event];
+        }
+      } catch (error) {
+        throw error instanceof JournalAppendError
+          ? error
+          : new JournalAppendError("event", eventDurable, error);
       } finally {
-        await handle.close();
+        if (handle) {
+          try {
+            await handle.close();
+          } catch (error) {
+            throw new JournalAppendError("event", eventDurable, error);
+          }
+        }
       }
-      await this.writeStatus(reduceStatus([...events, event]));
+
+      if (!refreshStatus) return { event: disposition, statusCache: { state: "skipped" } };
+      try {
+        await this.writeStatus(reduceStatus(finalEvents));
+        return { event: disposition, statusCache: { state: "refreshed" } };
+      } catch (cause) {
+        const error = new JournalAppendError("status_cache", eventDurable, cause);
+        this.cacheFailures.push(error);
+        return { event: disposition, statusCache: { state: "failed", error } };
+      }
     };
-    this.queue = this.queue.then(run, run);
-    return this.queue;
+    const queued = this.queue.then(run, run);
+    this.queue = queued;
+    return queued;
+  }
+
+  /** Cache refresh failures observed by append callers and retained for run diagnostics. */
+  statusCacheFailures(): readonly JournalAppendError[] {
+    return this.cacheFailures;
   }
 
   private async readEventsInternal(): Promise<Result<RlmEvent[], InterpreterError>> {

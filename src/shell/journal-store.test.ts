@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { BudgetLimits } from "../core/budget.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import {
+  JournalAppendError,
   JournalStore,
   type JournalFileHandle,
   type JournalFileSystem,
@@ -178,7 +179,9 @@ describe("JournalStore", () => {
     } catch (error) {
       failure = error;
     }
-    expect(failure).toEqual(expect.objectContaining({ code: "JOURNAL_CORRUPT" }));
+    expect(failure).toBeInstanceOf(JournalAppendError);
+    expect((failure as JournalAppendError).phase).toBe("event");
+    expect((failure as JournalAppendError).cause).toEqual(expect.objectContaining({ code: "JOURNAL_CORRUPT" }));
     expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(original);
   });
 
@@ -214,10 +217,22 @@ describe("JournalStore", () => {
     ]);
   });
 
+  for (const fault of ["events append", "events sync", "events close"] as const) {
+    test(`types ${fault} as an authoritative event-phase failure`, async () => {
+      const { fileSystem } = instrumentedFileSystem(dir, fault);
+      try {
+        await new JournalStore(dir, fileSystem).append(started);
+        throw new Error("expected append failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(JournalAppendError);
+        expect((error as JournalAppendError).phase).toBe("event");
+        expect((error as JournalAppendError).eventDurable).toBe(fault === "events close");
+        expect(String((error as JournalAppendError).cause)).toContain(`injected ${fault} failure`);
+      }
+    });
+  }
+
   for (const fault of [
-    "events append",
-    "events sync",
-    "events close",
     "status write",
     "status sync",
     "status close",
@@ -225,9 +240,21 @@ describe("JournalStore", () => {
     "directory sync",
     "directory close",
   ] as const) {
-    test(`propagates ${fault} failures`, async () => {
+    test(`reports ${fault} without contradicting the durable event`, async () => {
       const { fileSystem } = instrumentedFileSystem(dir, fault);
-      await expect(new JournalStore(dir, fileSystem).append(started)).rejects.toThrow(`injected ${fault} failure`);
+      const store = new JournalStore(dir, fileSystem);
+      const outcome = await store.append(started);
+      expect(outcome.event).toBe("committed");
+      expect(outcome.statusCache.state).toBe("failed");
+      if (outcome.statusCache.state === "failed") {
+        expect(outcome.statusCache.error.phase).toBe("status_cache");
+        expect(outcome.statusCache.error.eventDurable).toBe(true);
+        expect(String(outcome.statusCache.error.cause)).toContain(`injected ${fault} failure`);
+      }
+      expect(store.statusCacheFailures()).toHaveLength(1);
+      const rebuilt = await store.status();
+      expect(rebuilt.ok).toBe(true);
+      if (rebuilt.ok) expect(rebuilt.value.runId).toBe("r1");
     });
   }
 });
