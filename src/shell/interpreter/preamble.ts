@@ -32,6 +32,7 @@ export const buildPreamble = (globals: CellGlobals): string => {
   const ARRAY_IS_ARRAY = Array.isArray;
   const NUMBER_IS_FINITE = Number.isFinite;
   const NUMBER_FROM = Number;
+  const HAS_OWN = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
   const IS_ARRAY_INDEX = Function.prototype.call.bind(RegExp.prototype.test, /^(0|[1-9][0-9]*)$/);
   const GET_DESCRIPTORS = Object.getOwnPropertyDescriptors;
   const OWN_KEYS = Reflect.ownKeys;
@@ -70,7 +71,7 @@ export const buildPreamble = (globals: CellGlobals): string => {
       const keys = OWN_KEYS(descriptors);
       if (ARRAY_IS_ARRAY(value)) {
         const lengthDescriptor = descriptors.length;
-        if (!lengthDescriptor || !("value" in lengthDescriptor)) return invalidJson();
+        if (!lengthDescriptor || !HAS_OWN(lengthDescriptor, "value")) return invalidJson();
         const length = lengthDescriptor.value;
         const clone = [];
         OBJECT_SET_PROTOTYPE(clone, null);
@@ -78,11 +79,11 @@ export const buildPreamble = (globals: CellGlobals): string => {
           if (key === "length") continue;
           if (typeof key !== "string" || !IS_ARRAY_INDEX(key) || NUMBER_FROM(key) >= length) return invalidJson();
           const descriptor = descriptors[key];
-          if (!descriptor || !("value" in descriptor)) return invalidJson();
+          if (!descriptor || !HAS_OWN(descriptor, "value")) return invalidJson();
         }
         for (let index = 0; index < length; index++) {
           const descriptor = descriptors[String(index)];
-          if (!descriptor || !("value" in descriptor)) return invalidJson();
+          if (!descriptor || !HAS_OWN(descriptor, "value")) return invalidJson();
           clone[index] = cloneJson(descriptor.value);
         }
         return clone;
@@ -91,7 +92,7 @@ export const buildPreamble = (globals: CellGlobals): string => {
       for (const key of keys) {
         if (typeof key !== "string") return invalidJson();
         const descriptor = descriptors[key];
-        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalidJson();
+        if (!descriptor || !HAS_OWN(descriptor, "value") || !descriptor.enumerable) return invalidJson();
         OBJECT_DEFINE(clone, key, { value: cloneJson(descriptor.value), enumerable: true });
       }
       return clone;

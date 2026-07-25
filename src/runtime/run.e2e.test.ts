@@ -409,6 +409,56 @@ describe("runProgram e2e", () => {
     }
   });
 
+  test("prototype-poisoned accessor descriptors remain invalid without running getters", async () => {
+    const seen: FrameState[] = [];
+    const cells: Cell[] = [
+      {
+        reasoning: "poison descriptor inspection",
+        code: `
+          let getterCount = 0;
+          const value = {};
+          Object.defineProperty(value, "answer", {
+            enumerable: true,
+            get() { getterCount += 100; return "forged"; },
+          });
+          Object.defineProperty(Object.prototype, "value", {
+            configurable: true,
+            get() { getterCount += 1; return "forged"; },
+          });
+          Object.prototype.hasOwnProperty = () => true;
+          Function.prototype.call = () => true;
+          answer(value);
+          emit({ message: String(getterCount) });
+          'invalid'`,
+      },
+      { reasoning: "recover", code: "answer({ answer: 'fixed' }); 'recovered'" },
+    ];
+    let index = 0;
+    const controller: ControllerDriver = {
+      async next(state) { seen.push(state); return cells[index++] as Cell; },
+      fork() { return this; },
+    };
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "c" }, controller,
+      model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "fixed" });
+    expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({
+      code: "INVALID_RESULT",
+      message: "answer value must be strict JSON",
+    });
+    const events = await journalEvents(dir);
+    const committedCells = events.filter((event) => event.type === "cell_committed");
+    expect(events.find((event) => event.type === "emit")?.message).toBe("0");
+    expect(committedCells[0]?.outputRef).toBeUndefined();
+    expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+  });
+
   test("a thrown cell discards its earlier answer effect before recovery", async () => {
     const dir = await tmp();
     const controller = new MockController([
