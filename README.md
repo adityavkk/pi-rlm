@@ -48,7 +48,7 @@ Requires [bun](https://bun.sh). Try the repository as a Pi package for one
 run:
 
 ```bash
-pi -e /path/to/pi-rlm
+pi -e /path/to/pi-rlm/index.ts
 ```
 
 Or install the local package through Pi's documented package mechanism. Pi
@@ -163,9 +163,10 @@ bun run test:smoke-isolation # same smoke; caller environment and cleanup check
 ```
 
 The packed smoke uses clean, separate HOME/XDG/npm/Bun directories for two
-credential-free cases: a direct `pi -e <package-directory> /rlm` tryout and an
-installed local package loaded from Pi settings without `-e`. Both require the
-bounded `RLM_SOURCE_REQUIRED` custom result before any provider turn.
+credential-free cases: the worktree entry loaded directly with
+`pi -e <worktree>/index.ts /rlm`, and an installed packed package discovered
+from Pi settings without `-e`. Both require the exact bounded and durable
+`RLM_SOURCE_REQUIRED` custom result lifecycle without an agent/provider turn.
 
 ## Roadmap
 

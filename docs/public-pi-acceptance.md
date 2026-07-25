@@ -3,17 +3,26 @@
 Pinned Pi version: `@earendil-works/pi-coding-agent` 0.80.10.
 
 Packed-package acceptance runs two independent cases with separate clean
-HOME/XDG/npm/Bun directories. The direct case invokes the pinned Pi CLI as
-`pi -e <installed-package-directory> /rlm`. The installed-discovery case puts
-the installed package directory in the isolated global settings `packages`
-array, validates that its packed `package.json` declares `pi.extensions`, and
-invokes Pi without `-e`; Pi alone resolves the extension manifest entry. Both
-run offline with an empty environment allowlist, use separate bounded JSONL and
-stderr files, and require one `pi-rlm-result` lifecycle containing
-`RLM_SOURCE_REQUIRED` without starting a provider turn. The isolation wrapper
-also verifies caller paths are unchanged and the temporary fixture is removed.
-Run `bun run smoke:packed` directly or `bun run test:smoke-isolation` for the
-outer caller-environment check.
+HOME/XDG/npm/Bun directories. The direct case invokes the pinned Pi CLI with
+`-e <worktree>/index.ts`; it never substitutes the installed tarball copy. The
+installed-discovery case puts the installed package directory in isolated Pi
+settings, validates its packed `pi.extensions` manifest, and invokes Pi without
+`-e`; Pi alone resolves the extension entry. Every npm, Bun, Node, and Pi helper
+runs from an explicit `env -i` allowlist. Registry network remains available
+only for temporary dependency installation. Pi runs with its public `--offline`
+flag and loopback proxy tripwires, not an OS sandbox.
+
+Each case uses an explicit isolated session file. Its strict bounded JSONL parser
+accepts only the session header, one `pi-rlm-result` custom append, and one exact
+matching custom `message_start`/`message_end`. It requires the typed failed
+projection with `error.code: RLM_SOURCE_REQUIRED`, then reads the persisted
+session JSONL and matches its header/state chain, durable custom entry, and custom
+message. Any prose,
+duplicate result/start, agent lifecycle, stderr, or additional output record
+fails. The outer wrapper starts the smoke under `env -i`, uses sentinel caller
+HOME/XDG/npm/Bun paths, compares their contents and metadata, and verifies full
+temporary cleanup. Run `bun run smoke:packed` directly or
+`bun run test:smoke-isolation` for the outer caller-environment check.
 
 Credential-free integration uses Pi's public `CreateAgentSessionRuntimeFactory`, `createAgentSessionServices`, `createAgentSessionFromServices`, and `createAgentSessionRuntime` APIs. `resourceLoaderOptions.extensionFactories` injects `createRlmExtension` with its public `executeRun` seam; no provider call or credential is used. For every extension mode binding (`tui`, `rpc`, `json`, and `print`), the real `AgentSession` and `ExtensionRunner` path is observed through public `session.subscribe()`: exactly one matching `pi-rlm-result` `message_start`, `message_end`, and session entry are required.
 
