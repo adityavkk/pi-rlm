@@ -62,3 +62,8 @@ export interface RunState {
   readonly contextSemaphore: Semaphore;
   readonly frameSeq: { current: number };
 }
+
+/** Runtime-private state used only by the top-level and frame runners. */
+export interface InternalRunState extends RunState {
+  readonly controllerTurnObserver?: (controllerTurns: number) => void;
+}
