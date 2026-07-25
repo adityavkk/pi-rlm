@@ -20,9 +20,10 @@ import { validateWorkspace } from "../core/workspace.ts";
 import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
+import { waitForAbort, wasAborted } from "./abort.ts";
 import { dispatchCall } from "./broker.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
-import type { ControllerDriver } from "./controller.ts";
+import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
 export interface FrameResult {
@@ -30,6 +31,7 @@ export interface FrameResult {
   readonly completionMode?: "answer";
   readonly exhausted: boolean;
   readonly terminal?: InterpreterError;
+  readonly cancelled?: true;
   readonly workspace?: JsonValue;
   readonly entries?: readonly TrajectoryEntry[];
 }
@@ -65,6 +67,8 @@ export const runFrame = async (
   state: RunState,
   frame: FrameRef,
   controller: ControllerDriver,
+  signal?: AbortSignal,
+  ownerDeadlineMs = Number.POSITIVE_INFINITY,
 ): Promise<FrameResult> => {
   let workspace: JsonValue = {};
   let entries: readonly TrajectoryEntry[] = [];
@@ -72,26 +76,36 @@ export const runFrame = async (
   let phaseOrdinal = 0;
   let emitOrdinal = 0;
 
-  const recurseFn = (args: JsonValue, _signal: AbortSignal): Promise<GuestCallResult> => runChild(state, frame, controller, args);
+  const cancelled = (): FrameResult => ({ exhausted: false, cancelled: true, workspace, entries });
+  const recurseFn = (args: JsonValue, cellSignal: AbortSignal, deadlineMs: number): Promise<GuestCallResult> =>
+    runChild(state, frame, controller, args, cellSignal, deadlineMs);
 
   for (let iteration = 1; ; iteration++) {
+    if (signal?.aborted) return cancelled();
     const turn = reserveControllerTurn(state.ledger.current, state.clock.now());
     if (!turn.ok) return { exhausted: true, workspace, entries };
     state.ledger.current = turn.value;
 
     const projection = projectTrajectory(entries, state.profile.trajectory);
-    const cell = await controller.next({
-      frameId: frame.frameId,
-      depth: frame.depth,
-      objective: frame.objective,
-      inputs: frame.inputs,
-      variables: frame.inputs as unknown as JsonValue,
-      budget: budgetView(state.ledger.current, frame.depth),
-      workspace,
-      outputs: frame.outputs,
-      trajectory: projection,
-      ...(lastOutcome ? { lastOutcome } : {}),
-    });
+    let cell: Cell;
+    try {
+      cell = await waitForAbort(controller.next({
+        frameId: frame.frameId,
+        depth: frame.depth,
+        objective: frame.objective,
+        inputs: frame.inputs,
+        variables: frame.inputs as unknown as JsonValue,
+        budget: budgetView(state.ledger.current, frame.depth),
+        workspace,
+        outputs: frame.outputs,
+        trajectory: projection,
+        ...(lastOutcome ? { lastOutcome } : {}),
+      }, signal), signal);
+    } catch (error) {
+      if (wasAborted(error, signal)) return cancelled();
+      throw error;
+    }
+    if (signal?.aborted) return cancelled();
 
     const transformed = transformCell(cell.code);
     if (!transformed.ok) {
@@ -113,6 +127,7 @@ export const runFrame = async (
         outputPreview: "",
         error: errorInfo(transformed.error),
       });
+      if (signal?.aborted) return cancelled();
       lastOutcome = { kind: "parse_error", message: transformed.error.message };
       continue;
     }
@@ -120,6 +135,7 @@ export const runFrame = async (
     let answered = false;
     let candidate: JsonValue | undefined;
     const effect = (name: string, args: JsonValue): void => {
+      if (signal?.aborted) return;
       if (name === "answer" && isJsonObject(args)) {
         answered = true;
         candidate = args["value"] as JsonValue;
@@ -130,7 +146,11 @@ export const runFrame = async (
       }
     };
 
-    const cellDeadline = Math.min(state.clock.now() + state.profile.cellWallMs, state.ledger.current.limits.deadlineMs);
+    const cellDeadline = Math.min(
+      state.clock.now() + state.profile.cellWallMs,
+      state.ledger.current.limits.deadlineMs,
+      ownerDeadlineMs,
+    );
     const outcome = await state.backend.evalCell({
       source: transformed.value.source,
       deadlineMs: cellDeadline,
@@ -142,9 +162,11 @@ export const runFrame = async (
         budget: budgetView(state.ledger.current, frame.depth) as unknown as JsonValue,
         workspace,
       },
-      dispatch: (n, a, signal) => dispatchCall(state, frame, n, a, recurseFn, signal),
+      ...(signal ? { signal } : {}),
+      dispatch: (n, a, cellSignal, deadlineMs) => dispatchCall(state, frame, n, a, recurseFn, cellSignal, deadlineMs),
       effect,
     });
+    if (signal?.aborted) return cancelled();
 
     if (outcome.kind === "terminal") {
       await state.journal.append({
@@ -157,6 +179,7 @@ export const runFrame = async (
         outputPreview: "",
         error: errorInfo(outcome.error),
       });
+      if (signal?.aborted) return cancelled();
       return { exhausted: false, terminal: outcome.error };
     }
 
@@ -181,6 +204,7 @@ export const runFrame = async (
         const answerErrors = validateAnswer(candidate, frame);
         if (answerErrors.length === 0) {
           const ref = await state.store.derive({ key: `answer:${frame.frameId}:${iteration}`, value: candidate });
+          if (signal?.aborted) return cancelled();
           entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
           await state.journal.append({
             type: "cell_committed",
@@ -192,7 +216,9 @@ export const runFrame = async (
             outputPreview: preview,
             outputRef: ref.id,
           });
+          if (signal?.aborted) return cancelled();
           await state.journal.append({ type: "answer_committed", frameId: frame.frameId, completionMode: "answer", outputRef: ref.id });
+          if (signal?.aborted) return cancelled();
           return { answer: candidate, completionMode: "answer", exhausted: false };
         }
         error = callError("INVALID_RESULT", `answer did not satisfy the output contract: ${answerErrors.join("; ")}`);
@@ -217,6 +243,7 @@ export const runFrame = async (
       outputPreview: preview,
       ...(error ? { error: errorInfo(error) } : {}),
     });
+    if (signal?.aborted) return cancelled();
     lastOutcome = error ? { kind: "error", message: error.message } : { kind: "value", preview };
   }
 };
@@ -226,11 +253,15 @@ const runChild = async (
   parentFrame: FrameRef,
   parentController: ControllerDriver,
   args: JsonValue,
+  signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<GuestCallResult> => {
   if (!isJsonObject(args)) return errResult("call_recurse_invalid", callError("INVALID_REQUEST", "recurse spec must be an object"), ZERO_CALL_USAGE, false);
   const key = typeof args["key"] === "string" ? args["key"] : "recurse";
   const objective = typeof args["objective"] === "string" ? args["objective"] : "";
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "recurse", key, identity: args });
+  const cancelled = (): GuestCallResult => errResult(callId, callError("CANCELLED", "cell epoch closed"), ZERO_CALL_USAGE, false);
+  if (signal.aborted) return cancelled();
   if (objective.length === 0) return errResult(callId, callError("INVALID_REQUEST", "recurse requires an objective"), ZERO_CALL_USAGE, false);
 
   const refs = Array.isArray(args["context"]) ? args["context"] : args["context"] !== undefined ? [args["context"]] : [];
@@ -242,19 +273,23 @@ const runChild = async (
     }
   });
 
+  if (signal.aborted) return cancelled();
   const opened = openFrame(state.ledger.current, parentFrame.depth + 1);
   if (!opened.ok) return errResult(callId, opened.error, ZERO_CALL_USAGE, false);
   state.ledger.current = opened.value;
 
   const childFrameId = `${state.runId}:f${state.frameSeq.current++}`;
   await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
+  if (signal.aborted) return cancelled();
 
   const childFrame: FrameRef = { frameId: childFrameId, depth: parentFrame.depth + 1, objective, inputs, outputs: [] };
   const childController = parentController.fork(objective, childFrameId);
-  const result = await runFrame(state, childFrame, childController);
+  const result = await runFrame(state, childFrame, childController, signal, deadlineMs);
+  if (signal.aborted || result.cancelled) return cancelled();
 
   const finalState = result.answer !== undefined ? "answered" : result.terminal ? "failed" : "closed";
   await state.journal.append({ type: "frame_closed", frameId: childFrameId, state: finalState });
+  if (signal.aborted) return cancelled();
 
   if (result.terminal) return errResult(callId, callError("FAILED", result.terminal.message), ZERO_CALL_USAGE, false);
   if (result.answer !== undefined) return okResult(callId, result.answer, ZERO_CALL_USAGE, false);

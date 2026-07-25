@@ -13,6 +13,11 @@
   epoch at the wall deadline, aborts host work, settles guest deferreds, and wakes the job
   driver. Cleanup never waits for host promises; late callbacks observe the closed/alive
   guards and never touch disposed QuickJS handles.
+- Cell cancellation propagates through recursive frames, controller calls, nested cell
+  evaluation, model calls, and abortable semaphore waiters. Runtime ownership (in-flight
+  identity, logical-call reservation, token reservation, and semaphore permit) detaches
+  before the cancelled call returns. External work that ignores `AbortSignal` may continue
+  outside runtime ownership, but its late fulfillment or rejection cannot commit or cache.
 - Keep the deadline interrupt installed through result serialization, workspace readback,
   closed-epoch job pumping, and disposal. Proxy traps and getters run during readback.
 - CPU interrupt via `shouldInterruptAfterDeadline` works on the sync runtime.

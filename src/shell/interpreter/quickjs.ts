@@ -97,6 +97,7 @@ export class QuickJsBackend implements InterpreterBackend {
     let alive = true;
     let epochOpen = true;
     let deadlineFired = false;
+    let ownerAborted = options.signal?.aborted ?? false;
     let resultReader: QuickJSHandle | undefined;
     let workspaceReader: QuickJSHandle | undefined;
     const cellAbort = new AbortController();
@@ -128,16 +129,26 @@ export class QuickJsBackend implements InterpreterBackend {
       outstanding.clear();
     };
 
-    let wakeDeadline!: () => void;
-    const deadline = new Promise<void>((resolve) => {
-      wakeDeadline = resolve;
+    let wakeStop!: () => void;
+    const stop = new Promise<void>((resolve) => {
+      wakeStop = resolve;
     });
     const fireDeadline = (): void => {
       if (deadlineFired) return;
       deadlineFired = true;
       closeEpoch(new Error("cell exceeded deadline"));
-      wakeDeadline();
+      wakeStop();
     };
+    const fireOwnerAbort = (): void => {
+      if (ownerAborted && !epochOpen) return;
+      ownerAborted = true;
+      closeEpoch(new Error("cell owner cancelled"));
+      wakeStop();
+    };
+    const ownerAbortListener = (): void => fireOwnerAbort();
+    if (options.signal && !options.signal.aborted) options.signal.addEventListener("abort", ownerAbortListener, { once: true });
+    else if (options.signal?.aborted) fireOwnerAbort();
+
     const delayMs = Math.max(0, Math.min(2_147_483_647, options.deadlineMs - Date.now()));
     const deadlineTimer = setTimeout(fireDeadline, delayMs);
     const deadlineExceeded = (): boolean => {
@@ -147,6 +158,7 @@ export class QuickJsBackend implements InterpreterBackend {
 
     const finish = (outcome: CellEvalOutcome): CellEvalOutcome => {
       clearTimeout(deadlineTimer);
+      options.signal?.removeEventListener("abort", ownerAbortListener);
       closeEpoch(new Error("cell epoch closed"));
       alive = false;
       // Propagate closed-epoch rejections while the deadline interrupt remains
@@ -179,6 +191,8 @@ export class QuickJsBackend implements InterpreterBackend {
       return outcome;
     };
 
+    if (ownerAborted) return finish({ kind: "terminal", error: interpreterError("DISPOSED", "cell owner cancelled") });
+
     const completeDeferred = (deferred: QuickJSDeferredPromise, payloadJson: string): void => {
       if (!alive || !epochOpen || !outstanding.has(deferred)) return;
       try {
@@ -203,7 +217,7 @@ export class QuickJsBackend implements InterpreterBackend {
       let operation!: Promise<void>;
       operation = (async () => {
         try {
-          const value = await options.dispatch(name, args, cellAbort.signal);
+          const value = await options.dispatch(name, args, cellAbort.signal, options.deadlineMs);
           let payloadJson: string;
           try {
             payloadJson = JSON.stringify({ ok: true, value });
@@ -314,6 +328,10 @@ export class QuickJsBackend implements InterpreterBackend {
 
     try {
       for (;;) {
+        if (ownerAborted) {
+          topHandle.dispose();
+          return finish({ kind: "terminal", error: interpreterError("DISPOSED", "cell owner cancelled") });
+        }
         if (deadlineExceeded()) {
           topHandle.dispose();
           return finish({ kind: "terminal", error: interpreterError("CPU_LIMIT", "cell exceeded deadline") });
@@ -334,11 +352,16 @@ export class QuickJsBackend implements InterpreterBackend {
           state = ctx.getPromiseState(topHandle);
         }
 
-        if (deadlineExceeded()) {
+        if (ownerAborted || deadlineExceeded()) {
           if (state.type === "fulfilled") state.value.dispose();
           else if (state.type === "rejected") state.error.dispose();
           topHandle.dispose();
-          return finish({ kind: "terminal", error: interpreterError("CPU_LIMIT", "cell exceeded deadline") });
+          return finish({
+            kind: "terminal",
+            error: ownerAborted
+              ? interpreterError("DISPOSED", "cell owner cancelled")
+              : interpreterError("CPU_LIMIT", "cell exceeded deadline"),
+          });
         }
 
         if (state.type !== "pending") {
@@ -406,7 +429,7 @@ export class QuickJsBackend implements InterpreterBackend {
             workspaceInvalidPaths: ws.value.invalid,
           });
         }
-        await Promise.race([deadline, ...inflight]);
+        await Promise.race([stop, ...inflight]);
       }
     } catch (error) {
       try {

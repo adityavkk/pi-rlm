@@ -20,7 +20,7 @@ export interface CellGlobals {
 }
 
 /** Async bridge for value-returning calls (llm, agent, recurse, tools, ...). */
-export type HostDispatch = (name: string, args: JsonValue, signal: AbortSignal) => Promise<unknown>;
+export type HostDispatch = (name: string, args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<unknown>;
 
 /** Synchronous effect for progress and answer recording (never awaited). */
 export type HostEffect = (name: string, args: JsonValue) => void;
@@ -32,6 +32,8 @@ export interface CellEvalOptions {
   readonly deadlineMs: number;
   readonly memoryBytes: number;
   readonly globals: CellGlobals;
+  /** Optional owner cancellation, composed into the cell epoch signal. */
+  readonly signal?: AbortSignal;
   readonly dispatch: HostDispatch;
   readonly effect: HostEffect;
 }
