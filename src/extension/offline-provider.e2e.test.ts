@@ -230,12 +230,18 @@ describe("credential-free offline Pi provider E2E", () => {
 
   test("session replacement aborts once, retains cancellation, and rejects late mutation", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("pending");
+    const replacementObserved: AgentSessionEvent[] = [];
+    let unsubscribeReplacement: (() => void) | undefined;
     try {
-      const prompt = fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" });
+      const originalSession = fixture.runtime.session;
+      const prompt = originalSession.prompt(OFFLINE_COMMAND, { source: "interactive" });
       await withTimeout(fixture.state.started, "provider start");
       expect(fixture.state.calls).toHaveLength(1);
       expect(fixture.state.calls[0]?.options).toEqual({ maxRetries: 0, maxTokens: 512, hasSignal: true, envKeys: [] });
       await withTimeout(fixture.runtime.newSession(), "session replacement");
+      const replacementSession = fixture.runtime.session;
+      expect(replacementSession).not.toBe(originalSession);
+      unsubscribeReplacement = replacementSession.subscribe((event) => replacementObserved.push(event));
       await withTimeout(prompt, "cancelled prompt");
       expect(fixture.state.aborts).toBe(1);
       expect(fixture.state.calls[0]?.signal?.aborted).toBe(true);
@@ -266,7 +272,11 @@ describe("credential-free offline Pi provider E2E", () => {
       expect(fixture.state.calls).toHaveLength(1);
       expect(fixture.state.fetchCalls).toBe(0);
       expect(observed.map(customMessage).filter(Boolean)).toHaveLength(0);
+      expect(replacementObserved.map(customMessage).filter(Boolean)).toHaveLength(0);
+      expect(fixture.sessionManager.getEntries().filter((entry) =>
+        entry.type === "custom_message" && entry.customType === "pi-rlm-result")).toHaveLength(0);
     } finally {
+      unsubscribeReplacement?.();
       unsubscribe();
       await fixture.dispose();
       await rm(root, { recursive: true, force: true });
