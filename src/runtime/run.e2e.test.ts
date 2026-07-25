@@ -195,7 +195,8 @@ describe("runProgram e2e", () => {
     ]);
     const extractor = new FunctionExtractor((evidence) => ({
       ok: true,
-      value: { answer: `fallback:${JSON.stringify(evidence.workspace)}` },
+      value: { answer: `fallback:${JSON.stringify(evidence.workspaceValues)}` },
+      evidenceRefs: [evidence.workspaceValues[0]!.evidenceId!],
     }));
     const result = await runProgram({
       program: program(),
@@ -806,15 +807,19 @@ describe("runProgram e2e", () => {
   test("fallback answers use the same denied transaction without residue", async () => {
     const dir = await tmp();
     const result = await runProgram({
-      program: program(), sources: { context: "" }, controller: new MockController([]),
+      program: program(), sources: { context: "x" }, controller: new MockController([]),
       model: new MockModelClient(() => "unused"), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, storedByteLimit: 1 },
-      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "oversized" } })),
+      extractor: new FunctionExtractor((evidence) => ({
+        ok: true,
+        value: { answer: "oversized" },
+        evidenceRefs: [evidence.handles[0]!.evidenceId!],
+      })),
     });
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("BUDGET_BYTES");
-    expect(result.ledger.usage.storedBytes).toBe(0);
+    expect(result.ledger.usage.storedBytes).toBe(1);
     expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(1);
     expect((await journalEvents(dir)).some((event) => event.type === "answer_committed")).toBe(false);
   });

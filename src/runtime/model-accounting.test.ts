@@ -26,11 +26,11 @@ beforeAll(async () => {
 
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-accounting-"));
 
-const program = (): RlmProgram => {
+const program = (withEvidenceInput = false): RlmProgram => {
   const normalized = normalizeProgram({
     objective: "account every model effect",
     profile: "default",
-    inputs: [],
+    inputs: withEvidenceInput ? [{ name: "context", adapter: "text", description: "fallback evidence" }] : [],
     outputs: [{ name: "answer", schema: { type: "string" } }],
   });
   if (!normalized.ok) throw new Error("invalid test program");
@@ -172,10 +172,14 @@ describe("tree-wide model accounting", () => {
     const dir = await tmp();
     const model = new MockModelClient(() => "unused");
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir,
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
-      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "external" } })),
+      extractor: new FunctionExtractor((evidence) => ({
+        ok: true,
+        value: { answer: "external" },
+        evidenceRefs: [evidence.handles[0]!.evidenceId!],
+      })),
     });
 
     expect(result.answer).toEqual({ answer: "external" });
@@ -186,19 +190,34 @@ describe("tree-wide model accounting", () => {
   });
 
   test("provider fallback can call the model only through the shared boundary", async () => {
-    const model = new MockModelClient(() => usageResponse('{"answer":"provider"}', 3, 4, 0.05, 9));
+    let modelRequest: ModelRequest | undefined;
+    const model = new MockModelClient((request) => {
+      modelRequest = request;
+      const evidenceId = request.prompt.match(/ev_[a-f0-9]{64}/)?.[0];
+      if (!evidenceId) throw new Error("model prompt omitted evidence IDs");
+      return usageResponse(JSON.stringify({
+        value: { answer: "provider" }, evidenceRefs: [evidenceId],
+      }), 3, 4, 0.05, 9);
+    });
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor(async (_evidence, _signal, operation) => {
         const response = await operation.complete({ prompt: "extract", system: "strict", maxOutputTokens: 32 });
-        return { ok: true, value: JSON.parse(response.text) };
+        const envelope = JSON.parse(response.text) as { value: { answer: string }; evidenceRefs: string[] };
+        return { ok: true, ...envelope };
       }, "provider"),
     });
 
     expect(result.answer).toEqual({ answer: "provider" });
     expect(model.callCount).toBe(1);
+    expect(modelRequest?.prompt).toContain("evidenceRefs");
+    expect(modelRequest?.prompt).toMatch(/ev_[a-f0-9]{64}/);
+    expect(modelRequest?.schema).toMatchObject({
+      required: ["value", "evidenceRefs"],
+      properties: { evidenceRefs: { type: "array" } },
+    });
     expect(result.ledger.usage).toMatchObject({
       logicalCalls: 1,
       attempts: 1,
@@ -211,10 +230,14 @@ describe("tree-wide model accounting", () => {
   test("provider extractor that skips its boundary fails instead of becoming free work", async () => {
     const model = new MockModelClient(() => "unused");
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
-      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "hidden" } }), "provider"),
+      extractor: new FunctionExtractor((evidence) => ({
+        ok: true,
+        value: { answer: "hidden" },
+        evidenceRefs: [evidence.handles[0]!.evidenceId!],
+      }), "provider"),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_REQUEST" } });
     expect(model.callCount).toBe(0);
@@ -299,10 +322,14 @@ describe("reviewed accounting boundaries", () => {
       }
     }
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
-      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "external" } })),
+      extractor: new FunctionExtractor((evidence) => ({
+        ok: true,
+        value: { answer: "external" },
+        evidenceRefs: [evidence.handles[0]!.evidenceId!],
+      })),
       journal: new CacheFailJournal(dir),
     });
 
@@ -319,10 +346,14 @@ describe("reviewed accounting boundaries", () => {
     const model = new MockModelClient(() => "must not run");
     const extractor = new FunctionExtractor((...args) => {
       argumentCount = args.length;
-      return { ok: true, value: { answer: "external" } };
+      return {
+        ok: true,
+        value: { answer: "external" },
+        evidenceRefs: [args[0].handles[0]!.evidenceId!],
+      };
     });
     const result = await runProgram({
-      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, maxConcurrency: 1 },
       extractor,

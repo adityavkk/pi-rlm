@@ -42,9 +42,31 @@ export type RlmEvent =
       readonly codeHash: string;
       readonly hasResult: boolean;
       readonly outputPreview: string;
+      readonly outputBytes?: number;
+      readonly outputOmittedBytes?: number;
       readonly usage?: CallUsage;
       readonly outputRef?: string;
       readonly error?: EventErrorInfo;
+    }
+  | {
+      readonly type: "fallback_evidence_projected";
+      readonly frameId: string;
+      readonly projectionVersion: string;
+      readonly projectionHash: string;
+      readonly projectedBytes: number;
+      readonly maxBytes: number;
+      readonly omittedBytes: number;
+      readonly omittedItems: number;
+      readonly truncatedItems: number;
+      readonly evidenceIdCount: number;
+      readonly evidenceIdsHash: string;
+      readonly truncated: boolean;
+    }
+  | {
+      readonly type: "fallback_evidence_cited";
+      readonly frameId: string;
+      readonly evidenceRefs: readonly string[];
+      readonly evidenceRefsHash: string;
     }
   | {
       readonly type: "provider_attempted";
@@ -162,6 +184,8 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         break;
       }
       case "emit":
+      case "fallback_evidence_projected":
+      case "fallback_evidence_cited":
       case "provider_attempted":
         break;
       case "key_bound": {

@@ -265,7 +265,8 @@ describe("run cancellation and terminal finalization", () => {
         return valueOutcome();
       });
       const run = runProgram({
-        program: program(kind === "context"), sources: kind === "context" ? { context: "abcdefgh" } : {},
+        program: program(kind === "context" || kind === "extractor"),
+        sources: kind === "context" || kind === "extractor" ? { context: "abcdefgh" } : {},
         controller: new OneCellController(), model: unusedModel, backend, dir, signal: owner.signal,
         ...(extractor ? { extractor, profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 } } : {}),
       });
@@ -292,7 +293,8 @@ describe("run cancellation and terminal finalization", () => {
     for (const entry of cases) {
       const dir = await tmp();
       const result = await runProgram({
-        program: program(), sources: {}, controller: entry.controller, model: unusedModel,
+        program: program(entry.extractor !== undefined),
+        sources: entry.extractor ? { context: "represented evidence" } : {}, controller: entry.controller, model: unusedModel,
         backend: new FunctionBackend(async () => valueOutcome()), dir, signal: new AbortController().signal,
         ...(entry.extractor ? { extractor: entry.extractor, profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 } } : {}),
       });
