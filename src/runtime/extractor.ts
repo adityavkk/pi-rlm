@@ -128,19 +128,21 @@ export const buildExtractorModelRequest = (
     },
     additionalProperties: false,
   } as JsonObject;
-  const contract = [
-    "Fallback extraction provenance contract:",
-    "Return ONLY one JSON object shaped as {\"value\": <output object>, \"evidenceRefs\": [\"evidenceId\", ...]}.",
-    "evidenceRefs must be nonempty and unique. Cite only IDs whose represented content supports the value.",
-    "A truncated preview may be cited only for the nonempty content shown; omitted bytes are not evidence.",
-    `Available substantive evidenceIds, in projection order: ${JSON.stringify(evidenceIds)}`,
-  ].join("\n");
   return {
     ...request,
-    prompt: `${request.prompt}\n\n${contract}`,
+    prompt: `${request.prompt}\n\n${buildExtractorPromptContract(evidenceIds)}`,
     schema,
   };
 };
+
+/** Stable rendered prompt contract shared by execution and manifest binding. */
+export const buildExtractorPromptContract = (evidenceIds: readonly string[]): string => [
+  "Fallback extraction provenance contract:",
+  "Return ONLY one JSON object shaped as {\"value\": <output object>, \"evidenceRefs\": [\"evidenceId\", ...]}.",
+  "evidenceRefs must be nonempty and unique. Cite only IDs whose represented content supports the value.",
+  "A truncated preview may be cited only for the nonempty content shown; omitted bytes are not evidence.",
+  `Available substantive evidenceIds, in projection order: ${JSON.stringify(evidenceIds)}`,
+].join("\n");
 
 export class FunctionExtractor implements Extractor {
   private readonly fn: ExternalExtractorFn | ProviderExtractorFn;

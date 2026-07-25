@@ -149,6 +149,7 @@ const pendingOfflineRuntime = (dir: string): {
   };
   const backend: InterpreterBackend = {
     id: "offline-extension-test",
+    version: "1",
     async evalCell(_options: CellEvalOptions): Promise<CellEvalOutcome> {
       throw new Error("late controller cell reached interpreter");
     },

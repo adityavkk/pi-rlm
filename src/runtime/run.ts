@@ -37,13 +37,14 @@ import type { FrameRef, InternalRunState } from "./state.ts";
 import {
   buildRunManifest,
   claimRunDirectory,
+  RLM_DSL_VERSION,
   type LaunchAuthorizationMode,
   type RunDirectoryFileSystem,
 } from "./run-manifest.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 
-export const RLM_DSL_VERSION = "0.1.0";
+export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
 export interface RunInput {
   readonly program: RlmProgram;
@@ -326,6 +327,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     program: input.program,
     sources: input.sources,
     profile,
+    limits,
     backend: input.backend,
     controller: input.controller,
     extractor: input.extractor,

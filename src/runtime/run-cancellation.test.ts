@@ -54,6 +54,7 @@ class OneCellController implements ControllerDriver {
 
 class FunctionBackend implements InterpreterBackend {
   readonly id = "test-backend";
+  readonly version = "1";
   constructor(private readonly fn: (options: CellEvalOptions) => Promise<CellEvalOutcome>) {}
   evalCell(options: CellEvalOptions): Promise<CellEvalOutcome> {
     return this.fn(options);
