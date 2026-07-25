@@ -7,14 +7,71 @@
  */
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { Context } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, StopReason } from "@earendil-works/pi-ai";
 import type { CallUsage } from "../../core/usage.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "./client.ts";
+
+export type PiModelErrorCode =
+  | "CANCELLED"
+  | "PROVIDER_ERROR"
+  | "OUTPUT_TRUNCATED"
+  | "UNEXPECTED_TOOL_USE"
+  | "MISSING_TEXT";
+
+/** Typed failure from a completed Pi request, including any reported usage. */
+export class PiModelError extends Error {
+  override readonly name = "PiModelError";
+
+  constructor(
+    readonly code: PiModelErrorCode,
+    readonly stopReason: StopReason,
+    readonly provider: string,
+    readonly model: string,
+    readonly usage: CallUsage,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 const splitModel = (id: string): { provider: string; model: string } => {
   const slash = id.indexOf("/");
   if (slash <= 0) throw new Error(`model id must be "provider/model": ${id}`);
   return { provider: id.slice(0, slash), model: id.slice(slash + 1) };
+};
+
+const mapUsage = (message: AssistantMessage): CallUsage => ({
+  attempts: 1,
+  inputTokens: message.usage.input,
+  outputTokens: message.usage.output,
+  totalTokens: message.usage.totalTokens,
+  costUsd: message.usage.cost.total,
+  durationMs: 0,
+});
+
+const mapMessage = (message: AssistantMessage, provider: string, model: string): ModelResponse => {
+  const usage = mapUsage(message);
+  const fail = (code: PiModelErrorCode, fallback: string): never => {
+    throw new PiModelError(code, message.stopReason, provider, model, usage, message.errorMessage ?? fallback);
+  };
+
+  switch (message.stopReason) {
+    case "error":
+      return fail("PROVIDER_ERROR", `provider ${provider} failed to complete model ${model}`);
+    case "aborted":
+      return fail("CANCELLED", `completion aborted for ${provider}/${model}`);
+    case "length":
+      return fail("OUTPUT_TRUNCATED", `output truncated for ${provider}/${model}`);
+    case "toolUse":
+      return fail("UNEXPECTED_TOOL_USE", `unexpected tool use from ${provider}/${model}`);
+    case "stop": {
+      const textParts = message.content.filter(
+        (part): part is { type: "text"; text: string } => part.type === "text",
+      );
+      if (textParts.length === 0) return fail("MISSING_TEXT", `no text returned by ${provider}/${model}`);
+      return { text: textParts.map((part) => part.text).join(""), usage };
+    }
+  }
 };
 
 export class PiModelClient implements ModelClient {
@@ -46,18 +103,6 @@ export class PiModelClient implements ModelClient {
       ...(request.signal ? { signal: request.signal } : {}),
     });
 
-    const text = message.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("");
-    const usage: CallUsage = {
-      attempts: 1,
-      inputTokens: message.usage.input,
-      outputTokens: message.usage.output,
-      totalTokens: message.usage.totalTokens,
-      costUsd: message.usage.cost.total,
-      durationMs: 0,
-    };
-    return { text, usage };
+    return mapMessage(message, provider, model);
   }
 }
