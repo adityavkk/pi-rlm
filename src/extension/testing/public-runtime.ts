@@ -3,11 +3,13 @@ import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
   createAgentSessionServices,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
 } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createRlmExtension } from "../../../index.ts";
 import { createLedger } from "../../core/budget.ts";
 import { DEFAULT_PROFILE, resolveLimits, type RunResult } from "../../runtime/index.ts";
@@ -34,6 +36,12 @@ export const createPublicRuntimeFixture = async (root: string): Promise<PublicRu
   const agentDir = join(root, "agent");
   const settingsManager = SettingsManager.inMemory();
   const sessionManager = SessionManager.inMemory(root);
+  const modelRuntime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsStore: new InMemoryModelsStore(),
+    modelsPath: null,
+    allowModelNetwork: false,
+  });
   const captured: LaunchRequest[] = [];
   const extension = createRlmExtension({
     executeRun: async (request) => {
@@ -47,6 +55,7 @@ export const createPublicRuntimeFixture = async (root: string): Promise<PublicRu
       cwd: options.cwd,
       agentDir: options.agentDir,
       settingsManager,
+      modelRuntime,
       resourceLoaderOptions: {
         extensionFactories: [{ name: "pi-rlm-public-runtime", factory: extension }],
       },
