@@ -32,6 +32,7 @@ import {
   ModelController,
   type LaunchAuthorizationMode,
   type Profile,
+  preflightRunComponents,
   runProgram,
   type RunResult,
 } from "./src/runtime/index.ts";
@@ -174,6 +175,7 @@ const executeRun = async (
   throwIfAborted(signal);
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
+  preflightRunComponents({ backend, model, controller });
   const dirWork = (dependencies.createRunDirectory ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-run-"))))();
   let dir: string;
   try {
@@ -183,19 +185,26 @@ const executeRun = async (
       void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
     throw error;
   }
-  throwIfAborted(signal);
-  return runProgram({
-    program: request.program,
-    sources: request.sources,
-    controller,
-    model,
-    backend,
-    dir,
-    profile,
-    signal,
-    authorizationMode,
-    createRunNonce: dependencies.createRunNonce,
-  });
+  try {
+    throwIfAborted(signal);
+    const result = await runProgram({
+      program: request.program,
+      sources: request.sources,
+      controller,
+      model,
+      backend,
+      dir,
+      profile,
+      signal,
+      authorizationMode,
+      createRunNonce: dependencies.createRunNonce,
+    });
+    if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
+    return result;
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
+  }
 };
 
 export interface RlmExtensionDependencies {

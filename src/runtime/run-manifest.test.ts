@@ -12,6 +12,7 @@ import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
 import { FunctionExtractor } from "./extractor.ts";
 import { ModelController } from "./model-controller.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
+import { providerRequestIdentity, PROVIDER_REQUEST_IDENTITY_VERSION } from "./provider.ts";
 import {
   buildRunManifest,
   claimRunDirectory,
@@ -92,8 +93,8 @@ describe("source-bound run identity and manifest", () => {
       runProgram(runInput(await tmp(), "same source", "nonce-a")),
       runProgram(runInput(await tmp(), "same source", "nonce-b")),
     ]);
-    expect(a.runId).toBe("run_nonce-a");
-    expect(b.runId).toBe("run_nonce-b");
+    expect(a.runId).toBe(`run_${sha256("nonce-a")}`);
+    expect(b.runId).toBe(`run_${sha256("nonce-b")}`);
   });
 
   test("binds full normalized program, resolved limits/routes, prompt renders, and no source", () => {
@@ -294,7 +295,12 @@ describe("source-bound run identity and manifest", () => {
     expect(storedManifest).not.toContain("turnRenderedSha256");
     const events = (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     const attempted = events.find((event) => event.type === "provider_attempted");
-    expect(attempted).toMatchObject({ promptSha256: sha256(prompt), outcome: "ok" });
+    expect(attempted).toMatchObject({
+      requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
+      requestSha256: providerRequestIdentity(dynamicModel, { prompt }).sha256,
+      outcome: "ok",
+    });
+    expect(JSON.stringify(attempted)).not.toContain(prompt);
   });
 
   test("readRunManifest applies strict compatibility and canonical hash checks", async () => {

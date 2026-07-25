@@ -493,6 +493,31 @@ describe("pi-rlm extension wiring", () => {
     expect(h.runs).toHaveLength(1);
   });
 
+  test("opaque runtime identity fails before extension-owned directory creation", async () => {
+    let directoryCalls = 0;
+    const backend: InterpreterBackend = {
+      id: "preflight-backend", version: "1",
+      async evalCell() { throw new Error("unused"); },
+      async dispose() {},
+    };
+    const opaqueModel = { id: "opaque", async complete() { throw new Error("unused"); } } as unknown as ModelClient;
+    const controller: ControllerDriver = {
+      identity: { id: "test/preflight-controller", version: "1", configuration: {} },
+      async next() { throw new Error("unused"); },
+      fork() { return this; },
+    };
+    const h = harness({ runtime: {
+      createBackend: () => backend,
+      createModel: () => opaqueModel,
+      createController: () => controller,
+      createRunDirectory: async () => { directoryCalls++; return mkdtemp(join(tmpdir(), "must-not-create-")); },
+    } });
+    await h.startTurn("Use pi-rlm for this preflight run");
+    const result = await rlmTool(h).execute("call-preflight", { objective: "Preflight" }, undefined, undefined, h.ctx);
+    expect(result.details?.status).toBe("error");
+    expect(directoryCalls).toBe(0);
+  });
+
   test("tool signal cancels the production executeRun path with one closed terminal and no late commit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-tool-"));
     const offline = pendingOfflineRuntime(dir);
@@ -505,10 +530,10 @@ describe("pi-rlm extension wiring", () => {
     const result = await pending;
 
     expect(result.details?.status).toBe("cancelled");
-    const terminalSnapshot = await assertCancelledJournal(dir);
+    await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(terminalSnapshot);
+    await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test.each([
@@ -526,10 +551,10 @@ describe("pi-rlm extension wiring", () => {
     await pending;
 
     expect(h.notifications.at(-1)).toContain("cancelled");
-    const terminalSnapshot = await assertCancelledJournal(dir);
+    await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(terminalSnapshot);
+    await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("runtime initialization is not called when no consumable turn grant exists", async () => {

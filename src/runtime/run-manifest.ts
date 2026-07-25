@@ -240,6 +240,43 @@ const suppliedIdentity = (value: object, path: string): RuntimeComponentIdentity
   return runtimeIdentity(descriptor.value, `${path}.identity`);
 };
 
+export type RunPreflightErrorCode = "RUN_COMPONENT_IDENTITY_INVALID";
+
+/** Typed, effect-free failure from runtime component identity preflight. */
+export class RunPreflightError extends TypeError {
+  override readonly name = "RunPreflightError";
+  readonly code: RunPreflightErrorCode = "RUN_COMPONENT_IDENTITY_INVALID";
+  constructor(message: string, override readonly cause?: unknown) { super(message); }
+}
+
+export interface RunComponentPreflightInput {
+  readonly backend: InterpreterBackend;
+  readonly model: ModelClient;
+  readonly controller: ControllerDriver;
+  readonly extractor?: Extractor;
+}
+
+export interface RunComponentPreflight {
+  readonly backend: RunManifest["backend"];
+  readonly components: RunManifest["components"];
+}
+
+/** Validate and snapshot opaque component identities before any run-owned effect. */
+export const preflightRunComponents = (input: RunComponentPreflightInput): RunComponentPreflight => {
+  try {
+    return {
+      backend: { id: string(input.backend.id, "backend.id"), version: string(input.backend.version, "backend.version") },
+      components: {
+        model: suppliedIdentity(input.model, "model"),
+        controller: suppliedIdentity(input.controller, "controller"),
+        extractor: input.extractor ? suppliedIdentity(input.extractor, "extractor") : null,
+      },
+    };
+  } catch (cause) {
+    throw new RunPreflightError(cause instanceof Error ? cause.message : "runtime component identity is invalid", cause);
+  }
+};
+
 const safeNonce = (nonce: string): string => {
   if (!NONCE.test(nonce)) throw new TypeError("run nonce must be 1-128 safe identifier characters");
   return nonce;
@@ -281,13 +318,8 @@ export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocum
   const program = validateProgram(input.program);
   const profile = validateProfileJson(plainJson(input.profile, "resolved profile"));
   const limits = validateLimits(plainJson(input.limits, "resolved limits"), profile);
-  const backendId = string(input.backend.id, "backend.id");
-  const backendVersion = string(input.backend.version, "backend.version");
-  const components: RunManifest["components"] = {
-    model: suppliedIdentity(input.model, "model"),
-    controller: suppliedIdentity(input.controller, "controller"),
-    extractor: input.extractor ? suppliedIdentity(input.extractor, "extractor") : null,
-  };
+  const preflight = preflightRunComponents(input);
+  const components = preflight.components;
   const nonce = safeNonce((input.createRunNonce ?? randomUUID)());
   const inputs = program.inputs.map((declared) => {
     const text = input.sources[declared.name] ?? "";
@@ -302,12 +334,12 @@ export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocum
   const manifest: RunManifest = {
     schemaVersion: RUN_MANIFEST_SCHEMA_VERSION,
     runtime: { package: "pi-rlm", packageVersion: RLM_RUNTIME_VERSION, dslVersion: RLM_DSL_VERSION },
-    run: { nonce, id: `run_${nonce}` },
+    run: { nonce, id: `run_${sha256(nonce)}` },
     program: plainJson(program, "normalized program"),
     inputs,
     profile: plainJson(profile, "resolved profile"),
     limits,
-    backend: { id: backendId, version: backendVersion },
+    backend: preflight.backend,
     components,
     prompts: promptBindings(program, inputs, profile, limits, components),
     launchAuthorization: { mode: input.authorizationMode ?? "direct" },
@@ -468,7 +500,7 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
     throw new TypeError("manifest runtime is incompatible");
   const run = record(manifest.run, "manifest.run", ["nonce", "id"]);
   const nonce = string(run.nonce, "manifest.run.nonce");
-  if (!NONCE.test(nonce) || run.id !== `run_${nonce}`) throw new TypeError("manifest run identity is invalid");
+  if (!NONCE.test(nonce) || run.id !== `run_${sha256(nonce)}`) throw new TypeError("manifest run identity is invalid");
   const program = validateProgram(manifest.program);
   const rawInputs = array(manifest.inputs, "manifest.inputs");
   if (rawInputs.length !== program.inputs.length) throw new TypeError("manifest inputs do not match program");

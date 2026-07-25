@@ -476,3 +476,68 @@ describe("reviewed accounting boundaries", () => {
     }
   });
 });
+
+describe("canonical provider request identity", () => {
+  const identityModel = (route: string): import("../shell/model/client.ts").ModelClient => ({
+    id: "identity-model",
+    identity: { id: "test/identity-model", version: "1", configuration: { route } },
+    async complete() { throw new Error("unused"); },
+  });
+
+  test("binds model route and every ordered strict-JSON request field", async () => {
+    const { providerRequestIdentity } = await import("./provider.ts");
+    const client = identityModel("provider/base");
+    const base = {
+      prompt: "same prompt",
+      system: "system-a",
+      context: ["first", "second"],
+      schema: { type: "object", required: ["value"] },
+      maxOutputTokens: 64,
+      model: "provider/model-a",
+      thinking: "low",
+      temperature: 0,
+      reasoning: { effort: "low" },
+      providerOptions: { vendor: { mode: "a" } },
+      output: { format: "json" },
+    } as unknown as ModelRequest;
+    const hash = (request: ModelRequest, model = client) => providerRequestIdentity(model, request).sha256;
+    const baseline = hash(base);
+    const changes = [
+      { ...base, system: "system-b" },
+      { ...base, context: ["second", "first"] },
+      { ...base, context: ["first", "changed"] },
+      { ...base, schema: { type: "string" } },
+      { ...base, maxOutputTokens: 65 },
+      { ...base, model: "provider/model-b" },
+      { ...base, thinking: "high" },
+      { ...base, temperature: 1 },
+      { ...base, reasoning: { effort: "high" } },
+      { ...base, providerOptions: { vendor: { mode: "b" } } },
+      { ...base, output: { format: "text" } },
+    ] as unknown as ModelRequest[];
+    for (const changed of changes) expect(hash(changed)).not.toBe(baseline);
+    expect(hash(base, identityModel("provider/other"))).not.toBe(baseline);
+  });
+
+  test("rejects request accessors and nested accessors without invoking them", async () => {
+    const { providerRequestIdentity } = await import("./provider.ts");
+    let getterCalls = 0;
+    const top = {} as ModelRequest;
+    Object.defineProperty(top, "prompt", {
+      enumerable: true,
+      get() { getterCalls++; return "secret"; },
+    });
+    expect(() => providerRequestIdentity(identityModel("provider/base"), top)).toThrow("accessor");
+
+    const schema = { type: "object" } as Record<string, unknown>;
+    Object.defineProperty(schema, "description", {
+      enumerable: true,
+      get() { getterCalls++; return "secret"; },
+    });
+    expect(() => providerRequestIdentity(identityModel("provider/base"), {
+      prompt: "safe",
+      schema: schema as never,
+    })).toThrow("accessor");
+    expect(getterCalls).toBe(0);
+  });
+});
