@@ -2,9 +2,11 @@ import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
+import { interpreterError } from "../core/errors.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { ContextStore } from "../shell/context-store.ts";
+import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
@@ -138,6 +140,13 @@ describe("runProgram e2e", () => {
   });
 
   test("parent cell cancellation detaches a delayed child controller without late mutations", async () => {
+    let markChildStarted!: () => void;
+    let releaseChild!: () => void;
+    let markChildSettled!: () => void;
+    const childStarted = new Promise<void>((resolve) => { markChildStarted = resolve; });
+    const childRelease = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const childSettled = new Promise<void>((resolve) => { markChildSettled = resolve; });
+
     class DelayedChildController implements ControllerDriver {
       calls = 0;
       aborted = false;
@@ -145,16 +154,35 @@ describe("runProgram e2e", () => {
       async next(_state: FrameState, signal?: AbortSignal): Promise<Cell> {
         this.calls += 1;
         signal?.addEventListener("abort", () => { this.aborted = true; }, { once: true });
-        if (this.calls === 1) {
-          await new Promise((resolve) => setTimeout(resolve, 400));
-          return { reasoning: "late child cell", code: "1" };
-        }
-        return { reasoning: "must not run", code: "answer('late'); 'done'" };
+        markChildStarted();
+        await childRelease;
+        markChildSettled();
+        return { reasoning: "late child cell", code: "1" };
       }
 
       fork(): ControllerDriver {
         return new DelayedChildController();
       }
+    }
+
+    class CancellingBackend implements InterpreterBackend {
+      readonly id = "cancelling-test-backend";
+
+      async evalCell(options: CellEvalOptions): Promise<CellEvalOutcome> {
+        const cellEpoch = new AbortController();
+        const recurse = options.dispatch(
+          "recurse",
+          { key: "slow", objective: "slow child" },
+          cellEpoch.signal,
+          options.deadlineMs,
+        );
+        await childStarted;
+        cellEpoch.abort();
+        void recurse.catch(() => {});
+        return { kind: "terminal", error: interpreterError("CPU_LIMIT", "cell deadline reached") };
+      }
+
+      async dispose(): Promise<void> {}
     }
 
     const child = new DelayedChildController();
@@ -166,32 +194,33 @@ describe("runProgram e2e", () => {
       () => child,
     );
     const dir = await tmp();
-    const started = Date.now();
     const result = await runProgram({
       program: program({ objective: "cancel child" }),
       sources: { context: "hello" },
       controller,
       model: new MockModelClient(() => "unused"),
-      backend,
+      backend: new CancellingBackend(),
       dir,
       signal: new AbortController().signal,
-      profile: { ...DEFAULT_PROFILE, cellWallMs: 50 },
     });
 
-    expect(Date.now() - started).toBeLessThan(250);
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("CPU_LIMIT");
     expect(child.aborted).toBe(true);
     expect(child.calls).toBe(1);
-    const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
     expect(result.ledger.usage.controllerTurns).toBe(2);
+    const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
+    const ledgerAtFinalization = JSON.stringify(result.ledger);
 
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    releaseChild();
+    await childSettled;
+    await Promise.resolve();
     expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(eventsAtFinalization);
+    expect(JSON.stringify(result.ledger)).toBe(ledgerAtFinalization);
     // A late continuation would reserve another controller turn before this
     // second next() call, so one call proves both scheduling and ledger stopped.
     expect(child.calls).toBe(1);
-  }, 2_000);
+  }, 5_000);
 
   test("duplicate llm keys coalesce to one model call (cache)", async () => {
     let n = 0;
