@@ -98,6 +98,23 @@ export const validateProfile = (profile: Profile): void => {
     ["contextMaxChunks", profile.contextMaxChunks],
     ["contextMaxPatternBytes", profile.contextMaxPatternBytes],
   ] as const) safeInteger(name, value, false);
+  for (const [name, value] of [
+    ["trajectory.headEntries", profile.trajectory.headEntries],
+    ["trajectory.tailEntries", profile.trajectory.tailEntries],
+    ["trajectory.codeHeadBytes", profile.trajectory.codeHeadBytes],
+    ["trajectory.codeTailBytes", profile.trajectory.codeTailBytes],
+    ["trajectory.reasoningMaxBytes", profile.trajectory.reasoningMaxBytes],
+  ] as const) safeInteger(name, value, true);
+  safeInteger(
+    "trajectory head/tail entry capacity",
+    profile.trajectory.headEntries + profile.trajectory.tailEntries,
+    true,
+  );
+  safeInteger(
+    "trajectory code preview capacity",
+    profile.trajectory.codeHeadBytes + profile.trajectory.codeTailBytes,
+    true,
+  );
 };
 
 export const resolveLimits = (profile: Profile, startMs: number): BudgetLimits => {

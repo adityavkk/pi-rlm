@@ -2,15 +2,21 @@ import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
+import { callError } from "../core/errors.ts";
 import type { RlmEvent } from "../core/journal.ts";
+import { canonicalStringify } from "../core/json.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
+import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
+import { JournalAppendError, JournalStore, type JournalAppendOutcome } from "../shell/journal-store.ts";
 import type { ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
+import { tokenReservation } from "./broker.ts";
 import { FunctionExtractor } from "./extractor.ts";
 import { MockController } from "./mock-controller.ts";
 import { ModelController } from "./model-controller.ts";
 import { DEFAULT_PROFILE } from "./profile.ts";
+import { ModelInvocationError } from "./provider.ts";
 import { runProgram } from "./run.ts";
 
 let backend: QuickJsBackend;
@@ -255,6 +261,175 @@ describe("tree-wide model accounting", () => {
       });
       await expect(work).rejects.toThrow("maxConcurrency must be a positive safe integer");
       expect(controllerCalls).toBe(0);
+      expect(await readdir(dir)).toEqual([]);
+    }
+  });
+});
+
+describe("reviewed accounting boundaries", () => {
+  test("token reservation grows with canonical structured-schema bytes", () => {
+    const small = { type: "object", properties: { value: { type: "string" } } };
+    const large = { ...small, description: "schema-content".repeat(400) };
+    const request = { prompt: "p", maxOutputTokens: 32 };
+    const expected = (schema: typeof small | typeof large) =>
+      Math.ceil(Buffer.byteLength(`p${canonicalStringify(schema)}`, "utf8") / 4) + 32;
+
+    expect(tokenReservation({ ...request, schema: small })).toBe(expected(small));
+    expect(tokenReservation({ ...request, schema: large })).toBe(expected(large));
+    expect(tokenReservation({ ...request, schema: large })).toBeGreaterThan(tokenReservation({ ...request, schema: small })!);
+  });
+
+  test("external extractor settles once when provider-attempt journal cache refresh fails", async () => {
+    const dir = await tmp();
+    class CacheFailJournal extends JournalStore {
+      private injected = false;
+      override async append(event: RlmEvent): Promise<JournalAppendOutcome> {
+        const outcome = await super.append(event);
+        if (!this.injected && event.type === "provider_attempted") {
+          this.injected = true;
+          return {
+            ...outcome,
+            statusCache: {
+              state: "failed",
+              error: new JournalAppendError("status_cache", true, new Error("injected")),
+            },
+          };
+        }
+        return outcome;
+      }
+    }
+    const result = await runProgram({
+      program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
+      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "external" } })),
+      journal: new CacheFailJournal(dir),
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      error: { code: "JOURNAL_FAILED", cause: { name: "JournalAppendError" } },
+      ledger: { usage: { logicalCalls: 1, attempts: 1, activeLeafCalls: 0 } },
+    });
+    expect((await events(dir)).filter((event) => event.type === "provider_attempted")).toHaveLength(1);
+  });
+
+  test("external extractor receives no nested completion capability at maxConcurrency one", async () => {
+    let argumentCount = 0;
+    const model = new MockModelClient(() => "must not run");
+    const extractor = new FunctionExtractor((...args) => {
+      argumentCount = args.length;
+      return { ok: true, value: { answer: "external" } };
+    });
+    const result = await runProgram({
+      program: program(), sources: {}, controller: new MockController([]), model, backend, dir: await tmp(),
+      signal: new AbortController().signal,
+      profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, maxConcurrency: 1 },
+      extractor,
+    });
+
+    expect(result).toMatchObject({ status: "completed", answer: { answer: "external" } });
+    expect(argumentCount).toBe(2);
+    expect(model.callCount).toBe(0);
+    expect(result.ledger.usage.activeLeafCalls).toBe(0);
+  });
+
+  test("same recurse key under two parent lineages runs isolated child frames", async () => {
+    const controller = {
+      async next(state: { objective: string }) {
+        if (state.objective === "account every model effect") return {
+          reasoning: "open siblings",
+          code: `
+            const [left, right] = await Promise.all([
+              recurse({ key: 'left', objective: 'left-parent' }),
+              recurse({ key: 'right', objective: 'right-parent' }),
+            ]);
+            answer({ answer: left.ok && right.ok ? left.value + right.value : 'failed' });`,
+        };
+        if (state.objective === "leaf") return { reasoning: "leaf", code: "answer('leaf')" };
+        return {
+          reasoning: "same nested key",
+          code: `const child = await recurse({ key: 'shared-child', objective: 'leaf' }); answer(child.value);`,
+        };
+      },
+      fork() { return this; },
+    };
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({ status: "completed", answer: { answer: "leafleaf" } });
+    expect(result.ledger.usage.framesOpened).toBe(4);
+    const shared = (await events(dir)).filter((event) =>
+      event.type === "call_committed" && event.kind === "recurse" && event.key === "shared-child");
+    expect(shared).toHaveLength(2);
+    expect(new Set(shared.map((event) => event.type === "call_committed" ? event.callId : "")).size).toBe(2);
+  });
+
+  test("failed recurse result is not cached and identical retry keeps its binding", async () => {
+    let childRuns = 0;
+    const controller = {
+      async next(state: { objective: string }) {
+        if (state.objective === "account every model effect") return {
+          reasoning: "retry child",
+          code: `
+            const first = await recurse({ key: 'retry-child', objective: 'transient-child' });
+            const second = await recurse({ key: 'retry-child', objective: 'transient-child' });
+            answer({ answer: !first.ok && second.ok ? second.value : 'failed' });`,
+        };
+        childRuns += 1;
+        if (childRuns === 1)
+          throw new ModelInvocationError(callError("FAILED", "transient provider failure"), ZERO_CALL_USAGE);
+        return { reasoning: "retry succeeds", code: "answer('retried')" };
+      },
+      fork() { return this; },
+    };
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused"), backend, dir,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({ status: "completed", answer: { answer: "retried" } });
+    expect(childRuns).toBe(2);
+    expect(result.ledger.usage.framesOpened).toBe(2);
+    const retried = (await events(dir)).filter((event) =>
+      event.type === "call_committed" && event.kind === "recurse" && event.key === "retry-child");
+    expect(retried.map((event) => event.type === "call_committed" && event.ok)).toEqual([false, true]);
+    expect(new Set(retried.map((event) => event.type === "call_committed" ? event.callId : "")).size).toBe(1);
+  });
+
+  test("every trajectory numeric field rejects negative, nonfinite, fractional, and unsafe values before effects", async () => {
+    const fields = ["headEntries", "tailEntries", "codeHeadBytes", "codeTailBytes", "reasoningMaxBytes"] as const;
+    const invalid = [-1, Number.NaN, Number.POSITIVE_INFINITY, 0.5, Number.MAX_SAFE_INTEGER + 1];
+    for (const field of fields) {
+      for (const value of invalid) {
+        const dir = await tmp();
+        const work = runProgram({
+          program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+          signal: new AbortController().signal,
+          profile: { ...DEFAULT_PROFILE, trajectory: { ...DEFAULT_PROFILE.trajectory, [field]: value } },
+        });
+        await expect(work).rejects.toThrow(`trajectory.${field} must be a nonnegative safe integer`);
+        expect(await readdir(dir)).toEqual([]);
+      }
+    }
+  });
+
+  test("trajectory projection capacity sums must remain safe integers", async () => {
+    for (const trajectory of [
+      { ...DEFAULT_PROFILE.trajectory, headEntries: Number.MAX_SAFE_INTEGER, tailEntries: 1 },
+      { ...DEFAULT_PROFILE.trajectory, codeHeadBytes: Number.MAX_SAFE_INTEGER, codeTailBytes: 1 },
+    ]) {
+      const dir = await tmp();
+      const work = runProgram({
+        program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+        signal: new AbortController().signal,
+        profile: { ...DEFAULT_PROFILE, trajectory },
+      });
+      await expect(work).rejects.toThrow("capacity");
       expect(await readdir(dir)).toEqual([]);
     }
   });

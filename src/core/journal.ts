@@ -165,7 +165,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       case "provider_attempted":
         break;
       case "key_bound": {
-        const registryKey = `${event.kind}\u0000${event.key}`;
+        const registryKey = `${event.frameId}\u0000${event.kind}\u0000${event.key}`;
         if (!keyBindings.has(registryKey)) keyBindings.set(registryKey, {
           frameId: event.frameId,
           kind: event.kind,

@@ -31,6 +31,8 @@ export interface KeyIdentityBinding {
 
 export interface FrameRef {
   readonly frameId: string;
+  /** Deterministic recurse ancestry; unlike scheduling ordinals, stable for identity and controller forks. */
+  readonly lineage?: string;
   readonly depth: number;
   readonly objective: string;
   readonly inputs: Readonly<Record<string, ContextDescriptor>>;

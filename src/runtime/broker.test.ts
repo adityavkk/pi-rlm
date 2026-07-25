@@ -331,7 +331,8 @@ describe("dispatchCall cancellation ownership", () => {
         new AbortController().signal,
         Date.now() + 5_000,
       ) as GuestCallResult;
-      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" }, usage: { attempts: 1, durationMs: 0 } });
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" }, usage: { attempts: 1 } });
+      expect(result.usage.durationMs).toBeGreaterThanOrEqual(0);
       expect(state.ledger.current.usage.tokensReserved).toBe(0);
       expect(state.ledger.current.usage.tokensUsed).toBe(0);
       expect(Object.values(state.ledger.current.usage).every(Number.isSafeInteger)).toBe(true);

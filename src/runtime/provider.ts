@@ -17,6 +17,7 @@ import {
 } from "../core/budget.ts";
 import { type CallError, callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
 import type { RlmEvent } from "../core/journal.ts";
+import { canonicalStringify } from "../core/json.ts";
 import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
 import {
   addUsage,
@@ -62,22 +63,28 @@ export interface ModelOperation {
   runExternal<T>(effect: () => Promise<T> | T): Promise<T>;
 }
 
-type TokenReservationRequest = Pick<ModelRequest, "prompt" | "system" | "context" | "maxOutputTokens">;
+type TokenReservationRequest = Pick<ModelRequest, "prompt" | "system" | "context" | "schema" | "maxOutputTokens">;
 
-/** Conservative complete-request estimate: all text plus enforced output cap. */
+/** Conservative complete-request estimate: all canonical request bytes plus enforced output cap. */
 export const tokenReservation = (request: TokenReservationRequest): number | undefined => {
   const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0 || maxOutputTokens > MAX_CALL_TOKENS)
     return undefined;
-  let inputCharacters = request.prompt.length;
-  const inputs = request.system === undefined
-    ? (request.context ?? [])
-    : [request.system, ...(request.context ?? [])];
-  for (const input of inputs) {
-    if (inputCharacters > Number.MAX_SAFE_INTEGER - input.length) return undefined;
-    inputCharacters += input.length;
+  const inputs = [request.prompt, ...(request.system === undefined ? [] : [request.system]), ...(request.context ?? [])];
+  if (request.schema !== undefined) {
+    try {
+      inputs.push(canonicalStringify(request.schema));
+    } catch {
+      return undefined;
+    }
   }
-  const inputTokens = Math.ceil(inputCharacters / 4);
+  let inputBytes = 0;
+  for (const input of inputs) {
+    const bytes = Buffer.byteLength(input, "utf8");
+    if (inputBytes > Number.MAX_SAFE_INTEGER - bytes) return undefined;
+    inputBytes += bytes;
+  }
+  const inputTokens = Math.ceil(inputBytes / 4);
   return inputTokens <= MAX_CALL_TOKENS - maxOutputTokens ? inputTokens + maxOutputTokens : undefined;
 };
 
@@ -230,7 +237,7 @@ export const createModelOperation = (
     usage: CallUsage,
     errorCode?: string,
   ): Promise<void> => {
-    await state.journal.append({
+    const appended = await state.journal.append({
       type: "provider_attempted",
       frameId: frame.frameId,
       operationId: options.operationId,
@@ -241,6 +248,7 @@ export const createModelOperation = (
       usage,
       ...(errorCode ? { errorCode } : {}),
     });
+    if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
   };
 
   const complete = async (client: ModelClient, request: ModelRequest): Promise<ModelResponse> => {
@@ -350,7 +358,20 @@ export const createModelOperation = (
       throw new ModelInvocationError(callError("CANCELLED", "external model operation cancelled"), aggregate);
     }
     let active = false;
+    let settled = false;
     const startedMs = state.clock.now();
+    const settleExternal = (): CallUsage => {
+      if (settled)
+        throw new ModelInvocationError(callError("INVALID_RESULT", "external model operation settled more than once"), aggregate);
+      const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
+      const settlement = settleAttemptUsage(state.ledger.current, 0, usage);
+      if (!settlement.ok) throw new ModelInvocationError(settlement.error, aggregate);
+      state.ledger.current = settlement.value;
+      settled = true;
+      const accountingError = addAccounting(usage);
+      if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
+      return usage;
+    };
     try {
       checkpoint();
       const reservationError = reserve(0);
@@ -360,27 +381,19 @@ export const createModelOperation = (
         throw new ModelInvocationError(callError("INVALID_RESULT", "model concurrency accounting diverged"), aggregate);
       state.ledger.current = acquired;
       active = true;
+
+      let value: T;
       try {
-        const value = await waitForAbort(Promise.resolve(effect()), options.signal);
-        const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
-        const settled = settleAttemptUsage(state.ledger.current, 0, usage);
-        if (!settled.ok) throw new ModelInvocationError(settled.error, aggregate);
-        state.ledger.current = settled.value;
-        const accountingError = addAccounting(usage);
-        if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-        await journal("ok", usage);
-        return value;
+        value = await waitForAbort(Promise.resolve(effect()), options.signal);
       } catch (error) {
-        if (error instanceof ModelInvocationError) throw error;
-        const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
-        const settled = settleAttemptUsage(state.ledger.current, 0, usage);
-        if (!settled.ok) throw new ModelInvocationError(settled.error, aggregate);
-        state.ledger.current = settled.value;
-        const accountingError = addAccounting(usage);
-        if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-        await journal(wasAborted(error, options.signal) ? "cancelled" : "error", usage, wasAborted(error, options.signal) ? "CANCELLED" : "FAILED");
+        const usage = settleExternal();
+        const cancelled = wasAborted(error, options.signal);
+        await journal(cancelled ? "cancelled" : "error", usage, cancelled ? "CANCELLED" : "FAILED");
         throw error;
       }
+      const usage = settleExternal();
+      await journal("ok", usage);
+      return value;
     } finally {
       if (active) state.ledger.current = releaseLeaf(state.ledger.current);
       release();

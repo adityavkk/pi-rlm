@@ -28,30 +28,51 @@ export interface ExtractorModelOperation {
 export interface Extractor {
   /**
    * `external` consumes one explicit logical operation and attempt because its
-   * internal provider usage is unknowable. `provider` must use `model.complete`.
+   * internal provider usage is unknowable. Only `provider` receives the
+   * separately accounted `model.complete` capability.
    */
   readonly accountingMode?: "external" | "provider";
   extract(
     evidence: ExtractorEvidence,
     signal: AbortSignal,
-    model: ExtractorModelOperation,
+    model?: ExtractorModelOperation,
   ): Promise<ExtractorResult>;
 }
 
+type ExternalExtractorFn = (
+  evidence: ExtractorEvidence,
+  signal: AbortSignal,
+) => Promise<ExtractorResult> | ExtractorResult;
+
+type ProviderExtractorFn = (
+  evidence: ExtractorEvidence,
+  signal: AbortSignal,
+  model: ExtractorModelOperation,
+) => Promise<ExtractorResult> | ExtractorResult;
+
 export class FunctionExtractor implements Extractor {
+  private readonly fn: ExternalExtractorFn | ProviderExtractorFn;
+  readonly accountingMode: "external" | "provider";
+
+  constructor(fn: ExternalExtractorFn, accountingMode?: "external");
+  constructor(fn: ProviderExtractorFn, accountingMode: "provider");
   constructor(
-    private readonly fn: (
-      evidence: ExtractorEvidence,
-      signal: AbortSignal,
-      model: ExtractorModelOperation,
-    ) => Promise<ExtractorResult> | ExtractorResult,
-    readonly accountingMode: "external" | "provider" = "external",
-  ) {}
+    fn: ExternalExtractorFn | ProviderExtractorFn,
+    accountingMode: "external" | "provider" = "external",
+  ) {
+    this.fn = fn;
+    this.accountingMode = accountingMode;
+  }
+
   async extract(
     evidence: ExtractorEvidence,
     signal: AbortSignal,
-    model: ExtractorModelOperation,
+    model?: ExtractorModelOperation,
   ): Promise<ExtractorResult> {
-    return this.fn(evidence, signal, model);
+    if (this.accountingMode === "provider") {
+      if (!model) throw new TypeError("provider extractor requires an accounted model operation");
+      return (this.fn as ProviderExtractorFn)(evidence, signal, model);
+    }
+    return (this.fn as ExternalExtractorFn)(evidence, signal);
   }
 }

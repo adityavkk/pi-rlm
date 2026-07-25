@@ -339,7 +339,9 @@ const runChild = async (
   const key = typeof args["key"] === "string" ? args["key"] : "recurse";
   const objective = typeof args["objective"] === "string" ? args["objective"] : "";
   const contexts = resolveContextRefs(state, args["context"], "context");
+  const parentLineage = parentFrame.lineage ?? parentFrame.frameId;
   const identity: JsonValue = {
+    parentLineage,
     objective,
     contexts: contexts.map((context) => context.sha256),
     profile: typeof args["profile"] === "string" ? args["profile"] : state.profile.name,
@@ -381,12 +383,13 @@ const runChild = async (
       logicalReserved = true;
 
       state.scopeUsage.set(callId, ZERO_CALL_USAGE);
-      const childFrameId = `${state.runId}:f${state.frameSeq.current++}`;
+      const childFrameId = `${state.runId}:frame:${callId}`;
       await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
       if (signal.aborted) return cancelled();
 
       const childFrame: FrameRef = {
         frameId: childFrameId,
+        lineage: callId,
         depth: parentFrame.depth + 1,
         objective,
         inputs,
@@ -421,7 +424,7 @@ const runChild = async (
         cached: false,
         ok: callResult.ok,
         usage,
-      }, signal, deadlineMs);
+      }, signal, deadlineMs, callResult.ok);
       logicalReserved = false;
       return retained;
     } catch (error) {

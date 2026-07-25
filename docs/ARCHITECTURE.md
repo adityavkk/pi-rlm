@@ -133,8 +133,8 @@ accounting remains separate from stored bytes.
 
 `src/runtime/provider.ts` is the only production location that calls
 `ModelClient.complete`. It validates the complete request, estimates all system,
-prompt, context, and enforced-output tokens, then atomically reserves the
-logical operation (on its first attempt), attempt, tokens, and concurrency slot
+prompt, context, canonical structured-schema, and enforced-output tokens, then
+atomically reserves the logical operation (on its first attempt), attempt, tokens, and concurrency slot
 before entering the provider. Every exit settles finite reported tokens, cost,
 and duration; `finally` releases token and concurrency reservations. Reported
 token overshoot remains charged and blocks later reservations.
@@ -146,10 +146,10 @@ token overshoot remains charged and blocks later reservations.
 | Leaf `llm`, valid primary | 1 | 1 | `CallResult`, `call_committed`, tree ledger |
 | Leaf structured repair | 1 | 2 | combined on the same leaf operation |
 | Provider fallback extractor | 1 | provider completions | extractor provider events and tree ledger |
-| External custom extractor | 1 | 1 explicit opaque operation | zero reported tokens/cost, measured host duration |
-| `recurse` | 1 frame operation | 0 itself | subtree provider usage copied into its result, never re-settled |
+| External custom extractor | 1 | 1 explicit opaque operation | zero reported tokens/cost, measured host duration; no nested completion capability |
+| `recurse` | 1 frame operation | 0 itself | parent-lineage-scoped identity; subtree provider usage copied into its result, never re-settled |
 | Child-frame controller/leaf | their own operations | each provider completion | tree ledger once; propagated to ancestor recurse scopes |
-| Cache/coalesced waiter | 0 additional | 0 additional | cached committed result |
+| Successful cache/coalesced waiter | 0 additional | 0 additional | cached committed result; failed recurse results remain retryable |
 
 Controller turns and provider attempts are independent limits. A controller
 turn is not entered when no attempt remains. `maxAttempts: 0` therefore invokes
@@ -158,10 +158,18 @@ before spend.
 
 Extractor implementations declare `accountingMode`. `provider` extractors must
 use the supplied completion capability and fail if they return without doing
-so. `external` extractors never receive a raw model client; because arbitrary
-external code cannot report internal provider accounting, the runtime charges
-one explicit logical operation and attempt. This is an opaque-operation
-contract, not a claim about hidden transport token usage.
+so. `external` extractors receive no completion capability while holding their
+leaf slot; because arbitrary external code cannot report internal provider
+accounting, the runtime charges one explicit logical operation and attempt.
+Settlement and scoped aggregation happen once before journal persistence, so a
+typed journal failure cannot charge the opaque operation twice. This is an
+opaque-operation contract, not a claim about hidden transport token usage.
+
+Recurse call identity and key binding include the deterministic parent controller
+lineage. Equal calls under one parent coalesce, while equal keys in separate
+parent frames have independent results and cancellation. Only successful child
+results enter `callCache`; failed attempts are journaled but may retry against
+the durable key binding.
 
 Pi 0.80.10's public `ModelRuntime.completeSimple` options support `maxRetries`.
 `PiModelClient` sets it to `0`, verified with an adapter fake, so one boundary

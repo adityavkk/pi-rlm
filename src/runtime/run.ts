@@ -396,6 +396,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     };
     const rootFrame: FrameRef = {
       frameId: rootFrameId,
+      lineage: rootFrameId,
       depth: 0,
       objective: input.program.objective,
       inputs,
@@ -434,12 +435,11 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
         signal: scope.signal,
         deadlineMs: limits.deadlineMs,
       });
-      const extract = () => input.extractor!.extract(evidence, scope.signal, {
-        complete: (request) => operation.complete(state.model, request),
-      });
       const extracted = input.extractor.accountingMode === "provider"
-        ? await waitForAbort(extract(), scope.signal)
-        : await operation.runExternal(extract);
+        ? await waitForAbort(input.extractor.extract(evidence, scope.signal, {
+            complete: (request) => operation.complete(state.model, request),
+          }), scope.signal)
+        : await operation.runExternal(() => input.extractor!.extract(evidence, scope.signal));
       if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
         throw new ModelInvocationError(
           { code: "INVALID_REQUEST", message: "provider extractor returned without using the accounting boundary", retryable: false },

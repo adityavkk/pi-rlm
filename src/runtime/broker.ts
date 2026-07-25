@@ -99,7 +99,10 @@ interface KeyClaim {
   readonly identity: JsonValue;
 }
 
-const keyRegistryId = (kind: CallKind, key: string): string => `${kind}\u0000${key}`;
+const keyRegistryId = (kind: CallKind, key: string, frame: FrameRef): string =>
+  kind === "recurse"
+    ? `${kind}\u0000${frame.lineage ?? frame.frameId}\u0000${key}`
+    : `${kind}\u0000${key}`;
 
 /** Atomically validate and bind stable keys before any reservation or effect. */
 export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Promise<void> => {
@@ -107,7 +110,7 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
   for (const claim of claims) {
     const canonicalIdentity = canonicalStringify(claim.identity);
     const normalized = { ...claim, canonicalIdentity, identityHash: identityHash(state.hasher, claim.identity) };
-    const id = keyRegistryId(claim.kind, claim.key);
+    const id = keyRegistryId(claim.kind, claim.key, claim.frame);
     const prior = requested.get(id);
     if (prior && prior.canonicalIdentity !== canonicalIdentity)
       throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
@@ -145,7 +148,7 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
         ready,
         state: "pending",
       };
-      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), binding);
+      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key, claim.frame), binding);
       return { claim, binding, resolveReady, rejectReady };
     });
     // Observe every deferred before journal I/O can reject one. This also makes
@@ -169,12 +172,12 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
         if (error instanceof JournalAppendError && error.eventDurable) {
           binding.state = "durable_failed";
           binding.error = error;
-        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key)) === binding) {
-          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key));
+        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key, claim.frame)) === binding) {
+          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key, claim.frame));
         }
         current.rejectReady(error);
         for (const remaining of installed.slice(index + 1)) {
-          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key);
+          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key, remaining.claim.frame);
           if (state.keyIdentities.get(id) === remaining.binding) state.keyIdentities.delete(id);
           remaining.rejectReady(error);
         }
@@ -469,6 +472,7 @@ export const retainCallResult = async (
   event: Extract<RlmEvent, { type: "call_committed" }>,
   signal: AbortSignal,
   deadlineMs?: number,
+  cacheResult = true,
 ): Promise<GuestCallResult> => {
   checkpointCall(state, signal, deadlineMs);
   const release = await state.contextSemaphore.acquire(signal);
@@ -498,6 +502,10 @@ export const retainCallResult = async (
       journalFailure = error;
     }
     if (!journalCommitted) throw new Error("call journal event ignored after terminal");
+    if (!cacheResult) {
+      if (journalFailure) throw journalFailure;
+      return result;
+    }
 
     checkpointCall(state, signal, deadlineMs);
     const reserved = reserveStoredBytes(state.ledger, retainedJsonBytes(result as unknown as JsonValue));
