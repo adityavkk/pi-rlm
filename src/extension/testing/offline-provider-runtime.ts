@@ -1,4 +1,4 @@
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createAgentSessionFromServices,
@@ -66,6 +66,7 @@ export interface OfflineProviderRuntimeFixture {
   readonly state: OfflineProviderState;
   readonly runRoot: string;
   readEvents(): Promise<RlmEvent[]>;
+  readJournalBytes(): Promise<Buffer>;
   restoreFetchTripwire(): void;
   dispose(): Promise<void>;
 }
@@ -135,6 +136,7 @@ const findRunDirectory = async (root: string): Promise<string> => {
 export const createOfflineProviderRuntimeFixture = async (
   root: string,
   mode: OfflineProviderMode = "success",
+  options: { readonly setupFault?: "after-model-runtime" | "after-agent-runtime" } = {},
 ): Promise<OfflineProviderRuntimeFixture> => {
   const originalFetch = globalThis.fetch;
   let installedFetch: typeof fetch;
@@ -155,7 +157,12 @@ export const createOfflineProviderRuntimeFixture = async (
     throw new Error("offline provider fixture blocked fetch");
   }) as unknown as typeof fetch;
   globalThis.fetch = installedFetch;
+  const restoreFetchTripwire = (): void => {
+    if (globalThis.fetch === installedFetch) globalThis.fetch = originalFetch;
+  };
+  let runtime: AgentSessionRuntime | undefined;
 
+  try {
   const credentials = new InMemoryCredentialStore();
   const modelRuntime = await ModelRuntime.create({
     credentials,
@@ -163,6 +170,7 @@ export const createOfflineProviderRuntimeFixture = async (
     modelsPath: null,
     allowModelNetwork: false,
   });
+  if (options.setupFault === "after-model-runtime") throw new Error("injected offline fixture setup fault");
 
   const streamSimple = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
     const stream = createAssistantMessageEventStream();
@@ -180,7 +188,10 @@ export const createOfflineProviderRuntimeFixture = async (
     });
     resolveStarted();
 
-    const finish = (final: AssistantMessage): void => {
+    let settled = false;
+    const finish = (final: AssistantMessage): boolean => {
+      if (settled) return false;
+      settled = true;
       if (final.stopReason === "error" || final.stopReason === "aborted") {
         stream.push({ type: "error", reason: final.stopReason, error: final });
       } else {
@@ -188,6 +199,7 @@ export const createOfflineProviderRuntimeFixture = async (
         stream.push({ type: "done", reason: final.stopReason, message: final });
       }
       stream.end(final);
+      return true;
     };
 
     if (mode === "success") {
@@ -207,12 +219,8 @@ export const createOfflineProviderRuntimeFixture = async (
     else options?.signal?.addEventListener("abort", abort, { once: true });
     late = () => {
       state.lateEmissionAttempts += 1;
-      try {
-        finish(message(model, "stop", [{ type: "text", text: controllerCell }]));
+      if (finish(message(model, "stop", [{ type: "text", text: controllerCell }])))
         state.lateEmissionAccepted += 1;
-      } catch {
-        // EventStream rejects mutation after its terminal result.
-      }
     };
     return stream;
   };
@@ -272,12 +280,11 @@ export const createOfflineProviderRuntimeFixture = async (
     });
     return { ...created, services, diagnostics: services.diagnostics };
   };
-  const runtime = await createAgentSessionRuntime(createRuntime, { cwd: root, agentDir, sessionManager });
-  const restoreFetchTripwire = (): void => {
-    if (globalThis.fetch === installedFetch) globalThis.fetch = originalFetch;
-  };
+  runtime = await createAgentSessionRuntime(createRuntime, { cwd: root, agentDir, sessionManager });
+  if (options.setupFault === "after-agent-runtime") throw new Error("injected offline fixture setup fault");
+  const readyRuntime = runtime;
   return {
-    runtime,
+    runtime: readyRuntime,
     sessionManager,
     modelRuntime,
     state,
@@ -288,10 +295,18 @@ export const createOfflineProviderRuntimeFixture = async (
         return result.value;
       });
     },
+    async readJournalBytes() {
+      return readFile(join(await findRunDirectory(runRoot), "events.jsonl"));
+    },
     restoreFetchTripwire,
     async dispose() {
-      try { await runtime.dispose(); }
+      try { await readyRuntime.dispose(); }
       finally { restoreFetchTripwire(); }
     },
   };
+  } catch (error) {
+    try { await runtime?.dispose(); }
+    finally { restoreFetchTripwire(); }
+    throw error;
+  }
 };

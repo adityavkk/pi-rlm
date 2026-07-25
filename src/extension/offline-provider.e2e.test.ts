@@ -1,12 +1,8 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import type {
-  AgentSessionEvent,
-  ExtensionUIContext,
-  ModelRuntime,
-} from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent, ExtensionUIContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
 import { buildBasePrompt } from "../runtime/controller-prompt.ts";
 import {
@@ -16,12 +12,17 @@ import {
   OFFLINE_CONTROLLER_MODEL,
   OFFLINE_PROVIDER_ID,
   type OfflineProviderMode,
+  type OfflineProviderRuntimeFixture,
 } from "./testing/offline-provider-runtime.ts";
 
 // Compile-time public-API guard: fixture registration uses the pinned exported method.
 type PublicProviderRegistration = ModelRuntime["registerProvider"];
 const publicProviderRegistration: PublicProviderRegistration | undefined = undefined;
 void publicProviderRegistration;
+
+const EXPECTED_REQUEST_SHA = "c0989fab00392eca206590ba5b1c301ffa4d4410f9f8b1547f344caaa4cba823";
+const ANSWER_SHA = "a1962b5a13bb394a10d97d3c6acadac0d02bc24ddebe0f80d05a96b9b4dddf90";
+const ANSWER_REF = `ctx_${ANSWER_SHA}`;
 
 const ui = {
   setStatus() {},
@@ -61,92 +62,121 @@ const withTimeout = async <T>(work: Promise<T>, label: string, ms = 3_000): Prom
   }
 };
 
-const isolatedEnv = (root: string): Record<string, string> => ({
-  HOME: join(root, "home"),
-  XDG_CONFIG_HOME: join(root, "config"),
-  XDG_STATE_HOME: join(root, "state"),
-  XDG_CACHE_HOME: join(root, "cache"),
-  PATH: process.env["PATH"] ?? "",
-  NO_COLOR: "1",
-  PI_OFFLINE: "1",
-});
-
-const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
-
 const runCommand = async (mode: OfflineProviderMode) => {
   const root = await mkdtemp(join(tmpdir(), `pi-rlm-offline-${mode}-`));
-  const fixture = await createOfflineProviderRuntimeFixture(root, mode);
-  const observed: AgentSessionEvent[] = [];
-  const unsubscribe = fixture.runtime.session.subscribe((event) => observed.push(event));
-  await fixture.runtime.session.bindExtensions({ mode: "print", uiContext: ui });
-  return { root, fixture, observed, unsubscribe };
+  let fixture: OfflineProviderRuntimeFixture | undefined;
+  let unsubscribe: (() => void) | undefined;
+  try {
+    fixture = await createOfflineProviderRuntimeFixture(root, mode);
+    const observed: AgentSessionEvent[] = [];
+    unsubscribe = fixture.runtime.session.subscribe((event) => observed.push(event));
+    await fixture.runtime.session.bindExtensions({ mode: "print", uiContext: ui });
+    return { root, fixture, observed, unsubscribe };
+  } catch (error) {
+    unsubscribe?.();
+    await fixture?.dispose();
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+};
+
+const runIdentity = (events: readonly RlmEvent[]) => {
+  const starts = events.filter((event) => event.type === "run_started");
+  expect(starts).toHaveLength(1);
+  const runId = starts[0]!.runId;
+  const frameId = `${runId}:f0`;
+  expect(runId).toMatch(/^run_[a-f0-9]{64}$/);
+  expect(events.filter((event) => "runId" in event && event.runId === runId)).toHaveLength(2);
+  expect(events.filter((event) => "frameId" in event && event.frameId !== frameId)).toHaveLength(0);
+  const terminals = terminalEvents(events);
+  expect(terminals).toHaveLength(1);
+  expect(terminals[0]!.runId).toBe(runId);
+  return { runId, frameId, terminal: terminals[0]! };
+};
+
+const exactAttempt = (
+  event: Extract<RlmEvent, { type: "provider_attempted" }>,
+  frameId: string,
+  outcome: "ok" | "error" | "cancelled",
+) => {
+  const errorCode = outcome === "ok" ? undefined : outcome === "error" ? "FAILED" : "CANCELLED";
+  const tokens = outcome === "ok"
+    ? { inputTokens: 11, outputTokens: 7, totalTokens: 18, costUsd: 0 }
+    : outcome === "error" ? { inputTokens: 11, outputTokens: 0, totalTokens: 11, costUsd: 0 } : {};
+  expect(event).toEqual({
+    type: "provider_attempted",
+    frameId,
+    operationId: `${frameId}:controller:1`,
+    kind: "controller",
+    key: "1",
+    attempt: 1,
+    outcome,
+    usage: { attempts: 1, ...tokens, durationMs: event.usage.durationMs },
+    requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
+    requestSha256: EXPECTED_REQUEST_SHA,
+    ...(errorCode ? { errorCode } : {}),
+  });
+  expect(Number.isSafeInteger(event.usage.durationMs)).toBe(true);
+  expect(event.usage.durationMs).toBeGreaterThanOrEqual(0);
 };
 
 /** Real extension -> PiModelClient -> ModelRuntime -> controller -> QuickJS -> journal -> session. */
 describe("credential-free offline Pi provider E2E", () => {
-  test("success commits one exact controller request and bounded completed session result", async () => {
+  test("success commits one exact request/cell/answer sequence and completed session result", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("success");
     try {
       await withTimeout(fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }), "success prompt");
       expect(fixture.state.fetchCalls).toBe(0);
       expect(fixture.state.calls).toHaveLength(1);
       const call = fixture.state.calls[0]!;
+      expect(call.model).toEqual({ provider: OFFLINE_PROVIDER_ID, id: "controller", api: "pi-rlm-offline-api" });
       expect(`${call.model.provider}/${call.model.id}`).toBe(OFFLINE_CONTROLLER_MODEL);
-      expect(call.model.provider).toBe(OFFLINE_PROVIDER_ID);
       expect(call.options).toEqual({ maxRetries: 0, maxTokens: 512, hasSignal: true, envKeys: [] });
       expect(call.signal?.aborted).toBe(false);
       expect(call.context.systemPrompt).toBe(buildBasePrompt());
       expect(call.context.messages).toHaveLength(1);
-      const controllerPrompt = call.context.messages[0];
-      expect(controllerPrompt?.role).toBe("user");
-      expect(controllerPrompt?.content).toEqual(expect.stringContaining("Offline provider E2E"));
-      expect(controllerPrompt?.content).toEqual(expect.stringContaining("context (20 bytes, ~5 tokens, sha b9fa0ae0)"));
+      expect(call.context.messages[0]?.role).toBe("user");
+      expect(call.context.messages[0]?.content).toEqual(expect.stringContaining("Offline provider E2E"));
+      expect(call.context.messages[0]?.content).toEqual(expect.stringContaining("context (20 bytes, ~5 tokens, sha b9fa0ae0)"));
 
       const events = await fixture.readEvents();
-      const attempts = events.filter((event) => event.type === "provider_attempted");
+      const { runId, frameId, terminal } = runIdentity(events);
+      expect(events.map((event) => event.type)).toEqual([
+        "run_started", "frame_opened", "provider_attempted", "workspace_committed",
+        "cell_committed", "answer_committed", "frame_closed", "run_completed",
+      ]);
+      const attempts = events.filter((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
+        event.type === "provider_attempted");
       expect(attempts).toHaveLength(1);
-      expect(attempts[0]).toMatchObject({
-        type: "provider_attempted",
-        kind: "controller",
-        key: "1",
-        attempt: 1,
-        outcome: "ok",
-        requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
-        usage: { attempts: 1, inputTokens: 11, outputTokens: 7, totalTokens: 18 },
+      exactAttempt(attempts[0]!, frameId, "ok");
+      const cell = events.find((event): event is Extract<RlmEvent, { type: "cell_committed" }> => event.type === "cell_committed")!;
+      expect(cell).toEqual({
+        type: "cell_committed", frameId, iteration: 1, reasoning: "deterministic offline controller",
+        codeHash: "b581cdccc04050ebd7286c9c59d58b9d6b97c3892936c6ab94b3d57bba823181",
+        hasResult: false, outputPreview: "null", outputBytes: 4, outputOmittedBytes: 0,
+        usage: attempts[0]!.usage, outputRef: ANSWER_REF, outputRefSha256: ANSWER_SHA, outputRefBytes: 36,
       });
-      expect(attempts[0]?.type === "provider_attempted" && attempts[0].requestSha256)
-        .toMatch(/^[a-f0-9]{64}$/);
-      expect(events.filter((event) => event.type === "cell_committed")).toHaveLength(1);
-      const answer = events.filter((event) => event.type === "answer_committed");
-      expect(answer).toHaveLength(1);
-      expect(answer[0]).toMatchObject({ completionMode: "answer" });
-      const terminals = terminalEvents(events);
-      expect(terminals).toHaveLength(1);
-      expect(terminals[0]).toMatchObject({
-        type: "run_completed",
-        completionMode: "answer",
-        outputRef: answer[0]?.type === "answer_committed" ? answer[0].outputRef : undefined,
+      expect(events.find((event) => event.type === "answer_committed")).toEqual({
+        type: "answer_committed", frameId, completionMode: "answer",
+        outputRef: ANSWER_REF, outputSha256: ANSWER_SHA, outputBytes: 36,
       });
+      expect(terminal).toEqual({ type: "run_completed", runId, completionMode: "answer", outputRef: ANSWER_REF });
 
       const messages = observed.map(customMessage).filter((value): value is CustomMessage => value !== undefined);
       expect(messages).toHaveLength(1);
       expect(Buffer.byteLength(messages[0]!.content, "utf8")).toBeLessThan(64 * 1024);
       const projection = JSON.parse(messages[0]!.content) as Record<string, any>;
-      expect(projection).toMatchObject({
-        status: "completed",
-        mode: "answer",
-        answer: { answer: OFFLINE_ANSWER },
-        output: { ref: terminals[0]?.type === "run_completed" ? terminals[0].outputRef : undefined },
+      expect(projection).toEqual({
+        answer: { answer: OFFLINE_ANSWER }, mode: "answer",
+        output: { bytes: 36, ref: ANSWER_REF, sha256: ANSWER_SHA }, runId, status: "completed",
+        truncation: { omittedBytes: 0, originalBytes: 36, truncated: false },
         usage: {
-          controllerTurns: 1,
-          logicalCalls: 1,
-          attempts: 1,
-          inputTokensUsed: 11,
-          outputTokensUsed: 7,
-          tokensUsed: 18,
-          activeLeafCalls: 0,
-          tokensReserved: 0,
+          activeLeafCalls: 0, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
+          inputTokensUsed: 11, logicalCalls: 1, outputTokensUsed: 7,
+          providerDurationMs: attempts[0]!.usage.durationMs, storedBytes: 58,
+          tokensReserved: 0, tokensUsed: 18,
         },
+        warningCodes: [],
       });
       const entries = fixture.sessionManager.getEntries().filter((entry) =>
         entry.type === "custom_message" && entry.customType === "pi-rlm-result");
@@ -159,40 +189,37 @@ describe("credential-free offline Pi provider E2E", () => {
     }
   });
 
-  test("typed provider error commits one failed attempt, one terminal, and failed session result", async () => {
+  test("typed provider error commits exact failed attempt/terminal and failed session result", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("error");
     try {
       await withTimeout(fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }), "failure prompt");
       expect(fixture.state.fetchCalls).toBe(0);
       expect(fixture.state.calls).toHaveLength(1);
-      expect(fixture.state.calls[0]?.options.maxRetries).toBe(0);
+      expect(fixture.state.calls[0]?.options).toEqual({ maxRetries: 0, maxTokens: 512, hasSignal: true, envKeys: [] });
       const events = await fixture.readEvents();
-      const attempts = events.filter((event) => event.type === "provider_attempted");
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]).toMatchObject({
-        type: "provider_attempted",
-        kind: "controller",
-        outcome: "error",
-        usage: { attempts: 1, inputTokens: 11, outputTokens: 0, totalTokens: 11 },
-      });
-      expect(attempts[0]?.type === "provider_attempted" && attempts[0].errorCode).toBeTruthy();
-      const terminals = terminalEvents(events);
-      expect(terminals).toHaveLength(1);
-      expect(terminals[0]?.type).toBe("run_failed");
-      expect(events.filter((event) => event.type === "run_cancelled" || event.type === "run_completed")).toHaveLength(0);
+      const { runId, frameId, terminal } = runIdentity(events);
+      expect(events.map((event) => event.type)).toEqual([
+        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_failed",
+      ]);
+      const attempt = events.find((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
+        event.type === "provider_attempted")!;
+      exactAttempt(attempt, frameId, "error");
+      expect(terminal).toEqual({ type: "run_failed", runId, code: "FAILED", message: "model provider failed" });
+      expect(events.find((event) => event.type === "frame_closed")).toEqual({ type: "frame_closed", frameId, state: "failed" });
 
       const messages = observed.map(customMessage).filter((value): value is CustomMessage => value !== undefined);
       expect(messages).toHaveLength(1);
       const projection = JSON.parse(messages[0]!.content) as Record<string, any>;
-      expect(projection["status"]).toBe("failed");
-      expect(projection["errorCode"]).toBe(terminals[0]?.type === "run_failed" ? terminals[0].code : undefined);
-      expect(projection["usage"]).toMatchObject({
-        controllerTurns: 1,
-        logicalCalls: 1,
-        attempts: 1,
-        tokensUsed: 11,
-        activeLeafCalls: 0,
-        tokensReserved: 0,
+      expect(projection).toEqual({
+        error: { code: "FAILED", message: "model provider failed" }, errorCode: "FAILED", mode: null,
+        output: null, runId, status: "failed",
+        truncation: { omittedBytes: 0, originalBytes: 0, truncated: false },
+        usage: {
+          activeLeafCalls: 0, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
+          inputTokensUsed: 11, logicalCalls: 1, outputTokensUsed: 0,
+          providerDurationMs: attempt.usage.durationMs, storedBytes: 20, tokensReserved: 0, tokensUsed: 11,
+        },
+        warningCodes: [],
       });
     } finally {
       unsubscribe();
@@ -201,145 +228,60 @@ describe("credential-free offline Pi provider E2E", () => {
     }
   });
 
-  test("public session replacement aborts pending provider and rejects late runtime mutation", async () => {
+  test("session replacement aborts once, retains cancellation, and rejects late mutation", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("pending");
     try {
       const prompt = fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" });
       await withTimeout(fixture.state.started, "provider start");
       expect(fixture.state.calls).toHaveLength(1);
+      expect(fixture.state.calls[0]?.options).toEqual({ maxRetries: 0, maxTokens: 512, hasSignal: true, envKeys: [] });
       await withTimeout(fixture.runtime.newSession(), "session replacement");
       await withTimeout(prompt, "cancelled prompt");
       expect(fixture.state.aborts).toBe(1);
       expect(fixture.state.calls[0]?.signal?.aborted).toBe(true);
       const events = await fixture.readEvents();
-      const attempts = events.filter((event) => event.type === "provider_attempted");
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]).toMatchObject({
-        type: "provider_attempted",
-        kind: "controller",
-        outcome: "cancelled",
-        usage: { attempts: 1 },
-      });
-      expect(terminalEvents(events)).toEqual([
-        expect.objectContaining({ type: "run_cancelled", code: "CANCELLED" }),
+      const { runId, frameId, terminal } = runIdentity(events);
+      expect(events.map((event) => event.type)).toEqual([
+        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_cancelled",
       ]);
-      expect(events.filter((event) => event.type === "cell_committed" || event.type === "answer_committed")).toHaveLength(0);
+      const attempt = events.find((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
+        event.type === "provider_attempted")!;
+      exactAttempt(attempt, frameId, "cancelled");
+      expect(Object.keys(attempt.usage).sort()).toEqual(["attempts", "durationMs"]);
+      expect(terminal).toEqual({ type: "run_cancelled", runId, code: "CANCELLED", message: "run cancelled by owner" });
+      expect(events.find((event) => event.type === "frame_closed")).toEqual({ type: "frame_closed", frameId, state: "cancelled" });
       expect(observed.map(customMessage).filter(Boolean)).toHaveLength(0);
 
-      const before = JSON.stringify(events);
-      const usageBefore = JSON.stringify(attempts[0]?.type === "provider_attempted" && attempts[0].usage);
+      const journalBefore = await fixture.readJournalBytes();
+      const eventsBefore = structuredClone(events);
+      const accountingBefore = structuredClone(attempt.usage);
       fixture.state.emitLate();
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(fixture.state.lateEmissionAttempts).toBe(1);
-      expect(JSON.stringify(await fixture.readEvents())).toBe(before);
-      expect(JSON.stringify(attempts[0]?.type === "provider_attempted" && attempts[0].usage)).toBe(usageBefore);
+      expect(fixture.state.lateEmissionAccepted).toBe(0);
+      expect(fixture.state.aborts).toBe(1);
+      expect(await fixture.readJournalBytes()).toEqual(journalBefore);
+      expect(await fixture.readEvents()).toEqual(eventsBefore);
+      expect(attempt.usage).toEqual(accountingBefore);
       expect(fixture.state.calls).toHaveLength(1);
       expect(fixture.state.fetchCalls).toBe(0);
+      expect(observed.map(customMessage).filter(Boolean)).toHaveLength(0);
     } finally {
       unsubscribe();
       await fixture.dispose();
       await rm(root, { recursive: true, force: true });
     }
   });
-});
 
-const runPrintAdapter = async (adapter: "text" | "json", outcome: "success" | "error") => {
-  const root = await mkdtemp(join(tmpdir(), `pi-rlm-native-${adapter}-${outcome}-`));
-  const statePath = join(root, "entries.json");
-  try {
-    const process = Bun.spawn(["bun", fixturePath, adapter, root, statePath, outcome], {
-      cwd: root,
-      env: isolatedEnv(root),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
-      process.exited,
-    ]);
-    const entries = JSON.parse(await readFile(statePath, "utf8")) as Array<Record<string, unknown>>;
-    return { stdout, stderr, exitCode, entries };
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-};
-
-describe("offline provider through public Pi adapters", () => {
-  test.each([
-    ["text", "success"], ["text", "error"], ["json", "success"], ["json", "error"],
-  ] as const)("runPrintMode %s exposes durable %s outcome", async (adapter, outcome) => {
-    const result = await runPrintAdapter(adapter, outcome);
-    expect(result.exitCode).toBe(0);
-    expect(result.stderr).toBe("");
-    const entries = result.entries.filter((entry) =>
-      entry["type"] === "custom_message" && entry["customType"] === "pi-rlm-result");
-    expect(entries).toHaveLength(1);
-    const projection = JSON.parse(String(entries[0]?.["content"])) as Record<string, unknown>;
-    expect(projection["status"]).toBe(outcome === "success" ? "completed" : "failed");
-    if (adapter === "text") expect(result.stdout).toBe("");
-    else {
-      const events = result.stdout.trim().split("\n").filter(Boolean)
-        .map((line) => JSON.parse(line) as Record<string, any>);
-      expect(events.filter((event) => event["type"] === "message_end"
-        && event["message"]?.customType === "pi-rlm-result")).toHaveLength(1);
-    }
-  });
-
-  test.each(["success", "error"] as const)("runRpcMode exposes %s outcome and durable entry", async (outcome) => {
-    const root = await mkdtemp(join(tmpdir(), `pi-rlm-native-rpc-${outcome}-`));
-    const process = Bun.spawn(["bun", fixturePath, "rpc", root, join(root, "unused"), outcome], {
-      cwd: root,
-      env: isolatedEnv(root),
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const output: Array<Record<string, any>> = [];
-    const reader = process.stdout.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-    let requestedEntries = false;
-    const send = async (value: unknown): Promise<void> => {
-      process.stdin.write(`${JSON.stringify(value)}\n`);
-      await process.stdin.flush();
-    };
-    await send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
-    const readOutput = async (): Promise<void> => {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        pending += decoder.decode(chunk.value, { stream: true });
-        let newline: number;
-        while ((newline = pending.indexOf("\n")) >= 0) {
-          const line = pending.slice(0, newline);
-          pending = pending.slice(newline + 1);
-          if (!line) continue;
-          const event = JSON.parse(line) as Record<string, any>;
-          output.push(event);
-          if (!requestedEntries && event["type"] === "message_end"
-            && event["message"]?.customType === "pi-rlm-result") {
-            requestedEntries = true;
-            await send({ id: "entries", type: "get_entries" });
-          } else if (event["type"] === "response" && event["id"] === "entries") {
-            process.stdin.end();
-          }
-        }
-      }
-    };
+  test("setup fault disposes partial runtime and restores the fetch tripwire", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-offline-setup-fault-"));
+    const fetchBefore = globalThis.fetch;
     try {
-      await withTimeout(Promise.all([readOutput(), process.exited]), "RPC adapter", 10_000);
-      expect(await new Response(process.stderr).text()).toBe("");
-      expect(process.exitCode).toBe(0);
-      const message = output.find((event) => event["type"] === "message_end"
-        && event["message"]?.customType === "pi-rlm-result");
-      const projection = JSON.parse(message?.["message"]?.content ?? "null") as Record<string, unknown>;
-      expect(projection["status"]).toBe(outcome === "success" ? "completed" : "failed");
-      const response = output.find((event) => event["type"] === "response" && event["id"] === "entries");
-      expect(response?.["data"]?.entries.filter((entry: Record<string, unknown>) =>
-        entry["type"] === "custom_message" && entry["customType"] === "pi-rlm-result")).toHaveLength(1);
+      await expect(createOfflineProviderRuntimeFixture(root, "success", { setupFault: "after-agent-runtime" }))
+        .rejects.toThrow("injected offline fixture setup fault");
+      expect(globalThis.fetch).toBe(fetchBefore);
     } finally {
-      if (process.exitCode === null) process.kill();
+      if (globalThis.fetch !== fetchBefore) globalThis.fetch = fetchBefore;
       await rm(root, { recursive: true, force: true });
     }
   });
