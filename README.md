@@ -70,6 +70,12 @@ Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
   is guidance only and never authorizes spend. Every headless `rlm_run` call
   fails with `RLM_OPT_IN_REQUIRED`; there is no phrase or environment bypass.
 
+Completed, failed, and cancelled extension runs are retained under a private,
+host-owned state root for future recovery and bounded by age, count, and exact
+aggregate-byte policy. See [managed run retention](docs/run-retention.md) for
+platform paths, defaults, active-lease safety, and the explicit dry-run/force
+cleanup API. Retention is filesystem deletion, not secure erasure.
+
 Model routing is configured with environment variables (all default to a single
 model):
 
@@ -135,8 +141,7 @@ bun run typecheck # strict TypeScript
 
 - Phase 2: `agent()` delegation through `pi-subagents`, background runs, and the
   TUI inspector, widget, and approvals.
-- Phase 3: allowlisted `tools.call()`, checkpoints, retention, and the security
-  probe suite.
+- Phase 3: allowlisted `tools.call()`, checkpoints, and the security probe suite.
 - Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
   compaction, and ordinary subagent fan-out.
 

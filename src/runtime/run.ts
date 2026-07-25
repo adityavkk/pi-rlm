@@ -47,6 +47,13 @@ import { resolveControllerTurnObserver } from "./testing/controller-turn-observe
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
+export interface RunLifecycleHooks {
+  /** Pre-existing manager files allowed during the otherwise-exclusive manifest claim. */
+  readonly claimEntries: readonly string[];
+  /** Called after durable manifest publication and before journals or source snapshots. */
+  readonly onManifest: (runId: string) => Promise<void>;
+}
+
 export interface RunInput {
   readonly program: RlmProgram;
   readonly sources: Readonly<Record<string, string>>;
@@ -65,6 +72,8 @@ export interface RunInput {
   readonly createRunNonce?: () => string;
   /** Optional manifest persistence injection for fault testing. */
   readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
+  /** Host-managed lifecycle binding; custom run directories omit this. */
+  readonly runLifecycle?: RunLifecycleHooks;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
 }
@@ -341,7 +350,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const ledgerRef = { current: createLedger(limits) };
   const runId = document.manifest.run.id;
   try {
-    await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem);
+    await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem, input.runLifecycle?.claimEntries);
   } catch (error) {
     const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
     const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
@@ -349,6 +358,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       return { ...failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error), ledger: ledgerRef.current };
     throw error;
   }
+  await input.runLifecycle?.onManifest(runId);
   const rootFrameId = `${runId}:f0`;
   const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));

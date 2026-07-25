@@ -7,9 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -36,6 +34,11 @@ import {
   runProgram,
   type RunResult,
 } from "./src/runtime/index.ts";
+import {
+  ManagedRunStore,
+  RunRetentionError,
+  type ManagedRunStoreOptions,
+} from "./src/runtime/run-retention.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./src/runtime/abort.ts";
 import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
@@ -155,8 +158,12 @@ export interface RlmRuntimeDependencies {
   readonly createBackend?: () => InterpreterBackend | Promise<InterpreterBackend>;
   readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
   readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
+  /** Custom directories retain the legacy caller-owned lifecycle and are never swept. */
   readonly createRunDirectory?: () => Promise<string>;
   readonly createRunNonce?: () => string;
+  readonly runRetention?: ManagedRunStoreOptions;
+  /** Observer for detached cleanup after cancellation wins a directory-allocation race. */
+  readonly onRetentionError?: (error: RunRetentionError) => void;
 }
 
 const executeRun = async (
@@ -176,35 +183,69 @@ const executeRun = async (
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
   preflightRunComponents({ backend, model, controller });
-  const dirWork = (dependencies.createRunDirectory ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-run-"))))();
-  let dir: string;
+  if (dependencies.createRunDirectory) {
+    const dirWork = dependencies.createRunDirectory();
+    let dir: string;
+    try {
+      dir = await waitForAbort(dirWork, signal);
+    } catch (error) {
+      if (wasAborted(error, signal))
+        void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
+      throw error;
+    }
+    try {
+      throwIfAborted(signal);
+      const result = await runProgram({
+        program: request.program, sources: request.sources, controller, model, backend, dir, profile, signal,
+        authorizationMode, createRunNonce: dependencies.createRunNonce,
+      });
+      if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
+      return result;
+    } catch (error) {
+      await rm(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  const store = new ManagedRunStore(dependencies.runRetention);
+  const allocationWork = store.create();
+  let lease: Awaited<typeof allocationWork>;
   try {
-    dir = await waitForAbort(dirWork, signal);
+    lease = await waitForAbort(allocationWork, signal);
   } catch (error) {
-    if (wasAborted(error, signal))
-      void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
+    if (wasAborted(error, signal)) {
+      void allocationWork.then((lateLease) => lateLease.discard()).catch((cause: unknown) => {
+        const observed = cause instanceof RunRetentionError
+          ? cause
+          : new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "late managed allocation cleanup failed", cause);
+        (dependencies.onRetentionError ?? ((failure) => console.error(failure.code, failure.message)))(observed);
+      });
+    }
     throw error;
   }
+
+  let result: RunResult;
   try {
     throwIfAborted(signal);
-    const result = await runProgram({
-      program: request.program,
-      sources: request.sources,
-      controller,
-      model,
-      backend,
-      dir,
-      profile,
-      signal,
-      authorizationMode,
-      createRunNonce: dependencies.createRunNonce,
+    result = await runProgram({
+      program: request.program, sources: request.sources, controller, model, backend, dir: lease.dir, profile, signal,
+      authorizationMode, createRunNonce: dependencies.createRunNonce, runLifecycle: lease.lifecycle,
     });
-    if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
-    return result;
-  } catch (error) {
-    await rm(dir, { recursive: true, force: true });
-    throw error;
+  } catch (primary) {
+    const cleanupFailures: unknown[] = [];
+    try { await lease.finish("failed"); } catch (error) { cleanupFailures.push(error); }
+    try { await store.cleanup(); } catch (error) { cleanupFailures.push(error); }
+    if (cleanupFailures.length > 0)
+      throw new RunRetentionError(
+        "RUN_RETENTION_CLEANUP_FAILED",
+        "run failure and managed lifecycle cleanup both failed",
+        new AggregateError([primary, ...cleanupFailures]),
+      );
+    throw primary;
   }
+  await lease.finish(result.status, result.runId);
+  await store.cleanup();
+  return result;
 };
 
 export interface RlmExtensionDependencies {

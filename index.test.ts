@@ -1,10 +1,10 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "./src/core/journal.ts";
 import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controller.ts";
-import { DEFAULT_PROFILE, type RunResult } from "./src/runtime/index.ts";
+import { DEFAULT_PROFILE, ManagedRunStore, type RunResult } from "./src/runtime/index.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
@@ -555,6 +555,42 @@ describe("pi-rlm extension wiring", () => {
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("default runtime uses retained managed state while injected directories keep legacy ownership", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-extension-state-"));
+    const backend: InterpreterBackend = {
+      id: "managed-test-backend", version: "1",
+      async evalCell() { throw new Error("unused"); },
+      async dispose() {},
+    };
+    const model: ModelClient = {
+      id: "managed-test-model",
+      identity: { id: "test/managed-model", version: "1", configuration: {} },
+      async complete() { throw new Error("unused"); },
+    };
+    const controller: ControllerDriver = {
+      identity: { id: "test/managed-controller", version: "1", configuration: {} },
+      async next() { throw new Error("unused"); },
+      fork() { return this; },
+    };
+    const h = harness({ runtime: {
+      resolveProfile: () => ({ ...DEFAULT_PROFILE, maxControllerTurns: 0 }),
+      createBackend: () => backend,
+      createModel: () => model,
+      createController: () => controller,
+      runRetention: { root: stateRoot },
+    } });
+    await h.startTurn("Use pi-rlm with managed retention");
+    const result = await rlmTool(h).execute("call-managed", { objective: "Retain this run" }, undefined, undefined, h.ctx);
+    expect(result.details?.status).toBe("failed");
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.issues).toEqual([]);
+    expect(listing.runs).toHaveLength(1);
+    expect(listing.runs[0]?.metadata).toMatchObject({ status: "failed", runId: expect.stringMatching(/^run_[a-f0-9]{64}$/) });
+    expect((await lstat(join(listing.runs[0]!.path, "manifest.json"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(join(listing.runs[0]!.path, "events.jsonl"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(join(listing.runs[0]!.path, "contexts"))).mode & 0o777).toBe(0o700);
   });
 
   test("runtime initialization is not called when no consumable turn grant exists", async () => {

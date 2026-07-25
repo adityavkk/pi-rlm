@@ -354,7 +354,7 @@ export interface RunDirectoryFileHandle {
 }
 
 export interface RunDirectoryFileSystem {
-  open(path: string, flags: string): Promise<RunDirectoryFileHandle>;
+  open(path: string, flags: string, mode?: number): Promise<RunDirectoryFileHandle>;
   readFile(path: string): Promise<Buffer>;
   readdir(path: string): Promise<string[]>;
   rename(oldPath: string, newPath: string): Promise<void>;
@@ -362,7 +362,7 @@ export interface RunDirectoryFileSystem {
 }
 
 export const nodeRunDirectoryFileSystem: RunDirectoryFileSystem = {
-  open: async (path, flags) => open(path, flags),
+  open: async (path, flags, mode) => open(path, flags, mode),
   readFile: async (path) => readFile(path),
   readdir,
   rename,
@@ -426,11 +426,12 @@ export const claimRunDirectory = async (
   dir: string,
   document: RunManifestDocument,
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
+  allowedEntries: readonly string[] = [],
 ): Promise<void> => {
   const lockPath = join(dir, RUN_LOCK_FILE);
   let lock: RunDirectoryFileHandle;
   try {
-    lock = await fileSystem.open(lockPath, "wx");
+    lock = await fileSystem.open(lockPath, "wx", 0o600);
   } catch (error) {
     if (errorCode(error) === "EEXIST") throw new RunDirectoryError("RUN_DIRECTORY_IN_USE", "run directory is already claimed", error);
     throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to claim run directory", error);
@@ -438,7 +439,8 @@ export const claimRunDirectory = async (
 
   try {
     await closeAfter(lock, async () => {
-      const entries = (await fileSystem.readdir(dir)).filter((entry) => entry !== RUN_LOCK_FILE);
+      const allowed = new Set(allowedEntries);
+      const entries = (await fileSystem.readdir(dir)).filter((entry) => entry !== RUN_LOCK_FILE && !allowed.has(entry));
       if (entries.length > 0) throw new RunDirectoryError("RUN_DIRECTORY_NOT_EMPTY", "run directory contains existing state");
       await lock.writeFile(canonicalStringify({ runId: document.manifest.run.id, manifestHash: document.manifestHash }), "utf8");
       await lock.sync();
@@ -462,7 +464,7 @@ export const claimRunDirectory = async (
   try {
     // Makes the exclusive lock directory entry durable before any valid manifest can appear.
     await syncDirectory(dir, fileSystem);
-    const temp = await fileSystem.open(tempPath, "wx");
+    const temp = await fileSystem.open(tempPath, "wx", 0o600);
     tempCreated = true;
     await closeAfter(temp, async () => {
       await temp.writeFile(`${canonicalStringify(plainJson(document, "run manifest document"))}\n`, "utf8");
