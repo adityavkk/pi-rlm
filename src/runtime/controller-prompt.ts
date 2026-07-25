@@ -11,6 +11,10 @@ import type { JsonObject } from "./../core/json.ts";
 import { isJsonObject } from "./../core/json.ts";
 import type { FrameState } from "./controller.ts";
 
+export const CONTROLLER_PROMPT_VERSION = "2";
+export const CONTROLLER_TURN_VERSION = "2";
+export const CONTROLLER_TURN_CONFIGURATION = Object.freeze({ projection: "frame-state-v1" });
+
 export const CELL_SCHEMA: JsonObject = {
   type: "object",
   required: ["reasoning", "code"],

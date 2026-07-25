@@ -1,0 +1,11 @@
+# Run manifest identity
+
+A run manifest binds every effectful runtime component before the run nonce or filesystem work. `ModelClient`, `ControllerDriver`, and `Extractor` implementations must expose an own data `identity` containing a stable, non-secret implementation `id`, `version`, and strict-JSON `configuration`. Configuration must include every behavior-affecting instance option. Opaque hosts must identify closures and provider prompt policies explicitly; pi-rlm never inspects function source or invents a fallback identity.
+
+`PiModelClient` binds its default model and routing/retry policy. `ModelController` binds its model-client identity, model route, output cap, and static/turn prompt policy. `FunctionExtractor` binds accounting mode, closure identity, extractor configuration, model route, and provider-prompt renderer identity/configuration.
+
+Manifest prompt versions are the exported renderer versions. Validation strictly parses the normalized program, component identities, profile, and limits, then recomputes every stored prompt/schema/binding hash with the supported renderer configuration. Rehashing a document cannot make arbitrary prompt metadata valid.
+
+Dynamic turn and extractor prompt text is not predicted in the manifest. The manifest binds its renderer version and canonical configuration. Immediately before invocation, each actual provider request records only `requestIdentityVersion` and `requestSha256` on its `provider_attempted` journal event. The hash binds the model client/route identity and a strict, prototype-safe snapshot of every provider-affecting request field, including ordered context and structured output options. Accessors and non-JSON fields fail before provider effects. Opaque external operations have no provider request and therefore omit those fields.
+
+Manifest publication uses an exclusive lock, synced temporary file, atomic rename, and directory sync. Failed provisional lock claims are removed and synced. Failed temporary publication is cleaned while the durable lock remains fail-closed. Handle or unlink cleanup failures use `MANIFEST_CLEANUP_FAILED`, retain the primary and cleanup causes, and never make an incomplete manifest reopenable as valid.

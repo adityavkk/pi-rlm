@@ -16,6 +16,15 @@ import { DEFAULT_PROFILE } from "./profile.ts";
 import { runProgram } from "./run.ts";
 import { registerControllerTurnObserverForTest } from "./testing/controller-turn-observer.ts";
 
+const modelIdentity = (fixture: string) => ({ id: "test/mock-model-handler", version: "1", configuration: { fixture } } as const);
+const extractorIdentity = (fixture: string) => ({
+  closure: { id: "test/extractor-closure", version: "1", configuration: { fixture } },
+  configuration: { fixture },
+  modelRoute: "test/model",
+  providerPrompt: { id: "test/extractor-prompt", version: "1", configuration: { fixture } },
+} as const);
+const controllerIdentity = (fixture: string) => ({ id: "test/mock-controller-fork", version: "1", configuration: { fixture } } as const);
+
 let backend: QuickJsBackend;
 beforeAll(async () => {
   backend = await QuickJsBackend.create();
@@ -42,7 +51,7 @@ const program = (overrides: Partial<RlmProgram> = {}): RlmProgram => {
 
 describe("runProgram e2e", () => {
   test("map/reduce with llm.batch, workspace, and typed answer", async () => {
-    const model = new MockModelClient((req) => (req.prompt.includes("count") ? JSON.stringify({ n: 1 }) : "ok"));
+    const model = new MockModelClient((req) => (req.prompt.includes("count") ? JSON.stringify({ n: 1 }) : "ok"), modelIdentity("src/runtime/run.e2e.test.ts:41"));
     const controller = new MockController([
       {
         reasoning: "chunk, classify, reduce",
@@ -113,7 +122,7 @@ describe("runProgram e2e", () => {
   });
 
   test("recurse opens a child frame whose answer flows back to the parent", async () => {
-    const model = new MockModelClient(() => "unused");
+    const model = new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:81"));
     const controller = new MockController(
       [
         {
@@ -124,7 +133,7 @@ describe("runProgram e2e", () => {
             'root-done'`,
         },
       ],
-      () => new MockController([{ reasoning: "child", code: "answer('child-result'); 'child-done'" }]),
+      () => new MockController([{ reasoning: "child", code: "answer('child-result'); 'child-done'" }]), controllerIdentity("src/runtime/run.e2e.test.ts:82")
     );
     const result = await runProgram({
       program: program({ objective: "parent" }),
@@ -149,6 +158,7 @@ describe("runProgram e2e", () => {
     const childSettled = new Promise<void>((resolve) => { markChildSettled = resolve; });
 
     class DelayedChildController implements ControllerDriver {
+  readonly identity = { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run.e2e.test.ts:109" } } as const;
       calls = 0;
       aborted = false;
 
@@ -168,6 +178,7 @@ describe("runProgram e2e", () => {
 
     class CancellingBackend implements InterpreterBackend {
       readonly id = "cancelling-test-backend";
+      readonly version = "1";
 
       async evalCell(options: CellEvalOptions): Promise<CellEvalOutcome> {
         const cellEpoch = new AbortController();
@@ -193,7 +204,7 @@ describe("runProgram e2e", () => {
         reasoning: "delegate",
         code: "await recurse({ key: 'slow', objective: 'slow child', context: input }); 'done'",
       }],
-      () => child,
+      () => child, controllerIdentity("src/runtime/run.e2e.test.ts:129")
     );
     const dir = await tmp();
     const owner = new AbortController();
@@ -206,7 +217,7 @@ describe("runProgram e2e", () => {
         program: program({ objective: "cancel child" }),
         sources: { context: "hello" },
         controller,
-        model: new MockModelClient(() => "unused"),
+        model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:deterministic-cancellation")),
         backend: new CancellingBackend(),
         dir,
         signal: owner.signal,
@@ -238,7 +249,7 @@ describe("runProgram e2e", () => {
 
   test("duplicate llm keys coalesce to one model call (cache)", async () => {
     let n = 0;
-    const model = new MockModelClient(() => `r${++n}`);
+    const model = new MockModelClient(() => `r${++n}`, modelIdentity("src/runtime/run.e2e.test.ts:166"));
     const controller = new MockController([
       {
         reasoning: "call twice same key",
@@ -263,7 +274,7 @@ describe("runProgram e2e", () => {
   });
 
   test("turn exhaustion triggers fallback extraction", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:191"));
     const controller = new MockController([
       { reasoning: "noop 1", code: "workspace.a = (workspace.a ?? 0) + 1; workspace.a" },
       { reasoning: "noop 2", code: "workspace.a = (workspace.a ?? 0) + 1; workspace.a" },
@@ -272,7 +283,7 @@ describe("runProgram e2e", () => {
       ok: true,
       value: { answer: `fallback:${JSON.stringify(evidence.workspaceValues)}` },
       evidenceRefs: [evidence.workspaceValues[0]!.evidenceId!],
-    }));
+    }), "external", extractorIdentity("src/runtime/run.e2e.test.ts:196"));
     const result = await runProgram({
       program: program(),
       sources: { context: "c" },
@@ -290,7 +301,7 @@ describe("runProgram e2e", () => {
   });
 
   test("exhaustion without an extractor fails with NO_ANSWER", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:218"));
     const controller = new MockController([{ reasoning: "noop", code: "1 + 1" }]);
     const result = await runProgram({
       program: program(),
@@ -307,7 +318,7 @@ describe("runProgram e2e", () => {
   });
 
   test("budget exhaustion returns a catchable CallResult, not a throw", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:235"));
     const controller = new MockController([
       {
         reasoning: "two distinct calls under a 1-call budget",
@@ -334,7 +345,7 @@ describe("runProgram e2e", () => {
   });
 
   test("invalid answer is recoverable; the controller corrects on the next turn", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:262"));
     const controller = new MockController([
       { reasoning: "wrong shape", code: "answer({ wrong: 1 }); 'first'" },
       { reasoning: "corrected", code: "answer({ answer: 'fixed' }); 'second'" },
@@ -363,7 +374,7 @@ describe("runProgram e2e", () => {
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "c" }, controller,
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:291")), backend, dir,
       signal: new AbortController().signal,
     });
 
@@ -408,6 +419,7 @@ describe("runProgram e2e", () => {
       ];
       let index = 0;
       const controller: ControllerDriver = {
+        identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run.e2e.test.ts:335" } },
         async next(state) {
           seen.push(state);
           return cells[index++] as Cell;
@@ -417,7 +429,7 @@ describe("runProgram e2e", () => {
       const dir = await tmp();
       const result = await runProgram({
         program: program(), sources: { context: "c" }, controller,
-        model: new MockModelClient(() => "unused"), backend, dir,
+        model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:345")), backend, dir,
         signal: new AbortController().signal,
       });
 
@@ -461,13 +473,14 @@ describe("runProgram e2e", () => {
       ];
       let index = 0;
       const controller: ControllerDriver = {
+        identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run.e2e.test.ts:388" } },
         async next(state) { seen.push(state); return cells[index++] as Cell; },
         fork() { return this; },
       };
       const dir = await tmp();
       const result = await runProgram({
         program: program(), sources: { context: "c" }, controller,
-        model: new MockModelClient(() => "unused"), backend, dir,
+        model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:395")), backend, dir,
         signal: new AbortController().signal,
       });
 
@@ -511,13 +524,14 @@ describe("runProgram e2e", () => {
     ];
     let index = 0;
     const controller: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run.e2e.test.ts:438" } },
       async next(state) { seen.push(state); return cells[index++] as Cell; },
       fork() { return this; },
     };
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "c" }, controller,
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:445")), backend, dir,
       signal: new AbortController().signal,
     });
 
@@ -543,7 +557,7 @@ describe("runProgram e2e", () => {
     ]);
     const result = await runProgram({
       program: program(), sources: { context: "c" }, controller,
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:471")), backend, dir,
       signal: new AbortController().signal,
     });
 
@@ -565,12 +579,13 @@ describe("runProgram e2e", () => {
     ];
     let index = 0;
     const controller: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run.e2e.test.ts:492" } },
       async next(state) { seen.push(state); return cells[index++] as Cell; },
       fork() { return this; },
     };
     const result = await runProgram({
       program: program(), sources: { context: "c" }, controller,
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:498")), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, storedByteLimit: 20 },
     });
@@ -592,7 +607,7 @@ describe("runProgram e2e", () => {
   });
 
   test("inherited output values do not satisfy the answer contract", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:518"));
     const controller = new MockController([
       { reasoning: "missing own value", code: "answer({}); 'first'" },
       { reasoning: "own value", code: "answer({ toString: 'fixed' }); 'second'" },
@@ -611,7 +626,7 @@ describe("runProgram e2e", () => {
   });
 
   test("context limit and unsupported syntax errors are typed and guest-catchable", async () => {
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:537"));
     const controller = new MockController([{
       reasoning: "recover from invalid context options",
       code: `
@@ -636,7 +651,7 @@ describe("runProgram e2e", () => {
   });
 
   test("changed llm and batch-child identities fail before provider spend", async () => {
-    const model = new MockModelClient(() => "only-result");
+    const model = new MockModelClient(() => "only-result", modelIdentity("src/runtime/run.e2e.test.ts:562"));
     const controller = new MockController([
       {
         reasoning: "establish identity",
@@ -675,7 +690,7 @@ describe("runProgram e2e", () => {
   });
 
   test("concurrent and batch duplicate llm identities coalesce", async () => {
-    const model = new MockModelClient(() => "shared");
+    const model = new MockModelClient(() => "shared", modelIdentity("src/runtime/run.e2e.test.ts:601"));
     const controller = new MockController([{
       reasoning: "coalesce duplicates",
       code: `
@@ -720,13 +735,13 @@ describe("runProgram e2e", () => {
           catch (error) { code = error.code; }
           answer({ answer: (a.callId === b.callId) + ':' + code });`,
       }],
-      () => new MockController([{ reasoning: "child", code: "answer('child-result')" }]),
+      () => new MockController([{ reasoning: "child", code: "answer('child-result')" }]), controllerIdentity("src/runtime/run.e2e.test.ts:633")
     );
     const result = await runProgram({
       program: program(),
       sources: { context: "c" },
       controller,
-      model: new MockModelClient(() => "unused"),
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:652")),
       backend,
       dir: await tmp(),
       signal: new AbortController().signal,
@@ -747,14 +762,14 @@ describe("runProgram e2e", () => {
           const child = await recurse({ key: 'child-ref', objective: 'same', context: input });
           answer({ answer: code + ':' + child.value });`,
       }],
-      () => new MockController([{ reasoning: "child", code: "answer('child-ok')" }]),
+      () => new MockController([{ reasoning: "child", code: "answer('child-ok')" }]), controllerIdentity("src/runtime/run.e2e.test.ts:663")
     );
     const dir = await tmp();
     const result = await runProgram({
       program: program(),
       sources: { context: "valid" },
       controller,
-      model: new MockModelClient(() => "unused"),
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:680")),
       backend,
       dir,
       signal: new AbortController().signal,
@@ -789,7 +804,7 @@ describe("runProgram e2e", () => {
       program: program(),
       sources: { context: "source" },
       controller,
-      model: new MockModelClient(() => "unused"),
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:715")),
       backend,
       dir: await tmp(),
       signal: new AbortController().signal,
@@ -801,7 +816,7 @@ describe("runProgram e2e", () => {
 
   test("denied context producers leave ledger, entries, and files unchanged", async () => {
     const dir = await tmp();
-    const model = new MockModelClient(() => "ok");
+    const model = new MockModelClient(() => "ok", modelIdentity("src/runtime/run.e2e.test.ts:727"));
     const controller = new MockController([{
       reasoning: "exercise tiny stored-byte budget",
       code: `
@@ -839,7 +854,7 @@ describe("runProgram e2e", () => {
     const result = await runProgram({
       program: program(), sources: { context: "xx" },
       controller: new MockController([{ reasoning: "must not run", code: "answer({ answer: 'bad' })" }]),
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:765")), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, storedByteLimit: 1 },
     });
@@ -872,7 +887,7 @@ describe("runProgram e2e", () => {
     }]);
     const result = await runProgram({
       program: program(), sources: { context: "s" }, controller,
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:798")), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, storedByteLimit: 26 },
     });
@@ -885,14 +900,14 @@ describe("runProgram e2e", () => {
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "x" }, controller: new MockController([]),
-      model: new MockModelClient(() => "unused"), backend, dir,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/run.e2e.test.ts:811")), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0, storedByteLimit: 1 },
       extractor: new FunctionExtractor((evidence) => ({
         ok: true,
         value: { answer: "oversized" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
-      })),
+      }), "external", extractorIdentity("src/runtime/run.e2e.test.ts:814")),
     });
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("BUDGET_BYTES");

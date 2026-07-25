@@ -1,6 +1,7 @@
 /** Model client boundary. The broker owns schema validation and budgeting; the
  * client only performs one completion and reports usage. */
 
+import type { RuntimeComponentIdentity } from "../../core/identity.ts";
 import type { JsonObject } from "../../core/json.ts";
 import type { CallUsage } from "../../core/usage.ts";
 
@@ -24,5 +25,7 @@ export interface ModelResponse {
 
 export interface ModelClient {
   readonly id: string;
+  /** Required before run effects. Opaque clients must supply stable, non-secret configuration. */
+  readonly identity: RuntimeComponentIdentity;
   complete(request: ModelRequest): Promise<ModelResponse>;
 }

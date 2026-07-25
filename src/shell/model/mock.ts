@@ -1,5 +1,6 @@
 /** Deterministic in-process model client for tests and offline runs. */
 
+import type { RuntimeComponentIdentity } from "../../core/identity.ts";
 import type { CallUsage } from "../../core/usage.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "./client.ts";
 
@@ -16,7 +17,10 @@ const defaultUsage = (text: string): CallUsage => ({
 export class MockModelClient implements ModelClient {
   readonly id = "mock-model";
   private calls = 0;
-  constructor(private readonly handler: MockHandler) {}
+  constructor(
+    private readonly handler: MockHandler,
+    readonly identity: RuntimeComponentIdentity,
+  ) {}
 
   get callCount(): number {
     return this.calls;

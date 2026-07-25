@@ -56,6 +56,8 @@ export type CellEvalOutcome =
 
 export interface InterpreterBackend {
   readonly id: string;
+  /** Nonempty engine/package version, recorded separately from the stable backend ID. */
+  readonly version: string;
   evalCell(options: CellEvalOptions): Promise<CellEvalOutcome>;
   dispose(): Promise<void>;
 }

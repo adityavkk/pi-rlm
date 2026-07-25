@@ -8,6 +8,8 @@ import { MockModelClient } from "../shell/model/mock.ts";
 import { ModelController } from "./model-controller.ts";
 import { runProgram } from "./run.ts";
 
+const modelIdentity = (fixture: string) => ({ id: "test/mock-model-handler", version: "1", configuration: { fixture } } as const);
+
 let backend: QuickJsBackend;
 beforeAll(async () => {
   backend = await QuickJsBackend.create();
@@ -30,12 +32,12 @@ describe("ModelController drives a real controller loop offline", () => {
       JSON.stringify({ reasoning: "read 3 bytes then answer", code: "const t = await input.read({ lengthBytes: 3 }); answer({ answer: t.text }); 'done'" }),
     ];
     let i = 0;
-    const controllerModel = new MockModelClient(() => cells[i++] ?? JSON.stringify({ reasoning: "stop", code: "" }));
+    const controllerModel = new MockModelClient(() => cells[i++] ?? JSON.stringify({ reasoning: "stop", code: "" }), modelIdentity("src/runtime/model-controller.test.ts:33"));
     const result = await runProgram({
       program: singleInput(),
       sources: { context: "ABCDE" },
       controller: new ModelController(controllerModel),
-      model: new MockModelClient(() => "unused"),
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-controller.test.ts:38")),
       backend,
       dir: await mkdtemp(join(tmpdir(), "pi-rlm-mc-")),
       signal: new AbortController().signal,
@@ -47,12 +49,12 @@ describe("ModelController drives a real controller loop offline", () => {
   test("repairs a non-JSON controller response once", async () => {
     const outputs = ["this is not json", JSON.stringify({ reasoning: "answer now", code: "answer({ answer: 'ok' }); 'x'" })];
     let i = 0;
-    const controllerModel = new MockModelClient(() => outputs[i++] ?? "still not json");
+    const controllerModel = new MockModelClient(() => outputs[i++] ?? "still not json", modelIdentity("src/runtime/model-controller.test.ts:50"));
     const result = await runProgram({
       program: singleInput(),
       sources: { context: "ABCDE" },
       controller: new ModelController(controllerModel),
-      model: new MockModelClient(() => "unused"),
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-controller.test.ts:55")),
       backend,
       dir: await mkdtemp(join(tmpdir(), "pi-rlm-mc-")),
       signal: new AbortController().signal,

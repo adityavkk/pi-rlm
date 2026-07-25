@@ -30,7 +30,9 @@ import {
 import {
   DEFAULT_PROFILE,
   ModelController,
+  type LaunchAuthorizationMode,
   type Profile,
+  preflightRunComponents,
   runProgram,
   type RunResult,
 } from "./src/runtime/index.ts";
@@ -154,12 +156,14 @@ export interface RlmRuntimeDependencies {
   readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
   readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
   readonly createRunDirectory?: () => Promise<string>;
+  readonly createRunNonce?: () => string;
 }
 
 const executeRun = async (
   request: LaunchRequest,
   signal: AbortSignal,
   dependencies: RlmRuntimeDependencies = {},
+  authorizationMode: LaunchAuthorizationMode = "direct",
 ): Promise<RunResult> => {
   throwIfAborted(signal);
   const profile = (dependencies.resolveProfile ?? resolveProfile)();
@@ -171,6 +175,7 @@ const executeRun = async (
   throwIfAborted(signal);
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
+  preflightRunComponents({ backend, model, controller });
   const dirWork = (dependencies.createRunDirectory ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-run-"))))();
   let dir: string;
   try {
@@ -180,21 +185,34 @@ const executeRun = async (
       void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
     throw error;
   }
-  throwIfAborted(signal);
-  return runProgram({
-    program: request.program,
-    sources: request.sources,
-    controller,
-    model,
-    backend,
-    dir,
-    profile,
-    signal,
-  });
+  try {
+    throwIfAborted(signal);
+    const result = await runProgram({
+      program: request.program,
+      sources: request.sources,
+      controller,
+      model,
+      backend,
+      dir,
+      profile,
+      signal,
+      authorizationMode,
+      createRunNonce: dependencies.createRunNonce,
+    });
+    if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
+    return result;
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
+  }
 };
 
 export interface RlmExtensionDependencies {
-  readonly executeRun?: (request: LaunchRequest, signal: AbortSignal) => Promise<RunResult>;
+  readonly executeRun?: (
+    request: LaunchRequest,
+    signal: AbortSignal,
+    authorizationMode: LaunchAuthorizationMode,
+  ) => Promise<RunResult>;
   readonly runtime?: RlmRuntimeDependencies;
   readonly now?: () => number;
   readonly createId?: () => string;
@@ -235,7 +253,7 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
-  const run = dependencies.executeRun ?? ((request, signal) => executeRun(request, signal, dependencies.runtime));
+  const run = dependencies.executeRun ?? ((request, signal, mode) => executeRun(request, signal, dependencies.runtime, mode));
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
@@ -391,7 +409,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       activeCommandRuns.add(commandController);
       ctx.ui.setStatus("pi-rlm", "running...");
       try {
-        const result = await run(built.value, commandController.signal);
+        const result = await run(built.value, commandController.signal, "slash_command");
         ctx.ui.notify(summarize(result), result.status === "completed" ? "info" : "error");
       } catch (error) {
         ctx.ui.notify(
@@ -483,7 +501,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         consumedToolCalls.add(callKey);
         audit(authorization.grant);
         try {
-          const result = await run(built.value, toolSignal);
+          const result = await run(built.value, toolSignal, "confirmed");
           return { content: [{ type: "text", text: summarize(result) }], details: { status: result.status } };
         } catch (error) {
           return {

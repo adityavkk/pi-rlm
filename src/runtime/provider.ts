@@ -17,7 +17,7 @@ import {
 } from "../core/budget.ts";
 import { type CallError, callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
 import type { RlmEvent } from "../core/journal.ts";
-import { canonicalStringify } from "../core/json.ts";
+import { canonicalStringify, type JsonObject, type JsonValue } from "../core/json.ts";
 import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
 import {
   addUsage,
@@ -28,12 +28,107 @@ import {
   normalizeCallUsage,
   ZERO_CALL_USAGE,
 } from "../core/usage.ts";
+import { sha256 } from "../shell/hash.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
 export const DEFAULT_MAX_OUTPUT_TOKENS = 512;
+export const PROVIDER_REQUEST_IDENTITY_VERSION = "1";
+
+interface PreparedModelRequest {
+  readonly request: ModelRequest;
+  readonly canonicalIdentity: string;
+}
+
+const strictJsonSnapshot = (input: unknown, label: string): JsonValue => {
+  const active = new WeakSet<object>();
+  const copy = (value: unknown, path: string): JsonValue => {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value !== "object") throw new TypeError(`${label} is not strict JSON at ${path}`);
+    if (active.has(value)) throw new TypeError(`${label} is cyclic at ${path}`);
+    active.add(value);
+    try {
+      if (Array.isArray(value)) {
+        if (Object.getPrototypeOf(value) !== Array.prototype) throw new TypeError(`${label} has a non-plain array at ${path}`);
+        const keys = Reflect.ownKeys(value);
+        if (keys.some((key) => key !== "length" && (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key))))
+          throw new TypeError(`${label} has an invalid array field at ${path}`);
+        const result: JsonValue[] = [];
+        for (let index = 0; index < value.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+          if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+            throw new TypeError(`${label} has an accessor or hole at ${path}[${index}]`);
+          result.push(copy(descriptor.value, `${path}[${index}]`));
+        }
+        return result;
+      }
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null)
+        throw new TypeError(`${label} has a non-plain object at ${path}`);
+      const result = Object.create(null) as Record<string, JsonValue>;
+      for (const key of Reflect.ownKeys(value)) {
+        if (typeof key !== "string") throw new TypeError(`${label} has a symbol field at ${path}`);
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+          throw new TypeError(`${label} has an accessor or non-enumerable field at ${path}.${key}`);
+        result[key] = copy(descriptor.value, `${path}.${key}`);
+      }
+      return result;
+    } finally {
+      active.delete(value);
+    }
+  };
+  return copy(input, "$");
+};
+
+const ownData = (value: object, key: string, label: string): unknown => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor || !("value" in descriptor)) throw new TypeError(`${label}.${key} must be an own data property`);
+  return descriptor.value;
+};
+
+const prepareModelRequest = (client: ModelClient, input: ModelRequest): PreparedModelRequest => {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) throw new TypeError("model request must be a plain object");
+  const requestInput = Object.create(null) as Record<string, unknown>;
+  if (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)
+    throw new TypeError("model request must be a plain object");
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== "string") throw new TypeError("model request has a symbol field");
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+      throw new TypeError(`model request has an accessor or non-enumerable field at $.${key}`);
+    // Owner cancellation is transport control supplied by this boundary, not provider request content.
+    if (key !== "signal") requestInput[key] = descriptor.value;
+  }
+  const requestJson = strictJsonSnapshot(requestInput, "model request") as JsonObject;
+  const normalizedJson = Object.assign(Object.create(null), requestJson, {
+    maxOutputTokens: requestJson["maxOutputTokens"] ?? DEFAULT_MAX_OUTPUT_TOKENS,
+  }) as JsonObject;
+  const clientId = ownData(client, "id", "model client");
+  const clientIdentity = ownData(client, "identity", "model client");
+  if (typeof clientId !== "string" || clientId.length === 0) throw new TypeError("model client.id must be a nonempty string");
+  const identity = strictJsonSnapshot({
+    version: PROVIDER_REQUEST_IDENTITY_VERSION,
+    modelClient: { id: clientId, identity: clientIdentity },
+    request: normalizedJson,
+  }, "provider request identity");
+  return {
+    request: Object.assign(Object.create(null), normalizedJson) as unknown as ModelRequest,
+    canonicalIdentity: canonicalStringify(identity),
+  };
+};
+
+/** Pure hash of the exact provider-affecting ModelRequest snapshot. */
+export const providerRequestIdentity = (
+  client: ModelClient,
+  request: ModelRequest,
+): { readonly version: string; readonly sha256: string } => {
+  const prepared = prepareModelRequest(client, request);
+  return { version: PROVIDER_REQUEST_IDENTITY_VERSION, sha256: sha256(prepared.canonicalIdentity) };
+};
 
 export type ModelOperationKind = "controller" | "llm" | "extractor";
 
@@ -236,6 +331,7 @@ export const createModelOperation = (
     outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"],
     usage: CallUsage,
     errorCode?: string,
+    requestSha256?: string,
   ): Promise<void> => {
     const appended = await state.journal.append({
       type: "provider_attempted",
@@ -246,19 +342,25 @@ export const createModelOperation = (
       attempt: attemptOrdinal,
       outcome,
       usage,
+      ...(requestSha256 ? {
+        requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
+        requestSha256,
+      } : {}),
       ...(errorCode ? { errorCode } : {}),
     });
     if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
   };
 
   const complete = async (client: ModelClient, request: ModelRequest): Promise<ModelResponse> => {
-    const invalid = validateRequest(request);
+    let prepared: PreparedModelRequest;
+    try {
+      prepared = prepareModelRequest(client, request);
+    } catch (error) {
+      throw new ModelInvocationError(callError("INVALID_REQUEST", error instanceof Error ? error.message : "model request cannot be canonicalized"), aggregate);
+    }
+    const invalid = validateRequest(prepared.request);
     if (invalid) throw new ModelInvocationError(invalid, aggregate);
-    const normalizedRequest: ModelRequest = {
-      ...request,
-      maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-      signal: options.signal,
-    };
+    const normalizedRequest = Object.assign(Object.create(null), prepared.request, { signal: options.signal }) as ModelRequest;
     const reservedTokens = tokenReservation(normalizedRequest);
     if (reservedTokens === undefined)
       throw new ModelInvocationError(callError("INVALID_REQUEST", "call token reservation exceeds per-call maximum"), aggregate);
@@ -283,6 +385,7 @@ export const createModelOperation = (
       active = true;
 
       checkpoint();
+      const requestSha256 = sha256(prepared.canonicalIdentity);
       const startedMs = state.clock.now();
       let raw: unknown;
       try {
@@ -308,7 +411,7 @@ export const createModelOperation = (
           : wasAborted(error, options.signal)
             ? callError("CANCELLED", "model completion cancelled")
             : callError("FAILED", "model completion failed"));
-        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code);
+        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code, requestSha256);
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -323,7 +426,7 @@ export const createModelOperation = (
         }
         pendingTokens = 0;
         const failure = addAccounting(usage) ?? callError("INVALID_RESULT", "model returned invalid usage");
-        await journal("invalid_result", usage, failure.code);
+        await journal("invalid_result", usage, failure.code, requestSha256);
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -338,7 +441,7 @@ export const createModelOperation = (
       pendingTokens = 0;
       const accountingError = addAccounting(response.usage);
       if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-      await journal("ok", response.usage);
+      await journal("ok", response.usage, undefined, requestSha256);
       return response;
     } finally {
       if (pendingTokens > 0) {

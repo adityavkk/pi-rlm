@@ -1,10 +1,9 @@
 /** Top-level run orchestration and exactly-once durable finalization. */
 
 import { createLedger, type Ledger } from "../core/budget.ts";
-import { identityHash } from "../core/ids.ts";
 import type { FrameState, RlmEvent } from "../core/journal.ts";
 import type { JsonValue } from "../core/json.ts";
-import { programIdentity, type RlmProgram } from "../core/program.ts";
+import type { RlmProgram } from "../core/program.ts";
 import {
   ContextBudgetError,
   type ContextDescriptor,
@@ -28,7 +27,6 @@ import {
 import {
   buildExtractorEvidence,
   ExtractorEvidenceDeadlineError,
-  extractorEvidenceIdentity,
 } from "./extractor-evidence.ts";
 import { runFrame } from "./frame.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
@@ -36,10 +34,18 @@ import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, InternalRunState } from "./state.ts";
+import {
+  buildRunManifest,
+  claimRunDirectory,
+  preflightRunComponents,
+  RLM_DSL_VERSION,
+  type LaunchAuthorizationMode,
+  type RunDirectoryFileSystem,
+} from "./run-manifest.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 
-export const RLM_DSL_VERSION = "0.1.0";
+export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
 export interface RunInput {
   readonly program: RlmProgram;
@@ -53,6 +59,12 @@ export interface RunInput {
   readonly clock?: Clock;
   readonly profile?: Profile;
   readonly extractor?: Extractor;
+  /** Non-secret authorization path that admitted this launch. */
+  readonly authorizationMode?: LaunchAuthorizationMode;
+  /** Cryptographically random by default; injectable only for deterministic tests. */
+  readonly createRunNonce?: () => string;
+  /** Optional manifest persistence injection for fault testing. */
+  readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
 }
@@ -308,12 +320,35 @@ const finalize = async (
 };
 
 export const runProgram = async (input: RunInput): Promise<RunResult> => {
+  preflightRunComponents(input);
   const clock = input.clock ?? systemClock;
   const profile = input.profile ?? DEFAULT_PROFILE;
   const startMs = clock.now();
   const limits = resolveLimits(profile, startMs);
+  const document = buildRunManifest({
+    program: input.program,
+    sources: input.sources,
+    profile,
+    limits,
+    backend: input.backend,
+    model: input.model,
+    controller: input.controller,
+    extractor: input.extractor,
+    authorizationMode: input.authorizationMode,
+    createRunNonce: input.createRunNonce,
+    dslVersion: RLM_DSL_VERSION,
+  });
   const ledgerRef = { current: createLedger(limits) };
-  const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`)}`;
+  const runId = document.manifest.run.id;
+  try {
+    await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem);
+  } catch (error) {
+    const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
+    const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
+    if (code === "ENOENT" || code === "ENOTDIR")
+      return { ...failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error), ledger: ledgerRef.current };
+    throw error;
+  }
   const rootFrameId = `${runId}:f0`;
   const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
@@ -336,13 +371,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   });
 
   try {
-    const manifestHash = sha256(JSON.stringify({
-      program: programIdentity(input.program),
-      profile: profile.name,
-      dsl: RLM_DSL_VERSION,
-      backend: input.backend.id,
-      extractorEvidence: extractorEvidenceIdentity(profile),
-    }));
+    const manifestHash = document.manifestHash;
     phase = "source";
     const sourceTransaction = await store.beginIngestTexts(
       input.program.inputs.map((declared) => ({
