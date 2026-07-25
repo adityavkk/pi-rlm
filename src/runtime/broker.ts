@@ -18,7 +18,7 @@ import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
-export type RecurseFn = (args: JsonValue) => Promise<GuestCallResult>;
+export type RecurseFn = (args: JsonValue, signal: AbortSignal) => Promise<GuestCallResult>;
 
 class DslError extends Error {
   constructor(readonly code: string, message: string) {
@@ -81,14 +81,15 @@ export const dispatchCall = async (
   name: string,
   args: JsonValue,
   recurse: RecurseFn,
+  signal: AbortSignal,
 ): Promise<unknown> => {
   switch (name) {
     case "llm":
-      return llm(state, frame, asObject(args));
+      return llm(state, frame, asObject(args), signal);
     case "llm.batch":
-      return llmBatch(state, frame, asObject(args), recurse);
+      return llmBatch(state, frame, asObject(args), recurse, signal);
     case "recurse":
-      return recurse(args);
+      return recurse(args, signal);
     case "agent": {
       const spec = asObject(args);
       const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "agent", key: reqStr(spec, "key"), identity: spec });
@@ -206,7 +207,7 @@ const writeArtifact = async (state: RunState, spec: JsonObject) => {
   return descriptor;
 };
 
-const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<GuestCallResult> => {
+const llm = async (state: RunState, frame: FrameRef, spec: JsonObject, signal: AbortSignal): Promise<GuestCallResult> => {
   const key = reqStr(spec, "key");
   const prompt = reqStr(spec, "prompt");
   const { model, thinking } = resolveModel(state, spec["model"]);
@@ -239,6 +240,7 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
   if (pending) return { ...(await pending), cached: true };
 
   const task = (async (): Promise<GuestCallResult> => {
+    if (signal.aborted) return errResult(callId, callError("CANCELLED", "cell epoch closed"), ZERO_CALL_USAGE, false);
     const reservedCall = reserveLogicalCall(state.ledger.current, now(state));
     if (!reservedCall.ok) return errResult(callId, reservedCall.error, ZERO_CALL_USAGE, false);
     state.ledger.current = reservedCall.value;
@@ -246,6 +248,7 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
     const release = await state.semaphore.acquire();
     let usage: CallUsage = ZERO_CALL_USAGE;
     try {
+      if (signal.aborted) return errResult(callId, callError("CANCELLED", "cell epoch closed"), usage, false);
       const contexts = await Promise.all(ctxIds.map((id) => state.store.load(id)));
       const request: ModelRequest = {
         prompt,
@@ -254,6 +257,7 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
         ...(thinking ? { thinking } : {}),
         ...(schema ? { schema } : {}),
         ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+        signal,
       };
       const reserveTokens = Math.ceil(prompt.length / 4) + (maxOutputTokens ?? 512);
       const reservedAttempt = reserveAttempt(state.ledger.current, now(state), reserveTokens);
@@ -313,7 +317,13 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
 const settle = (state: RunState, reserved: number, actual: number) =>
   settleAttempt(state.ledger.current, reserved, actual);
 
-const llmBatch = async (state: RunState, frame: FrameRef, spec: JsonObject, recurse: RecurseFn): Promise<unknown> => {
+const llmBatch = async (
+  state: RunState,
+  frame: FrameRef,
+  spec: JsonObject,
+  recurse: RecurseFn,
+  signal: AbortSignal,
+): Promise<unknown> => {
   void recurse;
   reqStr(spec, "key");
   const items = spec["items"];
@@ -325,7 +335,7 @@ const llmBatch = async (state: RunState, frame: FrameRef, spec: JsonObject, recu
     for (;;) {
       const index = cursor++;
       if (index >= items.length) return;
-      results[index] = await llm(state, frame, asObject(items[index] as JsonValue));
+      results[index] = await llm(state, frame, asObject(items[index] as JsonValue), signal);
     }
   });
   await Promise.all(workers);

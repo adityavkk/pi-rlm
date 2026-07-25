@@ -72,7 +72,7 @@ export const runFrame = async (
   let phaseOrdinal = 0;
   let emitOrdinal = 0;
 
-  const recurseFn = (args: JsonValue): Promise<GuestCallResult> => runChild(state, frame, controller, args);
+  const recurseFn = (args: JsonValue, _signal: AbortSignal): Promise<GuestCallResult> => runChild(state, frame, controller, args);
 
   for (let iteration = 1; ; iteration++) {
     const turn = reserveControllerTurn(state.ledger.current, state.clock.now());
@@ -142,7 +142,7 @@ export const runFrame = async (
         budget: budgetView(state.ledger.current, frame.depth) as unknown as JsonValue,
         workspace,
       },
-      dispatch: (n, a) => dispatchCall(state, frame, n, a, recurseFn),
+      dispatch: (n, a, signal) => dispatchCall(state, frame, n, a, recurseFn, signal),
       effect,
     });
 

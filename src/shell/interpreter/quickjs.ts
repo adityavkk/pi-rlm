@@ -1,13 +1,13 @@
 /**
  * QuickJS interpreter backend (imperative shell).
  *
- * Validated bun-safe strategy (see .tmp/phase0-findings.md):
+ * Validated bun-safe strategy (see docs/PHASE0-FINDINGS.md):
  *   - singlefile SYNC variant (wasm inlined; avoids bun cache subpath issues),
  *   - async host calls modeled with `ctx.newPromise()` deferreds,
  *   - a single drive loop owns all `executePendingJobs` pumping,
  *   - progress/answer are synchronous native functions (no unawaited work),
- *   - CPU interrupt via deadline, heap cap via memory limit, fresh runtime and
- *     context per cell, and strict alive-guarding so late callbacks are dropped.
+ *   - CPU interrupt plus a host wall timer, heap cap, fresh runtime and context
+ *     per cell, and strict epoch/alive guards so late callbacks are dropped.
  */
 
 import { newQuickJSWASMModuleFromVariant, type QuickJSContext, type QuickJSDeferredPromise, type QuickJSHandle, type QuickJSRuntime, type QuickJSWASMModule, shouldInterruptAfterDeadline } from "quickjs-emscripten-core";
@@ -17,26 +17,42 @@ import type { JsonValue } from "../../core/json.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./backend.ts";
 import { buildPreamble } from "./preamble.ts";
 
-const WORKSPACE_READBACK = `(() => {
-  const seen = new WeakSet();
-  const bad = [];
-  const check = (v, path) => {
-    if (v === null) return;
-    const t = typeof v;
-    if (t === "function" || t === "undefined" || t === "symbol" || t === "bigint") { bad.push(path); return; }
-    if (t === "number" && !isFinite(v)) { bad.push(path); return; }
-    if (t === "object") {
-      if (seen.has(v)) { bad.push(path); return; }
-      seen.add(v);
-      if (Array.isArray(v)) v.forEach((x, i) => check(x, path + "[" + i + "]"));
-      else for (const k of Object.keys(v)) check(v[k], path + "." + k);
-    }
+const RESULT_READBACK = `(() => {
+  const stringify = JSON.stringify;
+  return (value) => {
+    const json = stringify(value);
+    return json === undefined ? "" : json;
   };
-  const ws = globalThis.workspace;
-  if (ws && typeof ws === "object" && !Array.isArray(ws)) for (const k of Object.keys(ws)) check(ws[k], k);
-  else bad.push("<root>");
-  return JSON.stringify({ bad, json: bad.length === 0 ? ws : {} });
 })()`;
+
+const WORKSPACE_READBACK = `(() => {
+  const arrayIsArray = Array.isArray;
+  const objectKeys = Object.keys;
+  const stringify = JSON.stringify;
+  const WeakSetCtor = WeakSet;
+  return () => {
+    const seen = new WeakSetCtor();
+    const bad = [];
+    const check = (v, path) => {
+      if (v === null) return;
+      const t = typeof v;
+      if (t === "function" || t === "undefined" || t === "symbol" || t === "bigint") { bad.push(path); return; }
+      if (t === "number" && !isFinite(v)) { bad.push(path); return; }
+      if (t === "object") {
+        if (seen.has(v)) { bad.push(path); return; }
+        seen.add(v);
+        if (arrayIsArray(v)) v.forEach((x, i) => check(x, path + "[" + i + "]"));
+        else for (const k of objectKeys(v)) check(v[k], path + "." + k);
+      }
+    };
+    const ws = globalThis.workspace;
+    if (ws && typeof ws === "object" && !arrayIsArray(ws)) for (const k of objectKeys(ws)) check(ws[k], k);
+    else bad.push("<root>");
+    return stringify({ bad, json: bad.length === 0 ? ws : {} });
+  };
+})()`;
+
+const EPOCH_CLOSED_PAYLOAD = JSON.stringify({ ok: false, error: { name: "RlmError", message: "cell epoch closed" } });
 
 const classify = (message: string): InterpreterErrorCode => {
   const m = message.toLowerCase();
@@ -55,6 +71,13 @@ const terminalFromGuestMessage = (message: string): InterpreterErrorCode | undef
   return undefined;
 };
 
+interface WorkspaceReadback {
+  readonly workspace: JsonValue;
+  readonly invalid: string[];
+}
+
+type Readback<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: InterpreterError };
+
 export class QuickJsBackend implements InterpreterBackend {
   readonly id = "quickjs-emscripten-core@0.32.0/singlefile-sync";
 
@@ -72,39 +95,131 @@ export class QuickJsBackend implements InterpreterBackend {
     const ctx: QuickJSContext = runtime.newContext();
 
     let alive = true;
+    let epochOpen = true;
+    let deadlineFired = false;
+    let resultReader: QuickJSHandle | undefined;
+    let workspaceReader: QuickJSHandle | undefined;
+    const cellAbort = new AbortController();
     const inflight = new Set<Promise<void>>();
     const outstanding = new Set<QuickJSDeferredPromise>();
-    const track = (p: Promise<void>): void => {
-      const wrapped = p.finally(() => inflight.delete(wrapped));
-      inflight.add(wrapped);
-    };
 
     const settle = (deferred: QuickJSDeferredPromise, payloadJson: string): void => {
       const payload = ctx.newString(payloadJson);
-      deferred.resolve(payload);
-      payload.dispose();
+      try {
+        deferred.resolve(payload);
+      } finally {
+        payload.dispose();
+      }
     };
+
+    const closeEpoch = (reason: Error): void => {
+      if (!epochOpen) return;
+      epochOpen = false;
+      cellAbort.abort(reason);
+      for (const deferred of outstanding) {
+        try {
+          settle(deferred, EPOCH_CLOSED_PAYLOAD);
+        } catch {
+          // If allocation or resolution failed, release all three deferred
+          // handles rather than leaving an unsettled promise in the runtime.
+          deferred.dispose();
+        }
+      }
+      outstanding.clear();
+    };
+
+    let wakeDeadline!: () => void;
+    const deadline = new Promise<void>((resolve) => {
+      wakeDeadline = resolve;
+    });
+    const fireDeadline = (): void => {
+      if (deadlineFired) return;
+      deadlineFired = true;
+      closeEpoch(new Error("cell exceeded deadline"));
+      wakeDeadline();
+    };
+    const delayMs = Math.max(0, Math.min(2_147_483_647, options.deadlineMs - Date.now()));
+    const deadlineTimer = setTimeout(fireDeadline, delayMs);
+    const deadlineExceeded = (): boolean => {
+      if (!deadlineFired && Date.now() >= options.deadlineMs) fireDeadline();
+      return deadlineFired;
+    };
+
+    const finish = (outcome: CellEvalOutcome): CellEvalOutcome => {
+      clearTimeout(deadlineTimer);
+      closeEpoch(new Error("cell epoch closed"));
+      alive = false;
+      // Propagate closed-epoch rejections while the deadline interrupt remains
+      // installed. Cleanup jobs therefore cannot create an unbounded second
+      // execution window.
+      try {
+        const jobs = runtime.executePendingJobs();
+        if (jobs.error) jobs.error.dispose();
+      } catch {
+        /* interrupted or already terminal */
+      }
+      for (const handle of [resultReader, workspaceReader]) {
+        try {
+          handle?.dispose();
+        } catch {
+          /* already disposed */
+        }
+      }
+      inflight.clear();
+      try {
+        ctx.dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        runtime.dispose();
+      } catch {
+        /* ignore */
+      }
+      return outcome;
+    };
+
+    const completeDeferred = (deferred: QuickJSDeferredPromise, payloadJson: string): void => {
+      if (!alive || !epochOpen || !outstanding.has(deferred)) return;
+      try {
+        settle(deferred, payloadJson);
+      } catch {
+        deferred.dispose();
+      } finally {
+        outstanding.delete(deferred);
+      }
+    };
+
     const hostFn = ctx.newFunction("__rlm_host", (nameHandle, argsHandle): QuickJSHandle => {
+      const deferred = ctx.newPromise();
+      if (!epochOpen) {
+        settle(deferred, EPOCH_CLOSED_PAYLOAD);
+        return deferred.handle;
+      }
+
       const name = ctx.getString(nameHandle);
       const args = safeParse(ctx.getString(argsHandle));
-      const deferred = ctx.newPromise();
       outstanding.add(deferred);
-      track(
-        options
-          .dispatch(name, args)
-          .then(
-            (value) => {
-              if (!alive) return;
-              outstanding.delete(deferred);
-              settle(deferred, JSON.stringify({ ok: true, value }));
-            },
-            (error: unknown) => {
-              if (!alive) return;
-              outstanding.delete(deferred);
-              settle(deferred, JSON.stringify({ ok: false, error: normalizeError(error) }));
-            },
-          ),
-      );
+      let operation!: Promise<void>;
+      operation = (async () => {
+        try {
+          const value = await options.dispatch(name, args, cellAbort.signal);
+          let payloadJson: string;
+          try {
+            payloadJson = JSON.stringify({ ok: true, value });
+          } catch (error) {
+            payloadJson = JSON.stringify({ ok: false, error: normalizeError(error) });
+          }
+          completeDeferred(deferred, payloadJson);
+        } catch (error) {
+          completeDeferred(deferred, JSON.stringify({ ok: false, error: normalizeError(error) }));
+        }
+      })()
+        .catch(() => {
+          // Bridge completion must never become an unhandled host rejection.
+        })
+        .finally(() => inflight.delete(operation));
+      inflight.add(operation);
       return deferred.handle;
     });
     hostFn.consume((f) => ctx.setProp(ctx.global, "__rlm_host", f));
@@ -120,56 +235,30 @@ export class QuickJsBackend implements InterpreterBackend {
     });
     effectFn.consume((f) => ctx.setProp(ctx.global, "__rlm_effect", f));
 
-    const disableInterrupts = (): void => {
-      try {
-        runtime.setInterruptHandler(() => false);
-      } catch {
-        /* ignore */
-      }
-    };
-
-    const finish = async (outcome: CellEvalOutcome): Promise<CellEvalOutcome> => {
-      alive = false;
-      disableInterrupts();
-      // Settle any promise the guest left unawaited so the runtime can free it.
-      // A fulfilled promise with no reactions is simply collected; leaving it
-      // unsettled makes JS_FreeRuntime assert on a non-empty GC list.
-      for (const deferred of outstanding) {
-        try {
-          settle(deferred, JSON.stringify({ ok: false, error: { name: "RlmError", message: "cell epoch closed" } }));
-        } catch {
-          /* ignore */
-        }
-      }
-      outstanding.clear();
-      try {
-        runtime.executePendingJobs();
-      } catch {
-        /* ignore */
-      }
-      // Late host callbacks observe `alive === false` and no-op.
-      await Promise.allSettled([...inflight]);
-      try {
-        ctx.dispose();
-      } catch {
-        /* ignore */
-      }
-      try {
-        runtime.dispose();
-      } catch {
-        /* ignore */
-      }
-      return outcome;
-    };
-
     // Install preamble (data globals + shims).
     const pre = ctx.evalCode(buildPreamble(options.globals), "preamble.js");
     if (pre.error) {
       const message = describe(ctx, pre.error);
       pre.error.dispose();
-      return finish({ kind: "terminal", error: interpreterError("PARSE_ERROR", `preamble failed: ${message}`) });
+      return finish({ kind: "terminal", error: interpreterError(classify(message), `preamble failed: ${message}`) });
     }
     pre.value.dispose();
+
+    // Capture serialization intrinsics before the cell can replace built-ins.
+    const resultReaderResult = ctx.evalCode(RESULT_READBACK, "result-reader.js");
+    if (resultReaderResult.error) {
+      const message = describe(ctx, resultReaderResult.error);
+      resultReaderResult.error.dispose();
+      return finish({ kind: "terminal", error: interpreterError(classify(message), `result reader failed: ${message}`) });
+    }
+    resultReader = resultReaderResult.value;
+    const workspaceReaderResult = ctx.evalCode(WORKSPACE_READBACK, "workspace-reader.js");
+    if (workspaceReaderResult.error) {
+      const message = describe(ctx, workspaceReaderResult.error);
+      workspaceReaderResult.error.dispose();
+      return finish({ kind: "terminal", error: interpreterError(classify(message), `workspace reader failed: ${message}`) });
+    }
+    workspaceReader = workspaceReaderResult.value;
 
     // Evaluate the cell IIFE (returns a promise handle).
     const evalRes = ctx.evalCode(options.source, "cell.js");
@@ -180,21 +269,56 @@ export class QuickJsBackend implements InterpreterBackend {
     }
     const topHandle = evalRes.value;
 
-    // Drive loop: centralized pumping until the cell promise settles.
-    const readWorkspace = (): { workspace: JsonValue; invalid: string[] } => {
-      const res = ctx.evalCode(WORKSPACE_READBACK, "workspace.js");
+    const readResult = (handle: QuickJSHandle): Readback<{ result: JsonValue | undefined; hasResult: boolean }> => {
+      const res = ctx.callFunction(resultReader!, ctx.undefined, handle);
       if (res.error) {
+        const message = describe(ctx, res.error);
         res.error.dispose();
-        return { workspace: {}, invalid: ["<readback-error>"] };
+        const terminalCode = terminalFromGuestMessage(message);
+        if (terminalCode || deadlineExceeded()) {
+          return { ok: false, error: interpreterError(terminalCode ?? "CPU_LIMIT", `result readback failed: ${message}`) };
+        }
+        return { ok: true, value: { result: undefined, hasResult: false } };
       }
-      const raw = ctx.getString(res.value);
-      res.value.dispose();
-      const parsed = safeParse(raw) as { bad?: string[]; json?: JsonValue };
-      return { workspace: parsed.json ?? {}, invalid: parsed.bad ?? [] };
+      try {
+        const raw = ctx.getString(res.value);
+        if (raw.length === 0) return { ok: true, value: { result: undefined, hasResult: false } };
+        return { ok: true, value: { result: JSON.parse(raw) as JsonValue, hasResult: true } };
+      } catch (error) {
+        return { ok: false, error: interpreterError("UNHANDLED_REJECTION", `result readback failed: ${String(error)}`) };
+      } finally {
+        res.value.dispose();
+      }
+    };
+
+    const readWorkspace = (): Readback<WorkspaceReadback> => {
+      const res = ctx.callFunction(workspaceReader!, ctx.undefined);
+      if (res.error) {
+        const message = describe(ctx, res.error);
+        res.error.dispose();
+        const code = deadlineExceeded() ? "CPU_LIMIT" : classify(message);
+        return { ok: false, error: interpreterError(code, `workspace readback failed: ${message}`) };
+      }
+      try {
+        const parsed = JSON.parse(ctx.getString(res.value)) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid readback envelope");
+        const record = parsed as { bad?: unknown; json?: unknown };
+        if (!Array.isArray(record.bad) || !record.bad.every((path) => typeof path === "string")) throw new Error("invalid readback paths");
+        return { ok: true, value: { workspace: (record.json ?? {}) as JsonValue, invalid: record.bad } };
+      } catch (error) {
+        return { ok: false, error: interpreterError("UNHANDLED_REJECTION", `workspace readback failed: ${String(error)}`) };
+      } finally {
+        res.value.dispose();
+      }
     };
 
     try {
       for (;;) {
+        if (deadlineExceeded()) {
+          topHandle.dispose();
+          return finish({ kind: "terminal", error: interpreterError("CPU_LIMIT", "cell exceeded deadline") });
+        }
+
         let state = ctx.getPromiseState(topHandle);
         // Only pump while still pending. Pumping a settled (possibly interrupted)
         // promise near the deadline re-triggers the interrupt and corrupts the
@@ -210,8 +334,14 @@ export class QuickJsBackend implements InterpreterBackend {
           state = ctx.getPromiseState(topHandle);
         }
 
+        if (deadlineExceeded()) {
+          if (state.type === "fulfilled") state.value.dispose();
+          else if (state.type === "rejected") state.error.dispose();
+          topHandle.dispose();
+          return finish({ kind: "terminal", error: interpreterError("CPU_LIMIT", "cell exceeded deadline") });
+        }
+
         if (state.type !== "pending") {
-          disableInterrupts();
           if (state.type === "rejected") {
             const rejMessage = errorMessage(ctx, state.error);
             const terminalCode = terminalFromGuestMessage(rejMessage);
@@ -221,58 +351,62 @@ export class QuickJsBackend implements InterpreterBackend {
               return finish({ kind: "terminal", error: interpreterError(terminalCode, rejMessage) });
             }
           }
-          // Epoch closes when the cell promise settles. Any bridge work the
-          // guest failed to await is a bug: fail the cell recoverably.
-          if (inflight.size > 0) {
+
+          // Epoch closes before attacker-controlled result/workspace traversal.
+          // Getter-triggered bridge calls are rejected without host dispatch.
+          const unawaitedCount = inflight.size;
+          closeEpoch(new Error("cell epoch closed"));
+          if (unawaitedCount > 0) {
             if (state.type === "fulfilled") state.value.dispose();
             else state.error.dispose();
-            const count = inflight.size;
             topHandle.dispose();
             const ws = readWorkspace();
+            if (!ws.ok) return finish({ kind: "terminal", error: ws.error });
             return finish({
               kind: "guest_error",
-              message: `UNAWAITED_WORK: ${count} host call(s) were not awaited before the cell returned`,
-              workspace: ws.workspace,
-              workspaceInvalidPaths: ws.invalid,
+              message: `UNAWAITED_WORK: ${unawaitedCount} host call(s) were not awaited before the cell returned`,
+              workspace: ws.value.workspace,
+              workspaceInvalidPaths: ws.value.invalid,
             });
           }
+
           if (state.type === "fulfilled") {
-            const result = toJson(ctx, state.value);
+            const result = readResult(state.value);
             state.value.dispose();
             topHandle.dispose();
+            if (!result.ok) return finish({ kind: "terminal", error: result.error });
             const ws = readWorkspace();
+            if (!ws.ok) return finish({ kind: "terminal", error: ws.error });
             return finish({
               kind: "value",
-              result,
-              hasResult: result !== undefined,
-              workspace: ws.workspace,
-              workspaceInvalidPaths: ws.invalid,
+              result: result.value.result,
+              hasResult: result.value.hasResult,
+              workspace: ws.value.workspace,
+              workspaceInvalidPaths: ws.value.invalid,
             });
           }
+
           const message = errorMessage(ctx, state.error);
           state.error.dispose();
           topHandle.dispose();
           const ws = readWorkspace();
-          return finish({ kind: "guest_error", message, workspace: ws.workspace, workspaceInvalidPaths: ws.invalid });
+          if (!ws.ok) return finish({ kind: "terminal", error: ws.error });
+          return finish({ kind: "guest_error", message, workspace: ws.value.workspace, workspaceInvalidPaths: ws.value.invalid });
         }
 
         if (inflight.size === 0) {
-          disableInterrupts();
+          closeEpoch(new Error("cell epoch closed"));
           topHandle.dispose();
           const ws = readWorkspace();
+          if (!ws.ok) return finish({ kind: "terminal", error: ws.error });
           return finish({
             kind: "guest_error",
             message: "cell promise did not settle and no host work is pending",
-            workspace: ws.workspace,
-            workspaceInvalidPaths: ws.invalid,
+            workspace: ws.value.workspace,
+            workspaceInvalidPaths: ws.value.invalid,
           });
         }
-        await Promise.race([...inflight]);
-        if (Date.now() >= options.deadlineMs) {
-          disableInterrupts();
-          topHandle.dispose();
-          return finish({ kind: "terminal", error: interpreterError("CPU_LIMIT", "cell exceeded deadline") });
-        }
+        await Promise.race([deadline, ...inflight]);
       }
     } catch (error) {
       try {
@@ -307,16 +441,6 @@ const normalizeError = (error: unknown): { name: string; message: string; code?:
     };
   }
   return { name: "Error", message: String(error) };
-};
-
-const toJson = (ctx: QuickJSContext, handle: QuickJSHandle): JsonValue | undefined => {
-  try {
-    const dumped = ctx.dump(handle) as unknown;
-    if (dumped === undefined) return undefined;
-    return JSON.parse(JSON.stringify(dumped)) as JsonValue;
-  } catch {
-    return undefined;
-  }
 };
 
 const errorMessage = (ctx: QuickJSContext, handle: QuickJSHandle): string => {
