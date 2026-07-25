@@ -16,7 +16,7 @@ import {
   settleAttemptUsage,
 } from "../core/budget.ts";
 import { type CallError, callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
-import type { RlmEvent } from "../core/journal.ts";
+import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, type JsonObject, type JsonValue } from "../core/json.ts";
 import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
 import {
@@ -35,7 +35,7 @@ import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
 export const DEFAULT_MAX_OUTPUT_TOKENS = 512;
-export const PROVIDER_REQUEST_IDENTITY_VERSION = "1";
+export { PROVIDER_REQUEST_IDENTITY_VERSION };
 
 interface PreparedModelRequest {
   readonly request: ModelRequest;

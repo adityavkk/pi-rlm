@@ -80,7 +80,7 @@ const hasErrorCode = (error: unknown, code: string): boolean =>
 
 type ProgressEvent = Extract<RlmEvent, { type: "phase" | "emit" }>;
 
-const appendCellBatch = async (state: RunState, events: readonly RlmEvent[]): Promise<void> => {
+const appendCellBatch = async (state: InternalRunState, events: readonly RlmEvent[]): Promise<void> => {
   const outcome = await state.journal.appendBatch(events);
   if (outcome.events.some((event) => event === "ignored_after_terminal"))
     throw new Error("cell journal batch ignored after terminal");

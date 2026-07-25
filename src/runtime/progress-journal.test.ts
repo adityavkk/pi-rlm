@@ -21,6 +21,10 @@ beforeAll(async () => {
   backend = await QuickJsBackend.create();
 });
 
+const modelIdentity = (fixture: string) => ({
+  id: "test/progress-model", version: "1", configuration: { fixture },
+} as const);
+
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-progress-"));
 const events = async (dir: string): Promise<RlmEvent[]> => {
   const result = await new JournalStore(dir).readEvents();
@@ -54,7 +58,7 @@ const run = (dir: string, controller: MockController, options: {
   program: program(),
   sources: {},
   controller,
-  model: options.model ?? new MockModelClient(() => "unused"),
+  model: options.model ?? new MockModelClient(() => "unused", modelIdentity("default")),
   backend,
   dir,
   signal: options.signal ?? new AbortController().signal,
@@ -189,7 +193,7 @@ describe("authoritative progress journal effects", () => {
     const model = new MockModelClient(() => {
       owner.abort();
       return "late";
-    });
+    }, modelIdentity("cancellation"));
     const result = await run(dir, new MockController([{
       reasoning: "cancel after progress",
       code: "phase('not-committed'); await llm({ key: 'cancel', prompt: 'cancel' }); 'late'",
@@ -281,6 +285,7 @@ describe("authoritative progress journal effects", () => {
         reasoning: objective,
         code: `phase('${objective}'); emit({ message: '${objective}-emit' }); answer('${objective}-answer'); 'ok'`,
       }]),
+      { id: "test/progress-fork-factory", version: "1", configuration: { fixture: "overlapping-child-batches" } },
     );
     const result = await run(dir, controller, { journal });
 

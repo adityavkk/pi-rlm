@@ -1,6 +1,6 @@
 import { isProxy } from "node:util/types";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
-import type { RlmEvent } from "../core/journal.ts";
+import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
 import { err, ok, type Result } from "../core/result.ts";
 
 const MAX_EVENT_DEPTH = 5;
@@ -173,11 +173,16 @@ const validEvent = (event: RecordValue): boolean => {
     case "fallback_evidence_cited":
       return exact(event, ["type", "frameId", "evidenceRefs", "evidenceRefsHash"])
         && string(event, "frameId", false) && validStringArray(event["evidenceRefs"]) && hash(event, "evidenceRefsHash");
-    case "provider_attempted":
-      return exact(event, ["type", "frameId", "operationId", "kind", "key", "attempt", "outcome", "usage"], ["errorCode"])
-        && string(event, "frameId", false) && string(event, "operationId", false) && oneOf(event, "kind", PROVIDER_KINDS)
-        && string(event, "key") && integer(event, "attempt", true) && oneOf(event, "outcome", PROVIDER_OUTCOMES)
-        && validUsage(event["usage"]) && optional(event, "errorCode", () => string(event, "errorCode", false));
+    case "provider_attempted": {
+      if (!exact(event, ["type", "frameId", "operationId", "kind", "key", "attempt", "outcome", "usage"],
+        ["requestIdentityVersion", "requestSha256", "errorCode"])
+        || !string(event, "frameId", false) || !string(event, "operationId", false) || !oneOf(event, "kind", PROVIDER_KINDS)
+        || !string(event, "key") || !integer(event, "attempt", true) || !oneOf(event, "outcome", PROVIDER_OUTCOMES)
+        || !validUsage(event["usage"]) || !optional(event, "errorCode", () => string(event, "errorCode", false))) return false;
+      const requestIdentityFields = Number(own(event, "requestIdentityVersion")) + Number(own(event, "requestSha256"));
+      return requestIdentityFields === 0 || (requestIdentityFields === 2
+        && event["requestIdentityVersion"] === PROVIDER_REQUEST_IDENTITY_VERSION && hash(event, "requestSha256"));
+    }
     case "call_committed":
       return exact(event, ["type", "frameId", "callId", "kind", "key", "cached", "ok", "usage"],
         ["outputRef", "outputSha256", "outputBytes"])

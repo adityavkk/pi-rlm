@@ -13,6 +13,7 @@ import type { CallKind } from "./ids.ts";
 import type { CallUsage } from "./usage.ts";
 
 export type ProviderOperationKind = "controller" | "llm" | "extractor";
+export const PROVIDER_REQUEST_IDENTITY_VERSION = "pi-rlm.provider-request.v1";
 
 export type CompletionMode = "answer" | "fallback_extract";
 export type RunState = "running" | "completed" | "failed" | "cancelled";
