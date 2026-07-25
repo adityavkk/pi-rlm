@@ -87,7 +87,8 @@ interface WorkspaceReadback {
 type Readback<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: InterpreterError };
 
 export class QuickJsBackend implements InterpreterBackend {
-  readonly id = "quickjs-emscripten-core@0.32.0/singlefile-sync";
+  readonly id = "quickjs-emscripten-core/singlefile-sync";
+  readonly version = "0.32.0";
 
   private constructor(private readonly module: QuickJSWASMModule) {}
 

@@ -30,6 +30,7 @@ import {
 import {
   DEFAULT_PROFILE,
   ModelController,
+  type LaunchAuthorizationMode,
   type Profile,
   runProgram,
   type RunResult,
@@ -154,12 +155,14 @@ export interface RlmRuntimeDependencies {
   readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
   readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
   readonly createRunDirectory?: () => Promise<string>;
+  readonly createRunNonce?: () => string;
 }
 
 const executeRun = async (
   request: LaunchRequest,
   signal: AbortSignal,
   dependencies: RlmRuntimeDependencies = {},
+  authorizationMode: LaunchAuthorizationMode = "direct",
 ): Promise<RunResult> => {
   throwIfAborted(signal);
   const profile = (dependencies.resolveProfile ?? resolveProfile)();
@@ -190,11 +193,17 @@ const executeRun = async (
     dir,
     profile,
     signal,
+    authorizationMode,
+    createRunNonce: dependencies.createRunNonce,
   });
 };
 
 export interface RlmExtensionDependencies {
-  readonly executeRun?: (request: LaunchRequest, signal: AbortSignal) => Promise<RunResult>;
+  readonly executeRun?: (
+    request: LaunchRequest,
+    signal: AbortSignal,
+    authorizationMode: LaunchAuthorizationMode,
+  ) => Promise<RunResult>;
   readonly runtime?: RlmRuntimeDependencies;
   readonly now?: () => number;
   readonly createId?: () => string;
@@ -235,7 +244,7 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
-  const run = dependencies.executeRun ?? ((request, signal) => executeRun(request, signal, dependencies.runtime));
+  const run = dependencies.executeRun ?? ((request, signal, mode) => executeRun(request, signal, dependencies.runtime, mode));
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
@@ -391,7 +400,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       activeCommandRuns.add(commandController);
       ctx.ui.setStatus("pi-rlm", "running...");
       try {
-        const result = await run(built.value, commandController.signal);
+        const result = await run(built.value, commandController.signal, "slash_command");
         ctx.ui.notify(summarize(result), result.status === "completed" ? "info" : "error");
       } catch (error) {
         ctx.ui.notify(
@@ -483,7 +492,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         consumedToolCalls.add(callKey);
         audit(authorization.grant);
         try {
-          const result = await run(built.value, toolSignal);
+          const result = await run(built.value, toolSignal, "confirmed");
           return { content: [{ type: "text", text: summarize(result) }], details: { status: result.status } };
         } catch (error) {
           return {

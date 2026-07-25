@@ -1,10 +1,9 @@
 /** Top-level run orchestration and exactly-once durable finalization. */
 
 import { createLedger, type Ledger } from "../core/budget.ts";
-import { identityHash } from "../core/ids.ts";
 import type { FrameState, RlmEvent } from "../core/journal.ts";
 import type { JsonValue } from "../core/json.ts";
-import { programIdentity, type RlmProgram } from "../core/program.ts";
+import type { RlmProgram } from "../core/program.ts";
 import {
   ContextBudgetError,
   type ContextDescriptor,
@@ -28,7 +27,6 @@ import {
 import {
   buildExtractorEvidence,
   ExtractorEvidenceDeadlineError,
-  extractorEvidenceIdentity,
 } from "./extractor-evidence.ts";
 import { runFrame } from "./frame.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
@@ -36,6 +34,12 @@ import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, InternalRunState } from "./state.ts";
+import {
+  buildRunManifest,
+  claimRunDirectory,
+  type LaunchAuthorizationMode,
+  type RunDirectoryFileSystem,
+} from "./run-manifest.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 
@@ -53,6 +57,12 @@ export interface RunInput {
   readonly clock?: Clock;
   readonly profile?: Profile;
   readonly extractor?: Extractor;
+  /** Non-secret authorization path that admitted this launch. */
+  readonly authorizationMode?: LaunchAuthorizationMode;
+  /** Cryptographically random by default; injectable only for deterministic tests. */
+  readonly createRunNonce?: () => string;
+  /** Optional manifest persistence injection for fault testing. */
+  readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
 }
@@ -312,8 +322,28 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const profile = input.profile ?? DEFAULT_PROFILE;
   const startMs = clock.now();
   const limits = resolveLimits(profile, startMs);
+  const document = buildRunManifest({
+    program: input.program,
+    sources: input.sources,
+    profile,
+    backend: input.backend,
+    controller: input.controller,
+    extractor: input.extractor,
+    authorizationMode: input.authorizationMode,
+    createRunNonce: input.createRunNonce,
+    dslVersion: RLM_DSL_VERSION,
+  });
   const ledgerRef = { current: createLedger(limits) };
-  const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`)}`;
+  const runId = document.manifest.run.id;
+  try {
+    await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem);
+  } catch (error) {
+    const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
+    const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
+    if (code === "ENOENT" || code === "ENOTDIR")
+      return { ...failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error), ledger: ledgerRef.current };
+    throw error;
+  }
   const rootFrameId = `${runId}:f0`;
   const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
@@ -336,13 +366,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   });
 
   try {
-    const manifestHash = sha256(JSON.stringify({
-      program: programIdentity(input.program),
-      profile: profile.name,
-      dsl: RLM_DSL_VERSION,
-      backend: input.backend.id,
-      extractorEvidence: extractorEvidenceIdentity(profile),
-    }));
+    const manifestHash = document.manifestHash;
     phase = "source";
     const sourceTransaction = await store.beginIngestTexts(
       input.program.inputs.map((declared) => ({
@@ -357,18 +381,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throwIfAborted(scope.signal);
       phase = "journal";
       try {
-        const outcome = await journal.append({
-          type: "run_started",
-          runId,
-          manifestHash,
-          limits,
-          inputRefs: sourceTransaction.value.map((descriptor) => ({
-            name: descriptor.label,
-            id: descriptor.id,
-            sha256: descriptor.sha256,
-            bytes: descriptor.bytes,
-          })),
-        });
+        const outcome = await journal.append({ type: "run_started", runId, manifestHash, limits });
         sourceDurable = outcome.event === "committed";
       } catch (error) {
         sourceDurable = error instanceof JournalAppendError && error.eventDurable;
@@ -505,7 +518,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
               state,
               `fallback:${rootFrameId}`,
               extracted.value,
-              (outputRef, outputBytes, outputSha256) => [{
+              (outputRef) => [{
                 type: "fallback_evidence_cited",
                 frameId: rootFrameId,
                 evidenceRefs: extracted.evidenceRefs,
@@ -515,8 +528,6 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
                 frameId: rootFrameId,
                 completionMode: "fallback_extract",
                 outputRef,
-                outputSha256,
-                outputBytes,
               }],
               limits.deadlineMs,
               scope.signal,
