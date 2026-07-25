@@ -8,17 +8,18 @@
 
 import { releaseBytes, releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
 import { callError } from "../core/errors.ts";
-import { deriveCallId } from "../core/ids.ts";
+import { deriveCallId, identityHash, type CallKind } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
-import { isJsonObject } from "../core/json.ts";
+import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
-import type { ContextOperationControl } from "../shell/context-store.ts";
+import type { ContextDescriptor, ContextOperationControl } from "../shell/context-store.ts";
+import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
-import type { FrameRef, RunState } from "./state.ts";
+import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
 
 export type RecurseFn = (args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<GuestCallResult>;
 
@@ -40,14 +41,20 @@ const reqStr = (obj: JsonObject, key: string): string => {
   return v;
 };
 
-const contextIds = (value: JsonValue | undefined): string[] => {
+export const resolveContextRefs = (
+  state: RunState,
+  value: JsonValue | undefined,
+  field: string,
+): ContextDescriptor[] => {
   if (value === undefined) return [];
   const list = Array.isArray(value) ? value : [value];
-  const ids: string[] = [];
-  for (const item of list) {
-    if (isJsonObject(item) && typeof item["id"] === "string") ids.push(item["id"]);
-  }
-  return ids;
+  return list.map((item) => {
+    if (!isJsonObject(item) || typeof item["id"] !== "string" || item["id"].length === 0)
+      throw new DslError("INVALID_SPEC", `${field} must contain context handles`);
+    const descriptor = state.store.get(item["id"]);
+    if (!descriptor) throw new DslError("INVALID_STATE", `context ${item["id"]} not found`);
+    return descriptor;
+  });
 };
 
 const resolveModel = (state: RunState, selector: JsonValue | undefined): { model: string; thinking?: ThinkingLevel } => {
@@ -75,6 +82,150 @@ const strictJson = (text: string): { ok: true; value: JsonValue } | { ok: false 
 };
 
 const now = (state: RunState): number => state.clock.now();
+
+interface KeyClaim {
+  readonly frame: FrameRef;
+  readonly kind: CallKind;
+  readonly key: string;
+  readonly identity: JsonValue;
+}
+
+const keyRegistryId = (kind: CallKind, key: string): string => `${kind}\u0000${key}`;
+
+/** Atomically validate and bind stable keys before any reservation or effect. */
+export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Promise<void> => {
+  const requested = new Map<string, KeyClaim & { canonicalIdentity: string; identityHash: string }>();
+  for (const claim of claims) {
+    const canonicalIdentity = canonicalStringify(claim.identity);
+    const normalized = { ...claim, canonicalIdentity, identityHash: identityHash(state.hasher, claim.identity) };
+    const id = keyRegistryId(claim.kind, claim.key);
+    const prior = requested.get(id);
+    if (prior && prior.canonicalIdentity !== canonicalIdentity)
+      throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
+    if (!prior) requested.set(id, normalized);
+  }
+
+  for (;;) {
+    const pending: Promise<void>[] = [];
+    const additions: Array<KeyClaim & { canonicalIdentity: string; identityHash: string }> = [];
+    for (const [id, claim] of requested) {
+      const bound = state.keyIdentities.get(id);
+      if (bound && bound.canonicalIdentity !== claim.canonicalIdentity)
+        throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
+      if (bound?.state === "durable_failed") throw bound.error;
+      if (bound?.state === "pending") pending.push(bound.ready);
+      if (!bound) additions.push(claim);
+    }
+
+    if (pending.length > 0) {
+      await Promise.all(pending);
+      continue;
+    }
+    if (additions.length === 0) return;
+
+    const installed = additions.map((claim) => {
+      let resolveReady!: () => void;
+      let rejectReady!: (error: unknown) => void;
+      const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      const binding: KeyIdentityBinding = {
+        canonicalIdentity: claim.canonicalIdentity,
+        identityHash: claim.identityHash,
+        ready,
+        state: "pending",
+      };
+      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), binding);
+      return { claim, binding, resolveReady, rejectReady };
+    });
+    // Observe every deferred before journal I/O can reject one. This also makes
+    // the initiating caller receive the same failure as concurrent waiters.
+    const installedReady = Promise.all(installed.map(({ binding }) => binding.ready));
+
+    for (let index = 0; index < installed.length; index++) {
+      const current = installed[index]!;
+      const { claim, binding } = current;
+      try {
+        await state.journal.append({
+          type: "key_bound",
+          frameId: claim.frame.frameId,
+          kind: claim.kind,
+          key: claim.key,
+          identityHash: claim.identityHash,
+        });
+        binding.state = "durable";
+        current.resolveReady();
+      } catch (error) {
+        if (error instanceof JournalAppendError && error.eventDurable) {
+          binding.state = "durable_failed";
+          binding.error = error;
+        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key)) === binding) {
+          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key));
+        }
+        current.rejectReady(error);
+        for (const remaining of installed.slice(index + 1)) {
+          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key);
+          if (state.keyIdentities.get(id) === remaining.binding) state.keyIdentities.delete(id);
+          remaining.rejectReady(error);
+        }
+        await installedReady;
+        return;
+      }
+    }
+    await installedReady;
+    return;
+  }
+};
+
+interface NormalizedLlmSpec {
+  readonly key: string;
+  readonly prompt: string;
+  readonly model: string;
+  readonly thinking?: ThinkingLevel;
+  readonly contextIds: string[];
+  readonly schema?: JsonObject;
+  readonly maxOutputTokens?: number;
+  readonly identity: JsonValue;
+}
+
+const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec => {
+  const key = reqStr(spec, "key");
+  const prompt = reqStr(spec, "prompt");
+  const { model, thinking } = resolveModel(state, spec["model"]);
+  const contexts = resolveContextRefs(state, spec["context"], "context");
+  const ctxIds = contexts.map((context) => context.id);
+  const schemaValue = spec["schema"];
+  let schema: JsonObject | undefined;
+  if (schemaValue !== undefined) {
+    const normalized = normalizeJsonSchema(schemaValue);
+    if (!normalized.ok)
+      throw new DslError(
+        "INVALID_SPEC",
+        `invalid JSON schema: ${normalized.error.map((error) => `${error.path}: ${error.message}`).join("; ")}`,
+      );
+    schema = normalized.value;
+  }
+  const maxOutputTokens = typeof spec["maxOutputTokens"] === "number" ? spec["maxOutputTokens"] : undefined;
+  const identity: JsonValue = {
+    prompt,
+    model,
+    ...(thinking ? { thinking } : {}),
+    ...(schema ? { schema } : {}),
+    contexts: contexts.map((context) => context.sha256),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+  };
+  return {
+    key,
+    prompt,
+    model,
+    ...(thinking ? { thinking } : {}),
+    contextIds: ctxIds,
+    ...(schema ? { schema } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+    identity,
+  };
+};
 
 /** Handle one value-returning guest call. */
 export const dispatchCall = async (
@@ -143,12 +294,25 @@ export const dispatchCall = async (
     }
     case "context.provenance":
       return [] as unknown as JsonValue;
-    case "contexts.derive":
+    case "contexts.derive": {
+      const spec = deriveSpec(asObject(args));
+      const identity: JsonValue = { operation: "derive", value: spec.value, label: spec.label ?? `derived:${spec.key}` };
+      await bindKeys(state, [{ frame, kind: "context", key: spec.key, identity }]);
       return withContextMutation(state, () =>
-        state.store.derive(deriveSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
-    case "contexts.concat":
+        state.store.derive(spec, contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+    }
+    case "contexts.concat": {
+      const { spec, descriptors } = concatSpec(state, asObject(args));
+      const identity: JsonValue = {
+        operation: "concat",
+        refs: descriptors.map((descriptor) => descriptor.sha256),
+        separator: spec.separator ?? "\n",
+        label: spec.label ?? `concat:${spec.key}`,
+      };
+      await bindKeys(state, [{ frame, kind: "context", key: spec.key, identity }]);
       return withContextMutation(state, () =>
-        state.store.concat(concatSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+        state.store.concat(spec, contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
+    }
     case "contexts.open": {
       const id = reqStr(asObject(args), "id");
       const desc = state.store.get(id);
@@ -156,7 +320,7 @@ export const dispatchCall = async (
       return desc as unknown as JsonValue;
     }
     case "artifacts.write":
-      return writeArtifact(state, asObject(args)) as unknown as JsonValue;
+      return writeArtifact(state, frame, asObject(args)) as unknown as JsonValue;
     case "artifacts.open": {
       const id = reqStr(asObject(args), "id");
       const entry = state.artifacts.get(id);
@@ -218,15 +382,29 @@ export const contextControl = (
 });
 
 const deriveSpec = (spec: JsonObject): { key: string; value: string | JsonValue; label?: string } => {
+  const key = reqStr(spec, "key");
+  if (!Object.prototype.hasOwnProperty.call(spec, "value"))
+    throw new DslError("INVALID_SPEC", '"value" is required');
   const label = spec["label"];
-  return { key: reqStr(spec, "key"), value: spec["value"] as JsonValue, ...(typeof label === "string" ? { label } : {}) };
+  return { key, value: spec["value"] as JsonValue, ...(typeof label === "string" ? { label } : {}) };
 };
 
-const concatSpec = (spec: JsonObject): { key: string; refs: Array<{ id: string }>; separator?: string; label?: string } => {
-  const refs = contextIds(spec["refs"]).map((id) => ({ id }));
-  const sep = spec["separator"];
-  const label = spec["label"];
-  return { key: reqStr(spec, "key"), refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) };
+const concatSpec = (
+  state: RunState,
+  value: JsonObject,
+): {
+  spec: { key: string; refs: Array<{ id: string }>; separator?: string; label?: string };
+  descriptors: ContextDescriptor[];
+} => {
+  const key = reqStr(value, "key");
+  const descriptors = resolveContextRefs(state, value["refs"], "refs");
+  const refs = descriptors.map(({ id }) => ({ id }));
+  const sep = value["separator"];
+  const label = value["label"];
+  return {
+    spec: { key, refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) },
+    descriptors,
+  };
 };
 
 export const withContextMutation = async <T>(
@@ -244,50 +422,38 @@ export const withContextMutation = async <T>(
   }
 };
 
-const writeArtifact = async (state: RunState, spec: JsonObject) => {
+const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject) => {
   const key = reqStr(spec, "key");
   const name = reqStr(spec, "name");
+  if (!Object.prototype.hasOwnProperty.call(spec, "value"))
+    throw new DslError("INVALID_SPEC", '"value" is required');
   const value = spec["value"] as JsonValue;
-  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
+  const identity: JsonValue = { name, value, mimeType };
+  await bindKeys(state, [{ frame, kind: "artifact", key, identity }]);
+  const text = typeof value === "string" ? value : canonicalStringify(value);
   const sha = state.hasher(text);
   const id = `art_${sha.slice(0, 16)}`;
-  const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
   const descriptor = { id, name, bytes: new TextEncoder().encode(text).length, sha256: sha, mimeType };
   if (!state.artifacts.has(id)) {
     state.artifacts.set(id, { descriptor, text });
     const reserved = reserveBytes(state.ledger.current, descriptor.bytes);
     if (reserved.ok) state.ledger.current = reserved.value;
   }
-  void key;
   return descriptor;
 };
 
-const llm = async (state: RunState, frame: FrameRef, spec: JsonObject, signal: AbortSignal): Promise<GuestCallResult> => {
-  const key = reqStr(spec, "key");
-  const prompt = reqStr(spec, "prompt");
-  const { model, thinking } = resolveModel(state, spec["model"]);
-  const ctxIds = contextIds(spec["context"]);
-  const schemaValue = spec["schema"];
-  let schema: JsonObject | undefined;
-  if (schemaValue !== undefined) {
-    const normalized = normalizeJsonSchema(schemaValue);
-    if (!normalized.ok)
-      throw new DslError(
-        "INVALID_SPEC",
-        `invalid JSON schema: ${normalized.error.map((error) => `${error.path}: ${error.message}`).join("; ")}`,
-      );
-    schema = normalized.value;
-  }
-  const maxOutputTokens = typeof spec["maxOutputTokens"] === "number" ? spec["maxOutputTokens"] : undefined;
-  const identity: JsonValue = {
-    prompt,
-    model,
-    ...(thinking ? { thinking } : {}),
-    ...(schema ? { schema } : {}),
-    contexts: ctxIds.map((id) => state.store.get(id)?.sha256 ?? id),
-    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
-  };
+const llm = async (
+  state: RunState,
+  frame: FrameRef,
+  spec: JsonObject,
+  signal: AbortSignal,
+  identityBound = false,
+): Promise<GuestCallResult> => {
+  const normalized = normalizeLlmSpec(state, spec);
+  const { key, prompt, model, thinking, contextIds: ctxIds, schema, maxOutputTokens, identity } = normalized;
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "llm", key, identity });
+  if (!identityBound) await bindKeys(state, [{ frame, kind: "llm", key, identity }]);
 
   const cancelled = (usage: CallUsage = ZERO_CALL_USAGE): GuestCallResult =>
     errResult(callId, callError("CANCELLED", "cell epoch closed"), usage, false);
@@ -420,6 +586,9 @@ const llmBatch = async (
   reqStr(spec, "key");
   const items = spec["items"];
   if (!Array.isArray(items)) throw new DslError("INVALID_SPEC", "llm.batch requires an items array");
+  const itemSpecs = items.map((item) => asObject(item));
+  const normalizedItems = itemSpecs.map((item) => normalizeLlmSpec(state, item));
+  await bindKeys(state, normalizedItems.map((item) => ({ frame, kind: "llm" as const, key: item.key, identity: item.identity })));
   const concurrency = typeof spec["concurrency"] === "number" ? Math.max(1, spec["concurrency"]) : state.profile.maxConcurrency;
   const results: GuestCallResult[] = new Array(items.length);
   let cursor = 0;
@@ -428,7 +597,7 @@ const llmBatch = async (
       throwIfAborted(signal);
       const index = cursor++;
       if (index >= items.length) return;
-      const result = await llm(state, frame, asObject(items[index] as JsonValue), signal);
+      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true);
       throwIfAborted(signal);
       results[index] = result;
     }

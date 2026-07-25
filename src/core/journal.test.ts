@@ -22,6 +22,8 @@ describe("reduceStatus", () => {
       { type: "phase", frameId: "f0", ordinal: 0, name: "explore" },
       { type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "r", codeHash: "h1", hasResult: true, outputPreview: "p1" },
       { type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "r", codeHash: "h1", hasResult: true, outputPreview: "p1" }, // replay dup
+      { type: "key_bound", frameId: "f0", kind: "llm", key: "k", identityHash: "identity-1" },
+      { type: "key_bound", frameId: "f0", kind: "llm", key: "k", identityHash: "identity-1" }, // replay dup
       { type: "call_committed", frameId: "f0", callId: "c1", kind: "llm", key: "k", cached: false, ok: true, usage: ZERO_CALL_USAGE },
       { type: "call_committed", frameId: "f0", callId: "c1", kind: "llm", key: "k", cached: true, ok: true, usage: ZERO_CALL_USAGE }, // replay dup
       { type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: "out" },
@@ -31,6 +33,7 @@ describe("reduceStatus", () => {
     expect(status.state).toBe("completed");
     expect(status.completionMode).toBe("answer");
     expect(status.committedCallIds).toEqual(["c1"]);
+    expect(status.keyBindings).toEqual([{ frameId: "f0", kind: "llm", key: "k", identityHash: "identity-1" }]);
     const f0 = status.frames["f0"]!;
     expect(f0.iterations).toBe(1);
     expect(f0.calls).toBe(1);

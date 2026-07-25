@@ -369,6 +369,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       backend: input.backend,
       callCache: new Map(),
       inflight: new Map(),
+      keyIdentities: new Map(),
       semaphore: new Semaphore(profile.maxConcurrency),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
