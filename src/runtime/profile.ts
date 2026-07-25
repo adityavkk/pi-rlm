@@ -27,6 +27,14 @@ export interface Profile {
   readonly contextMaxMatches: number;
   readonly contextMaxChunks: number;
   readonly contextMaxPatternBytes: number;
+  /** Canonical serialized byte ceiling for one fallback evidence projection. */
+  readonly extractorEvidenceMaxBytes: number;
+  /** Largest workspace value or invalid answer candidate included exactly. */
+  readonly extractorValueMaxBytes: number;
+  /** Aggregate canonical bytes of exact workspace values and candidates. */
+  readonly extractorValuesMaxBytes: number;
+  readonly extractorHandleHeadBytes: number;
+  readonly extractorHandleTailBytes: number;
   readonly trajectory: ProjectionOptions;
   readonly models: { readonly small: string; readonly medium: string; readonly large: string };
 }
@@ -51,6 +59,11 @@ export const DEFAULT_PROFILE: Profile = {
   contextMaxMatches: 1_000,
   contextMaxChunks: 256,
   contextMaxPatternBytes: 4 * 1024,
+  extractorEvidenceMaxBytes: 128 * 1024,
+  extractorValueMaxBytes: 16 * 1024,
+  extractorValuesMaxBytes: 64 * 1024,
+  extractorHandleHeadBytes: 8 * 1024,
+  extractorHandleTailBytes: 4 * 1024,
   trajectory: {
     headEntries: 2,
     tailEntries: 6,
@@ -97,7 +110,21 @@ export const validateProfile = (profile: Profile): void => {
     ["contextMaxMatches", profile.contextMaxMatches],
     ["contextMaxChunks", profile.contextMaxChunks],
     ["contextMaxPatternBytes", profile.contextMaxPatternBytes],
+    ["extractorEvidenceMaxBytes", profile.extractorEvidenceMaxBytes],
+    ["extractorValueMaxBytes", profile.extractorValueMaxBytes],
+    ["extractorValuesMaxBytes", profile.extractorValuesMaxBytes],
+    ["extractorHandleHeadBytes", profile.extractorHandleHeadBytes],
+    ["extractorHandleTailBytes", profile.extractorHandleTailBytes],
   ] as const) safeInteger(name, value, false);
+  if (profile.extractorValueMaxBytes > profile.extractorValuesMaxBytes)
+    throw new TypeError("extractorValueMaxBytes must not exceed extractorValuesMaxBytes");
+  if (profile.extractorValuesMaxBytes > profile.extractorEvidenceMaxBytes)
+    throw new TypeError("extractorValuesMaxBytes must not exceed extractorEvidenceMaxBytes");
+  safeInteger(
+    "extractor handle preview capacity",
+    profile.extractorHandleHeadBytes + profile.extractorHandleTailBytes,
+    false,
+  );
   for (const [name, value] of [
     ["trajectory.headEntries", profile.trajectory.headEntries],
     ["trajectory.tailEntries", profile.trajectory.tailEntries],

@@ -5,7 +5,6 @@ import { identityHash } from "../core/ids.ts";
 import type { FrameState, RlmEvent } from "../core/journal.ts";
 import type { JsonValue } from "../core/json.ts";
 import { programIdentity, type RlmProgram } from "../core/program.ts";
-import { projectTrajectory } from "../core/trajectory.ts";
 import {
   ContextBudgetError,
   type ContextDescriptor,
@@ -20,8 +19,14 @@ import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { persistAnswer } from "./answer-persistence.ts";
 import type { ControllerDriver } from "./controller.ts";
-import type { Extractor } from "./extractor.ts";
+import { normalizeExtractorResult, type Extractor } from "./extractor.ts";
+import {
+  buildExtractorEvidence,
+  ExtractorEvidenceDeadlineError,
+  extractorEvidenceIdentity,
+} from "./extractor-evidence.ts";
 import { runFrame } from "./frame.ts";
+import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
@@ -113,6 +118,8 @@ const exceptionResult = (
   }
   if (error instanceof ModelInvocationError)
     return failure(runId, error.callError.code, error.callError.message, error);
+  if (error instanceof ExtractorEvidenceDeadlineError)
+    return failure(runId, error.code, error.message, error);
   if (error instanceof ContextBudgetError)
     return failure(runId, "BUDGET_BYTES", "stored byte limit reached", error);
   if (error instanceof JournalAppendError)
@@ -328,6 +335,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       profile: profile.name,
       dsl: RLM_DSL_VERSION,
       backend: input.backend.id,
+      extractorEvidence: extractorEvidenceIdentity(profile),
     }));
     phase = "source";
     const sourceTransaction = await store.beginIngestTexts(
@@ -423,53 +431,75 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       };
     } else if (input.extractor) {
       phase = "extractor";
-      const evidence = {
-        outputContract: input.program.outputs,
+      const built = await buildExtractorEvidence({
+        program: input.program,
+        variables: inputs,
         workspace: result.workspace ?? {},
-        trajectory: projectTrajectory(result.entries ?? [], profile.trajectory),
-      };
-      const operation = createModelOperation(state, rootFrame, {
-        operationId: `${runId}:extractor`,
-        kind: "extractor",
-        key: "fallback",
+        entries: result.entries ?? [],
+        store,
+        artifacts: state.artifacts,
+        profile,
         signal: scope.signal,
         deadlineMs: limits.deadlineMs,
+        now: () => clock.now(),
       });
-      const extracted = input.extractor.accountingMode === "provider"
-        ? await waitForAbort(input.extractor.extract(evidence, scope.signal, {
-            complete: (request) => operation.complete(state.model, request),
-          }), scope.signal)
-        : await operation.runExternal(() => input.extractor!.extract(evidence, scope.signal));
-      if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
-        throw new ModelInvocationError(
-          { code: "INVALID_REQUEST", message: "provider extractor returned without using the accounting boundary", retryable: false },
-          operation.usage,
-        );
-      throwIfAborted(scope.signal);
-      if (extracted.ok) {
-        phase = "context";
-        await persistAnswer(
-          state,
-          `fallback:${rootFrameId}`,
-          extracted.value,
-          (outputRef) => [{
-            type: "answer_committed",
-            frameId: rootFrameId,
-            completionMode: "fallback_extract",
-            outputRef,
-          }],
-          limits.deadlineMs,
-          scope.signal,
-        );
-        throwIfAborted(scope.signal);
-        planned = {
-          runId,
-          status: "completed",
-          completionMode: "fallback_extract",
-          answer: extracted.value,
-        };
+      if (!built.ok) {
+        planned = failure(runId, built.code, built.message);
       } else {
-        planned = failure(runId, extracted.code, extracted.message);
+        await journal.append({
+          type: "fallback_evidence_projected",
+          frameId: rootFrameId,
+          ...built.metadata,
+        });
+        const operation = createModelOperation(state, rootFrame, {
+          operationId: `${runId}:extractor`,
+          kind: "extractor",
+          key: built.metadata.projectionHash,
+          signal: scope.signal,
+          deadlineMs: limits.deadlineMs,
+        });
+        const raw = input.extractor.accountingMode === "provider"
+          ? await waitForAbort(input.extractor.extract(built.projection, scope.signal, {
+              complete: (request) => operation.complete(state.model, request),
+            }), scope.signal)
+          : await operation.runExternal(() => input.extractor!.extract(built.projection, scope.signal));
+        if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
+          throw new ModelInvocationError(
+            { code: "INVALID_REQUEST", message: "provider extractor returned without using the accounting boundary", retryable: false },
+            operation.usage,
+          );
+        throwIfAborted(scope.signal);
+        const extracted = normalizeExtractorResult(raw);
+        if (extracted.ok) {
+          const outputErrors = validateOutputContract(extracted.value, rootFrame.outputs);
+          if (outputErrors.length > 0) {
+            planned = failure(runId, "INVALID_RESULT", outputContractErrorMessage(outputErrors));
+          } else {
+            phase = "context";
+            await persistAnswer(
+              state,
+              `fallback:${rootFrameId}`,
+              extracted.value,
+              (outputRef) => [{
+                type: "answer_committed",
+                frameId: rootFrameId,
+                completionMode: "fallback_extract",
+                outputRef,
+              }],
+              limits.deadlineMs,
+              scope.signal,
+            );
+            throwIfAborted(scope.signal);
+            planned = {
+              runId,
+              status: "completed",
+              completionMode: "fallback_extract",
+              answer: extracted.value,
+            };
+          }
+        } else {
+          planned = failure(runId, extracted.code, extracted.message);
+        }
       }
     } else {
       planned = failure(runId, "NO_ANSWER", "controller exhausted without answer");

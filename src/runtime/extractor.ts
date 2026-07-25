@@ -1,54 +1,72 @@
-/**
- * Fallback extractor contract.
- *
- * When the controller exhausts its turns without a valid answer, the host may
- * run a separately budgeted extractor over a bounded evidence projection. It
- * must satisfy the same output contract or fail typed rather than invent data.
- */
+/** Accounted fallback extractor contract over one bounded evidence projection. */
 
 import type { JsonValue } from "../core/json.ts";
-import type { RlmOutputField } from "../core/program.ts";
-import type { TrajectoryProjection } from "../core/trajectory.ts";
 import type { ModelRequest, ModelResponse } from "../shell/model/client.ts";
+import { snapshotExtractorJson, type ExtractorEvidenceProjection } from "./extractor-evidence.ts";
 
-export interface ExtractorEvidence {
-  readonly outputContract: readonly RlmOutputField[];
-  readonly workspace: JsonValue;
-  readonly trajectory: TrajectoryProjection;
-}
+/** Compatibility alias; the value is always the bounded projection. */
+export type ExtractorEvidence = ExtractorEvidenceProjection;
 
 export type ExtractorResult =
   | { readonly ok: true; readonly value: JsonValue }
-  | { readonly ok: false; readonly code: "FALLBACK_EVIDENCE_TRUNCATED" | "FAILED"; readonly message: string };
+  | {
+      readonly ok: false;
+      readonly code: "FALLBACK_EVIDENCE_TRUNCATED" | "FAILED" | "INVALID_RESULT";
+      readonly message: string;
+    };
 
 export interface ExtractorModelOperation {
   complete(request: ModelRequest): Promise<ModelResponse>;
 }
 
 export interface Extractor {
-  /**
-   * `external` consumes one explicit logical operation and attempt because its
-   * internal provider usage is unknowable. Only `provider` receives the
-   * separately accounted `model.complete` capability.
-   */
+  /** External work is opaque but still consumes one logical operation/attempt. */
   readonly accountingMode?: "external" | "provider";
   extract(
-    evidence: ExtractorEvidence,
+    evidence: ExtractorEvidenceProjection,
     signal: AbortSignal,
     model?: ExtractorModelOperation,
   ): Promise<ExtractorResult>;
 }
 
 type ExternalExtractorFn = (
-  evidence: ExtractorEvidence,
+  evidence: ExtractorEvidenceProjection,
   signal: AbortSignal,
 ) => Promise<ExtractorResult> | ExtractorResult;
 
 type ProviderExtractorFn = (
-  evidence: ExtractorEvidence,
+  evidence: ExtractorEvidenceProjection,
   signal: AbortSignal,
   model: ExtractorModelOperation,
 ) => Promise<ExtractorResult> | ExtractorResult;
+
+const ownData = (value: object, key: string): unknown => {
+  const property = Object.getOwnPropertyDescriptor(value, key);
+  return property && "value" in property ? property.value : undefined;
+};
+
+/** Normalize an opaque result without invoking getters or proxy traps. */
+export const normalizeExtractorResult = (input: unknown): ExtractorResult => {
+  const snapshot = snapshotExtractorJson(input);
+  if (!snapshot.ok || typeof snapshot.value !== "object" || snapshot.value === null || Array.isArray(snapshot.value))
+    return { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" };
+  const object = snapshot.value as object;
+  const ok = ownData(object, "ok");
+  if (ok === true) {
+    const value = ownData(object, "value");
+    return value === undefined
+      ? { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" }
+      : { ok: true, value: value as JsonValue };
+  }
+  if (ok === false) {
+    const code = ownData(object, "code");
+    const message = ownData(object, "message");
+    if ((code === "FALLBACK_EVIDENCE_TRUNCATED" || code === "FAILED" || code === "INVALID_RESULT")
+      && typeof message === "string" && message.length > 0 && message.length <= 2048)
+      return { ok: false, code, message };
+  }
+  return { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" };
+};
 
 export class FunctionExtractor implements Extractor {
   private readonly fn: ExternalExtractorFn | ProviderExtractorFn;
@@ -65,7 +83,7 @@ export class FunctionExtractor implements Extractor {
   }
 
   async extract(
-    evidence: ExtractorEvidence,
+    evidence: ExtractorEvidenceProjection,
     signal: AbortSignal,
     model?: ExtractorModelOperation,
   ): Promise<ExtractorResult> {

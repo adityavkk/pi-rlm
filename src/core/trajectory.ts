@@ -8,6 +8,7 @@
  */
 
 import { type CallError, type InterpreterError } from "./errors.ts";
+import type { JsonValue } from "./json.ts";
 import { headTailPreview, headPreview, type Preview } from "./preview.ts";
 import type { CallUsage } from "./usage.ts";
 
@@ -19,9 +20,16 @@ export interface TrajectoryEntry {
   readonly code: string;
   readonly hasResult: boolean;
   readonly outputPreview: string;
+  readonly outputBytes?: number;
+  readonly outputOmittedBytes?: number;
   readonly usage?: CallUsage;
   readonly outputRef?: string;
   readonly error?: CellError;
+  /** Host-only snapshot; deliberately excluded from controller projections. */
+  readonly answerCandidate?: {
+    readonly value: JsonValue;
+    readonly validationErrors: readonly string[];
+  };
 }
 
 export interface ProjectedEntry {
@@ -29,6 +37,8 @@ export interface ProjectedEntry {
   readonly reasoning: string;
   readonly codePreview: Preview;
   readonly outputPreview: string;
+  readonly outputBytes?: number;
+  readonly outputOmittedBytes?: number;
   readonly usage?: CallUsage;
   readonly outputRef?: string;
   readonly error?: CellError;
@@ -56,6 +66,8 @@ const projectEntry = (entry: TrajectoryEntry, options: ProjectionOptions): Proje
     tailBytes: options.codeTailBytes,
   }),
   outputPreview: entry.outputPreview,
+  ...(entry.outputBytes !== undefined ? { outputBytes: entry.outputBytes } : {}),
+  ...(entry.outputOmittedBytes !== undefined ? { outputOmittedBytes: entry.outputOmittedBytes } : {}),
   ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
   ...(entry.outputRef !== undefined ? { outputRef: entry.outputRef } : {}),
   ...(entry.error !== undefined ? { error: entry.error } : {}),

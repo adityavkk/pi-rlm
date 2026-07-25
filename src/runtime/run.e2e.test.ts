@@ -195,7 +195,7 @@ describe("runProgram e2e", () => {
     ]);
     const extractor = new FunctionExtractor((evidence) => ({
       ok: true,
-      value: { answer: `fallback:${JSON.stringify(evidence.workspace)}` },
+      value: { answer: `fallback:${JSON.stringify(evidence.workspaceValues)}` },
     }));
     const result = await runProgram({
       program: program(),

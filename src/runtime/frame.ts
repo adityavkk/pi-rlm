@@ -14,7 +14,6 @@ import { type CallError, callError, type InterpreterError, interpreterError } fr
 import { deriveCallId } from "../core/ids.ts";
 import { isJsonObject, type JsonValue } from "../core/json.ts";
 import { headTailPreview } from "../core/preview.ts";
-import { validateAgainstSchema } from "../core/schema.ts";
 import { appendEntry, projectTrajectory, type TrajectoryEntry } from "../core/trajectory.ts";
 import { validateWorkspace } from "../core/workspace.ts";
 import { type CallUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
@@ -27,6 +26,7 @@ import { bindKeys, dispatchCall, resolveContextRefs, retainCallResult } from "./
 import { createModelOperation, hasAttemptCapacity, ModelInvocationError } from "./provider.ts";
 import { persistAnswer } from "./answer-persistence.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
+import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
@@ -75,20 +75,6 @@ const captureAnswer = (args: JsonValue): CapturedAnswer => {
 
 const hasErrorCode = (error: unknown, code: string): boolean =>
   typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
-
-const validateAnswer = (candidate: JsonValue, frame: FrameRef): string[] => {
-  if (frame.outputs.length === 0) return [];
-  if (!isJsonObject(candidate)) return ["answer must be an object containing every declared output"];
-  const errors: string[] = [];
-  for (const field of frame.outputs) {
-    if (!Object.prototype.hasOwnProperty.call(candidate, field.name)) {
-      errors.push(`${field.name}: required output missing`);
-      continue;
-    }
-    errors.push(...validateAgainstSchema(candidate[field.name] as JsonValue, field.schema, field.name));
-  }
-  return errors;
-};
 
 export const runFrame = async (
   state: RunState,
@@ -245,13 +231,19 @@ export const runFrame = async (
 
     let error: CallError | undefined;
     let preview = "";
+    let outputBytes = 0;
+    let outputOmittedBytes = 0;
+    let answerCandidate: TrajectoryEntry["answerCandidate"];
     if (outcome.kind === "guest_error") {
       error = callError("FAILED", outcome.message);
     } else {
-      preview = headTailPreview(safeStringify(outcome.result), {
+      const outputProjection = headTailPreview(safeStringify(outcome.result), {
         headBytes: state.profile.previewHeadBytes,
         tailBytes: state.profile.previewTailBytes,
-      }).text;
+      });
+      preview = outputProjection.text;
+      outputBytes = outputProjection.originalBytes;
+      outputOmittedBytes = outputProjection.omittedBytes;
       if (workspaceInvalid) {
         error = callError("FAILED", `workspace contains non-serializable values at: ${outcome.workspaceInvalidPaths.join(", ")}`);
       } else if (answerEffectCount > 1) {
@@ -261,9 +253,10 @@ export const runFrame = async (
           error = callError("INVALID_RESULT", "answer value must be strict JSON");
         } else {
           const candidate = capturedAnswer.value;
-          const answerErrors = validateAnswer(candidate, frame);
+          const answerErrors = validateOutputContract(candidate, frame.outputs);
           if (answerErrors.length > 0) {
-            error = callError("INVALID_RESULT", `answer did not satisfy the output contract: ${answerErrors.join("; ")}`);
+            answerCandidate = { value: candidate, validationErrors: answerErrors };
+            error = callError("INVALID_RESULT", outputContractErrorMessage(answerErrors));
           } else {
             try {
               const ref = await persistAnswer(
@@ -278,6 +271,8 @@ export const runFrame = async (
                   codeHash: state.hasher(cell.code).slice(0, 16),
                   hasResult: outcome.hasResult,
                   outputPreview: preview,
+                  outputBytes,
+                  outputOmittedBytes,
                   usage: controllerUsage,
                   outputRef,
                 }, {
@@ -290,11 +285,12 @@ export const runFrame = async (
                 signal,
               );
               if (signal?.aborted) return cancelled();
-              entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
+              entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputBytes, outputOmittedBytes, outputRef: ref.id });
               return { answer: candidate, completionMode: "answer", exhausted: false };
             } catch (persistenceError) {
               if (signal?.aborted) return cancelled();
               if (!hasErrorCode(persistenceError, "BUDGET_BYTES")) throw persistenceError;
+              answerCandidate = { value: candidate, validationErrors: [] };
               error = callError("BUDGET_BYTES", "answer output exceeds remaining stored-byte budget");
             }
           }
@@ -308,8 +304,11 @@ export const runFrame = async (
       code: cell.code,
       hasResult: outcome.kind === "value" ? outcome.hasResult : false,
       outputPreview: preview,
+      outputBytes,
+      outputOmittedBytes,
       usage: controllerUsage,
       ...(error ? { error } : {}),
+      ...(answerCandidate ? { answerCandidate } : {}),
     });
     await state.journal.append({
       type: "cell_committed",
@@ -319,6 +318,8 @@ export const runFrame = async (
       codeHash: state.hasher(cell.code).slice(0, 16),
       hasResult: outcome.kind === "value" ? outcome.hasResult : false,
       outputPreview: preview,
+      outputBytes,
+      outputOmittedBytes,
       usage: controllerUsage,
       ...(error ? { error: errorInfo(error) } : {}),
     });
