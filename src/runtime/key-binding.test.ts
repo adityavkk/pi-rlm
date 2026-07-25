@@ -46,6 +46,7 @@ const makeState = async (append: (event: RlmEvent) => Promise<unknown>, model?: 
     callCache: new Map(),
     inflight: new Map(),
     keyIdentities: new Map(),
+    scopeUsage: new Map(),
     semaphore: new Semaphore(DEFAULT_PROFILE.maxConcurrency),
     contextSemaphore: new Semaphore(1),
     frameSeq: { current: 1 },

@@ -204,7 +204,9 @@ describe("run cancellation and terminal finalization", () => {
     const result = await within(run);
     expect(result.status).toBe("cancelled");
     expect(calls).toBe(1);
-    expect(result.ledger.usage.logicalCalls).toBe(0);
+    expect(result.ledger.usage.logicalCalls).toBe(1);
+    expect(result.ledger.usage.attempts).toBe(1);
+    expect(result.ledger.usage.activeLeafCalls).toBe(0);
     expect(result.ledger.usage.tokensReserved).toBe(0);
     const before = await readFile(join(dir, "events.jsonl"), "utf8");
     const ledgerBefore = JSON.stringify(result.ledger);

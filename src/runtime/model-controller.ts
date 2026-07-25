@@ -9,10 +9,11 @@
 
 import { isJsonObject } from "../core/json.ts";
 import { validateAgainstSchema } from "../core/schema.ts";
+import { MAX_CALL_TOKENS } from "../core/usage.ts";
 import type { ModelClient } from "../shell/model/client.ts";
-import { throwIfAborted, waitForAbort } from "./abort.ts";
+import { throwIfAborted } from "./abort.ts";
 import { buildBasePrompt, buildTurnMessage, CELL_SCHEMA } from "./controller-prompt.ts";
-import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
+import type { Cell, ControllerDriver, ControllerModelOperation, FrameState } from "./controller.ts";
 
 export interface ModelControllerOptions {
   readonly model?: string;
@@ -38,9 +39,13 @@ export class ModelController implements ControllerDriver {
   constructor(
     private readonly model: ModelClient,
     private readonly options: ModelControllerOptions = {},
-  ) {}
+  ) {
+    if (options.maxOutputTokens !== undefined
+      && (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens <= 0 || options.maxOutputTokens > MAX_CALL_TOKENS))
+      throw new TypeError(`maxOutputTokens must be a positive safe integer at most ${MAX_CALL_TOKENS}`);
+  }
 
-  async next(state: FrameState, signal: AbortSignal): Promise<Cell> {
+  async next(state: FrameState, signal: AbortSignal, operation: ControllerModelOperation): Promise<Cell> {
     throwIfAborted(signal);
     const user = buildTurnMessage(state);
     const request = {
@@ -48,17 +53,17 @@ export class ModelController implements ControllerDriver {
       system: this.system,
       schema: CELL_SCHEMA,
       ...(this.options.model ? { model: this.options.model } : {}),
-      ...(this.options.maxOutputTokens ? { maxOutputTokens: this.options.maxOutputTokens } : {}),
+      ...(this.options.maxOutputTokens !== undefined ? { maxOutputTokens: this.options.maxOutputTokens } : {}),
       ...(signal ? { signal } : {}),
     };
-    const first = await waitForAbort(this.model.complete(request), signal);
+    const first = await operation.complete(this.model, request);
     throwIfAborted(signal);
     let cell = parseCell(first.text);
     if (!cell) {
-      const repair = await waitForAbort(this.model.complete({
+      const repair = await operation.complete(this.model, {
         ...request,
         prompt: `${user}\n\nYour previous response was not valid JSON of the form {"reasoning","code"}. Respond with ONLY that JSON now.`,
-      }), signal);
+      });
       throwIfAborted(signal);
       cell = parseCell(repair.text);
     }

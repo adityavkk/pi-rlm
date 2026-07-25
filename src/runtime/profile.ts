@@ -70,14 +70,50 @@ export const contextStoreLimits = (profile: Profile): ContextStoreLimits => ({
   maxPatternBytes: profile.contextMaxPatternBytes,
 });
 
-export const resolveLimits = (profile: Profile, startMs: number): BudgetLimits => ({
-  maxDepth: profile.maxDepth,
-  maxFrames: profile.maxFrames,
-  maxLogicalCalls: profile.maxLogicalCalls,
-  maxAttempts: profile.maxAttempts,
-  maxControllerTurns: profile.maxControllerTurns,
-  maxConcurrency: profile.maxConcurrency,
-  ...(profile.tokenLimit !== undefined ? { tokenLimit: profile.tokenLimit } : {}),
-  storedByteLimit: profile.storedByteLimit,
-  deadlineMs: startMs + profile.wallMs,
-});
+const safeInteger = (name: string, value: number, allowZero: boolean): void => {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1))
+    throw new TypeError(`${name} must be a ${allowZero ? "nonnegative" : "positive"} safe integer`);
+};
+
+/** Validate host numeric options before any run effect or provider reservation. */
+export const validateProfile = (profile: Profile): void => {
+  safeInteger("maxDepth", profile.maxDepth, true);
+  safeInteger("maxFrames", profile.maxFrames, true);
+  safeInteger("maxLogicalCalls", profile.maxLogicalCalls, true);
+  safeInteger("maxAttempts", profile.maxAttempts, true);
+  safeInteger("maxControllerTurns", profile.maxControllerTurns, true);
+  safeInteger("maxConcurrency", profile.maxConcurrency, false);
+  if (profile.tokenLimit !== undefined) safeInteger("tokenLimit", profile.tokenLimit, false);
+  safeInteger("storedByteLimit", profile.storedByteLimit, true);
+  for (const [name, value] of [
+    ["wallMs", profile.wallMs],
+    ["cellWallMs", profile.cellWallMs],
+    ["memoryBytes", profile.memoryBytes],
+    ["previewHeadBytes", profile.previewHeadBytes],
+    ["previewTailBytes", profile.previewTailBytes],
+    ["contextMaxReadBytes", profile.contextMaxReadBytes],
+    ["contextMaxLines", profile.contextMaxLines],
+    ["contextMaxLineBytes", profile.contextMaxLineBytes],
+    ["contextMaxMatches", profile.contextMaxMatches],
+    ["contextMaxChunks", profile.contextMaxChunks],
+    ["contextMaxPatternBytes", profile.contextMaxPatternBytes],
+  ] as const) safeInteger(name, value, false);
+};
+
+export const resolveLimits = (profile: Profile, startMs: number): BudgetLimits => {
+  validateProfile(profile);
+  if (!Number.isSafeInteger(startMs)) throw new TypeError("run start time must be a safe integer");
+  const deadlineMs = startMs + profile.wallMs;
+  if (!Number.isSafeInteger(deadlineMs)) throw new TypeError("run deadline must be a safe integer");
+  return {
+    maxDepth: profile.maxDepth,
+    maxFrames: profile.maxFrames,
+    maxLogicalCalls: profile.maxLogicalCalls,
+    maxAttempts: profile.maxAttempts,
+    maxControllerTurns: profile.maxControllerTurns,
+    maxConcurrency: profile.maxConcurrency,
+    ...(profile.tokenLimit !== undefined ? { tokenLimit: profile.tokenLimit } : {}),
+    storedByteLimit: profile.storedByteLimit,
+    deadlineMs,
+  };
+};
