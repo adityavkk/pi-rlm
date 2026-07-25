@@ -1,21 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import {
-  type AgentSessionEvent,
-  type ExtensionUIContext,
-} from "@earendil-works/pi-coding-agent";
-import {
-  createPublicRuntimeFixture,
-  PUBLIC_FIXTURE_COMMAND,
-} from "./testing/public-runtime.ts";
-
-const ui = {
-  setStatus() {},
-  notify() {},
-  confirm: async () => true,
-} as unknown as ExtensionUIContext;
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { PUBLIC_FIXTURE_COMMAND } from "./testing/public-runtime.ts";
 
 type BoundMode = "tui" | "rpc" | "json" | "print";
 interface ObservedMessageEvent {
@@ -51,21 +39,101 @@ const isolatedEnv = (root: string): Record<string, string> => ({
 });
 
 const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
+const bindingFixturePath = join(import.meta.dir, "testing", "public-binding-fixture.ts");
 const ADAPTER_TEST_TIMEOUT_MS = 15_000;
-const LIFECYCLE_TIMEOUT_MS = 5_000;
+const CHILD_TIMEOUT_MS = 10_000;
+const MAX_OUTPUT_BYTES = 256 * 1024;
+const MAX_OUTPUT_RECORDS = 256;
+const MAX_RECORD_BYTES = 64 * 1024;
 
-const bounded = async <T>(work: Promise<T>, label: string): Promise<T> => {
+type Child = ReturnType<typeof Bun.spawn>;
+
+const killAndWait = async (child: Child): Promise<void> => {
+  if (child.exitCode === null) child.kill("SIGKILL");
+  await child.exited;
+};
+
+const readBounded = async (
+  stream: ReadableStream<Uint8Array>,
+  child: Child,
+  label: string,
+): Promise<string> => {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > MAX_OUTPUT_BYTES) {
+        child.kill("SIGKILL");
+        throw new Error(`${label} exceeded ${MAX_OUTPUT_BYTES} bytes`);
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(joined);
+};
+
+const runBoundedChild = async (
+  command: string[],
+  root: string,
+  timeoutMs = CHILD_TIMEOUT_MS,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+  const child = Bun.spawn(command, {
+    cwd: root,
+    env: isolatedEnv(root),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdout = readBounded(child.stdout as ReadableStream<Uint8Array>, child, "stdout");
+  const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "stderr");
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      work,
+    const result = await Promise.race([
+      Promise.all([child.exited, stdout, stderr]),
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`${label} exceeded ${LIFECYCLE_TIMEOUT_MS}ms`)),
-          LIFECYCLE_TIMEOUT_MS);
+        timeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`child exceeded ${timeoutMs}ms`));
+        }, timeoutMs);
       }),
     ]);
+    return { exitCode: result[0], stdout: result[1], stderr: result[2] };
   } finally {
     if (timeout) clearTimeout(timeout);
+    await killAndWait(child);
+    await Promise.allSettled([stdout, stderr]);
+  }
+};
+
+const readBoundedState = async (path: string): Promise<unknown> => {
+  const info = await stat(path);
+  if (info.size > MAX_OUTPUT_BYTES) throw new Error(`state exceeded ${MAX_OUTPUT_BYTES} bytes`);
+  return JSON.parse(await readFile(path, "utf8"));
+};
+
+const runBindingFixture = async (mode: BoundMode) => {
+  const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-${mode}-`));
+  const statePath = join(root, "binding-result.json");
+  try {
+    const process = await runBoundedChild(["bun", bindingFixturePath, mode, root, statePath], root);
+    return { ...process, state: await readBoundedState(statePath) as {
+      captured: Array<{ sources: unknown }>;
+      messages: Array<{ type: string; content: unknown }>;
+      entries: Array<Record<string, unknown>>;
+    } };
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 };
 
@@ -73,19 +141,9 @@ const runPrintFixture = async (mode: "text" | "json") => {
   const root = await mkdtemp(join(tmpdir(), `pi-rlm-${mode}-mode-`));
   const statePath = join(root, "entries.json");
   try {
-    const process = Bun.spawn(["bun", fixturePath, mode, root, statePath], {
-      cwd: root,
-      env: isolatedEnv(root),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
-      process.exited,
-    ]);
-    const entries = JSON.parse(await readFile(statePath, "utf8")) as Array<Record<string, unknown>>;
-    return { stdout, stderr, exitCode, entries };
+    const process = await runBoundedChild(["bun", fixturePath, mode, root, statePath], root);
+    const entries = await readBoundedState(statePath) as Array<Record<string, unknown>>;
+    return { ...process, entries };
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -96,52 +154,20 @@ describe("public Pi SDK extension integration", () => {
   test.each(["tui", "rpc", "json", "print"] as const)(
     "%s emits one observable custom result lifecycle and one session entry",
     async (mode: BoundMode) => {
-      const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-${mode}-`));
-      const { runtime, sessionManager, captured } = await bounded(
-        createPublicRuntimeFixture(root), `${mode} fixture creation`);
-      const events: AgentSessionEvent[] = [];
-      let resolveEnd!: () => void;
-      const ended = new Promise<void>((resolve) => { resolveEnd = resolve; });
-      const unsubscribe = runtime.session.subscribe((event) => {
-        events.push(event);
-        if (isRlmMessageEvent(event, "message_end")) resolveEnd();
-      });
-      try {
-        await bounded(runtime.session.bindExtensions({ mode, uiContext: ui }), `${mode} extension binding`);
-        await bounded(runtime.session.prompt(PUBLIC_FIXTURE_COMMAND, {
-          source: mode === "rpc" ? "rpc" : "interactive",
-        }), `${mode} command prompt`);
-        let timeout: ReturnType<typeof setTimeout> | undefined;
-        try {
-          await Promise.race([
-            ended,
-            new Promise<never>((_, reject) => {
-              timeout = setTimeout(() => reject(new Error("custom message_end timeout")), 1_000);
-            }),
-          ]);
-        } finally {
-          if (timeout) clearTimeout(timeout);
-        }
-
-        expect(captured).toHaveLength(1);
-        expect(captured[0]?.sources).toEqual({ context: "exact public source" });
-        const starts = events.filter((event) => isRlmMessageEvent(event, "message_start"));
-        const ends = events.filter((event) => isRlmMessageEvent(event, "message_end"));
-        expect(starts).toHaveLength(1);
-        expect(ends).toHaveLength(1);
-        expect(messageContent(starts[0]!)).toBe(messageContent(ends[0]!));
-        expect(messageContent(starts[0]!)).toContain("OFFLINE_FIXTURE");
-        const entries = sessionManager.getEntries().filter((entry) =>
-          entry.type === "custom_message" && entry.customType === "pi-rlm-result");
-        expect(entries).toHaveLength(1);
-        expect(messageContent(starts[0]!)).toBe(entries[0]?.type === "custom_message" && entries[0].content);
-      } finally {
-        unsubscribe();
-        // This is a headless binding test, not an AgentSessionRuntime ownership
-        // test. Dispose its bound public session directly in every synthetic mode.
-        runtime.session.dispose();
-        await bounded(rm(root, { recursive: true, force: true }), `${mode} fixture cleanup`);
-      }
+      const result = await runBindingFixture(mode);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("");
+      expect(result.state.captured).toHaveLength(1);
+      expect(result.state.captured[0]?.sources).toEqual({ context: "exact public source" });
+      const starts = result.state.messages.filter((event) => event.type === "message_start");
+      const ends = result.state.messages.filter((event) => event.type === "message_end");
+      expect(starts).toHaveLength(1);
+      expect(ends).toHaveLength(1);
+      expect(starts[0]?.content).toBe(ends[0]?.content);
+      expect(String(starts[0]?.content)).toContain("OFFLINE_FIXTURE");
+      expect(result.state.entries).toHaveLength(1);
+      expect(starts[0]?.content).toBe(result.state.entries[0]?.["content"]);
     },
     ADAPTER_TEST_TIMEOUT_MS,
   );
@@ -167,63 +193,101 @@ describe("public Pi SDK extension integration", () => {
     }
   }, ADAPTER_TEST_TIMEOUT_MS);
 
+  test("bounded adapter child kills and reaps timeout and overflow failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-bounded-child-"));
+    try {
+      await expect(runBoundedChild([
+        "bun", "--eval", "setInterval(() => {}, 1000)",
+      ], root, 100)).rejects.toThrow("child exceeded 100ms");
+      await expect(runBoundedChild([
+        "bun", "--eval", `process.stdout.write("x".repeat(${MAX_OUTPUT_BYTES + 1}))`,
+      ], root)).rejects.toThrow(`stdout exceeded ${MAX_OUTPUT_BYTES} bytes`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, ADAPTER_TEST_TIMEOUT_MS);
+
   test("actual runRpcMode uses public JSON stdin/stdout and shuts down on stdin end", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-rpc-mode-"));
-    const process = Bun.spawn(["bun", fixturePath, "rpc", root], {
-      cwd: root,
-      env: isolatedEnv(root),
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const events: Array<Record<string, any>> = [];
-    const stderr = new Response(process.stderr).text();
-    const reader = process.stdout.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-    let requestedEntries = false;
-    let receivedEntries = false;
-    const send = async (value: unknown): Promise<void> => {
-      process.stdin.write(`${JSON.stringify(value)}\n`);
-      await process.stdin.flush();
-    };
-    await send({ id: "prompt", type: "prompt", message: PUBLIC_FIXTURE_COMMAND });
-    const readOutput = async (): Promise<void> => {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        pending += decoder.decode(chunk.value, { stream: true });
-        let newline: number;
-        while ((newline = pending.indexOf("\n")) >= 0) {
-          const line = pending.slice(0, newline);
-          pending = pending.slice(newline + 1);
-          if (!line) continue;
-          const event = JSON.parse(line) as Record<string, any>;
-          events.push(event);
-          if (!requestedEntries && event["type"] === "message_end"
-            && event["message"]?.role === "custom"
-            && event["message"]?.customType === "pi-rlm-result") {
-            requestedEntries = true;
-            await send({ id: "entries", type: "get_entries" });
-          }
-          if (event["type"] === "response" && event["id"] === "entries") {
-            receivedEntries = true;
-            process.stdin.end();
-          }
-        }
-      }
-    };
+    let process: Child | undefined;
+    let readOutputWork: Promise<void> | undefined;
+    let stderrWork: Promise<string> | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      process = Bun.spawn(["bun", fixturePath, "rpc", root], {
+        cwd: root,
+        env: isolatedEnv(root),
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const child = process;
+      const events: Array<Record<string, any>> = [];
+      stderrWork = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "RPC stderr");
+      const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+      const stdin = child.stdin as unknown as {
+        write(value: string): number | void;
+        flush(): number | Promise<number>;
+        end(): void;
+      };
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      let pending = "";
+      let totalBytes = 0;
+      let requestedEntries = false;
+      let receivedEntries = false;
+      const send = async (value: unknown): Promise<void> => {
+        stdin.write(`${JSON.stringify(value)}\n`);
+        await stdin.flush();
+      };
+      const readOutput = async (): Promise<void> => {
+        try {
+          while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            totalBytes += chunk.value.byteLength;
+            if (totalBytes > MAX_OUTPUT_BYTES)
+              throw new Error(`RPC output exceeded ${MAX_OUTPUT_BYTES} bytes`);
+            pending += decoder.decode(chunk.value, { stream: true });
+            let newline: number;
+            while ((newline = pending.indexOf("\n")) >= 0) {
+              const line = pending.slice(0, newline);
+              pending = pending.slice(newline + 1);
+              if (!line) continue;
+              if (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES)
+                throw new Error(`RPC record exceeded ${MAX_RECORD_BYTES} bytes`);
+              const event = JSON.parse(line) as Record<string, any>;
+              events.push(event);
+              if (events.length > MAX_OUTPUT_RECORDS)
+                throw new Error(`RPC exceeded ${MAX_OUTPUT_RECORDS} records`);
+              if (!requestedEntries && event["type"] === "message_end"
+                && event["message"]?.role === "custom"
+                && event["message"]?.customType === "pi-rlm-result") {
+                requestedEntries = true;
+                await send({ id: "entries", type: "get_entries" });
+              }
+              if (event["type"] === "response" && event["id"] === "entries") {
+                receivedEntries = true;
+                stdin.end();
+              }
+            }
+          }
+          pending += decoder.decode();
+          if (pending.length !== 0) throw new Error("RPC output ended with an incomplete record");
+        } finally {
+          reader.releaseLock();
+        }
+      };
+      await send({ id: "prompt", type: "prompt", message: PUBLIC_FIXTURE_COMMAND });
+      readOutputWork = readOutput();
       const timeoutFailure = new Promise<never>((_, reject) => {
         timeout = setTimeout(() => {
-          process.kill();
+          child.kill("SIGKILL");
           reject(new Error("runRpcMode shutdown timeout"));
-        }, 3_000);
+        }, 5_000);
       });
-      await Promise.race([Promise.all([readOutput(), process.exited]), timeoutFailure]);
-      expect(await stderr).toBe("");
-      expect(process.exitCode).toBe(0);
+      await Promise.race([Promise.all([readOutputWork, child.exited]), timeoutFailure]);
+      expect(await stderrWork).toBe("");
+      expect(child.exitCode).toBe(0);
       expect(requestedEntries).toBe(true);
       expect(receivedEntries).toBe(true);
       const starts = events.filter((event) => event["type"] === "message_start"
@@ -239,7 +303,12 @@ describe("public Pi SDK extension integration", () => {
       expect(entries).toHaveLength(1);
     } finally {
       if (timeout) clearTimeout(timeout);
-      if (process.exitCode === null) process.kill();
+      if (process) await killAndWait(process);
+      await Promise.allSettled([
+        ...(readOutputWork ? [readOutputWork] : []),
+        ...(stderrWork ? [stderrWork] : []),
+        ...(process ? [process.exited] : []),
+      ]);
       await rm(root, { recursive: true, force: true });
     }
   }, ADAPTER_TEST_TIMEOUT_MS);
