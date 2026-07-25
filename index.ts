@@ -13,17 +13,14 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   canonicalStringify,
-  compileShorthand,
   consumeGrant,
   emptyGrantStore,
   mintGrant,
-  normalizeProgram,
   parseJsonValue,
   type GrantConsumeContext,
   type GrantDenial,
   type GrantMode,
   type LaunchGrant,
-  type RlmProgram,
 } from "./src/core/index.ts";
 import {
   DEFAULT_PROFILE,
@@ -47,6 +44,19 @@ import { QuickJsBackend } from "./src/shell/interpreter/quickjs.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient } from "./src/shell/model/client.ts";
 import { PiModelClient } from "./src/shell/model/pi-model.ts";
+import {
+  buildInlineRequest,
+  captureCommandRequest,
+  type LaunchRequest,
+} from "./src/extension/source.ts";
+import {
+  failureProjection,
+  projectRunResult,
+  resultContent,
+  resultMetadata,
+  type RlmResultMetadata,
+  type RlmResultProjection,
+} from "./src/extension/result.ts";
 
 export const LAUNCH_SNIPPET =
   "pi-rlm runs long-context recursive model/agent workflows in a sandboxed JS controller. " +
@@ -73,54 +83,6 @@ const getBackend = (): Promise<QuickJsBackend> => (backendPromise ??= QuickJsBac
 let runtimePromise: Promise<ModelRuntime> | undefined;
 const getRuntime = (): Promise<ModelRuntime> => (runtimePromise ??= ModelRuntime.create());
 
-interface LaunchRequest {
-  readonly program: RlmProgram;
-  readonly sources: Readonly<Record<string, string>>;
-}
-
-interface LaunchParams {
-  readonly objective?: unknown;
-  readonly context?: unknown;
-  readonly program?: unknown;
-  readonly sources?: unknown;
-}
-
-const normalizeSources = (
-  raw: unknown,
-): { ok: true; value: Readonly<Record<string, string>> } | { ok: false; message: string } => {
-  if (raw === undefined) return { ok: true, value: Object.freeze(Object.create(null) as Record<string, string>) };
-  const parsed = parseJsonValue(raw);
-  if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null || Array.isArray(parsed.value))
-    return { ok: false, message: "Invalid sources: must be an object whose values are strings." };
-  const sources = Object.create(null) as Record<string, string>;
-  for (const [name, value] of Object.entries(parsed.value)) {
-    if (typeof value !== "string") return { ok: false, message: `Invalid sources.${name}: must be a string.` };
-    sources[name] = value;
-  }
-  return { ok: true, value: Object.freeze(sources) };
-};
-
-const buildRequest = (params: LaunchParams): { ok: true; value: LaunchRequest } | { ok: false; message: string } => {
-  const sources = normalizeSources(params.sources);
-  if (!sources.ok) return sources;
-  if (params.program !== undefined) {
-    const normalized = normalizeProgram(params.program);
-    if (!normalized.ok)
-      return { ok: false, message: `Invalid program: ${normalized.error.map((e) => `${e.path} ${e.message}`).join("; ")}` };
-    return { ok: true, value: { program: normalized.value, sources: sources.value } };
-  }
-  if (typeof params.objective === "string" && params.objective.trim()) {
-    if (params.context !== undefined && typeof params.context !== "string")
-      return { ok: false, message: "Invalid context: must be a string." };
-    const compiled = compileShorthand({ objective: params.objective });
-    if (!compiled.ok) return { ok: false, message: `Invalid objective: ${compiled.error[0]?.message ?? "unknown"}` };
-    return {
-      ok: true,
-      value: { program: compiled.value, sources: Object.freeze({ context: params.context ?? "" }) },
-    };
-  }
-  return { ok: false, message: "Provide either { objective, context } or { program, sources }." };
-};
 
 const requestSha256 = (request: LaunchRequest): string => {
   const parsed = parseJsonValue({ program: request.program, sources: request.sources });
@@ -145,18 +107,6 @@ const confirmationMessage = (request: LaunchRequest, hash: string): string => {
     `Exact normalized request SHA-256: ${hash}`,
     "This run may make many model calls and spend tokens.",
   ].join("\n");
-};
-
-const warningSummary = (result: RunResult): string => result.warnings?.length
-  ? `\n\nWarnings: ${result.warnings.map((warning) => `${warning.code}: ${warning.message}`).join("; ")}`
-  : "";
-
-const summarize = (result: RunResult): string => {
-  const warnings = warningSummary(result);
-  if (result.status === "completed")
-    return `pi-rlm ${result.completionMode === "fallback_extract" ? "completed via fallback extraction" : "completed"}.\n\nResult:\n${JSON.stringify(result.answer, null, 2)}\n\nUsage: ${result.ledger.usage.logicalCalls} calls, ${result.ledger.usage.attempts} attempts, ${result.ledger.usage.framesOpened} child frames.${warnings}`;
-  if (result.status === "cancelled") return `pi-rlm cancelled.${warnings}`;
-  return `pi-rlm failed (${result.error?.code}): ${result.error?.message}${warnings}`;
 };
 
 const retentionWarning = (
@@ -310,12 +260,25 @@ interface LaunchBinding {
   readonly promptSha256: string;
 }
 
+interface CommandLifecycle {
+  readonly controller: AbortController;
+  readonly sessionId: string;
+  readonly authorizationGeneration: number;
+}
+
 const denialCode = (denial: GrantDenial): string => `RLM_GRANT_${denial}`;
 
-const denied = (message: string): AgentToolResult<{ status: string }> => ({
-  content: [{ type: "text", text: message }],
-  details: { status: "denied" },
+const projectedToolResult = (projection: RlmResultProjection): AgentToolResult<RlmResultMetadata> => ({
+  content: [{ type: "text", text: resultContent(projection) }],
+  details: resultMetadata(projection),
 });
+
+const denied = (codeOrMessage: string, message?: string): AgentToolResult<RlmResultMetadata> => {
+  const code = message === undefined
+    ? (/^([A-Z][A-Z0-9_-]{0,63}):/.exec(codeOrMessage)?.[1] ?? "RLM_LAUNCH_DENIED")
+    : codeOrMessage;
+  return projectedToolResult(failureProjection(code, message ?? codeOrMessage));
+};
 
 const RlmRunParams = Type.Object({
   objective: Type.Optional(Type.String({ description: "Objective for the shorthand form." })),
@@ -416,11 +379,66 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
 
   const auditWarnings = (result: RunResult): void => {
     if (!result.warnings?.length) return;
-    pi.appendEntry("pi-rlm-run-warnings", {
-      runId: result.runId,
-      status: result.status,
-      codes: result.warnings.map((warning) => warning.code).slice(-8),
-    });
+    try {
+      pi.appendEntry("pi-rlm-run-warnings", {
+        runId: result.runId,
+        status: result.status,
+        codes: result.warnings.map((warning) => warning.code).slice(-8),
+      });
+    } catch {
+      // Warning audit is best-effort and cannot replace the authoritative result.
+    }
+  };
+
+  const sessionMatches = (
+    sessionId: string,
+    generation: number,
+    signal?: AbortSignal,
+    ctx?: ExtensionContext,
+  ): boolean => {
+    if (signal?.aborted || generation !== authorizationGeneration || !ctx) return false;
+    try { return ctx.sessionManager.getSessionId() === sessionId; }
+    catch { return false; }
+  };
+
+  const deliverCommandResult = (
+    projection: RlmResultProjection,
+    lifecycle: CommandLifecycle,
+    ctx: ExtensionContext,
+  ): void => {
+    let metadata: RlmResultMetadata;
+    let content: string;
+    try {
+      metadata = resultMetadata(projection);
+      content = resultContent(projection);
+    } catch {
+      const bounded = failureProjection("RLM_RESULT_DELIVERY_FAILED", "pi-rlm result delivery failed.");
+      metadata = resultMetadata(bounded);
+      content = resultContent(bounded);
+    }
+
+    // Each effect has its own boundary. Re-check immediately before each one.
+    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+    try { pi.appendEntry("pi-rlm-result", metadata); } catch { /* Message delivery remains independently useful. */ }
+    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+    try {
+      pi.sendMessage({
+        customType: "pi-rlm-result",
+        content,
+        details: metadata,
+        display: true,
+      }, { triggerTurn: false });
+    } catch {
+      // One bounded, non-recursive diagnostic attempt. Never retry delivery.
+      if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+      try {
+        pi.appendEntry("pi-rlm-result-delivery-failed", {
+          runId: metadata.runId,
+          status: metadata.status,
+          code: "RLM_RESULT_DELIVERY_FAILED",
+        });
+      } catch { /* No further audit attempt: audit failures cannot recurse. */ }
+    }
   };
 
   pi.on("input", (event, ctx) => {
@@ -454,53 +472,109 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   pi.on("session_shutdown", invalidateAuthorization);
 
   pi.registerCommand("rlm", {
-    description: "Start a host-authorized pi-rlm run from an objective.",
+    description: "Start a host-authorized pi-rlm run with an explicit source.",
     handler: async (args, ctx) => {
-      const objective = args.trim();
-      if (!objective) {
-        ctx.ui.notify("Usage: /rlm <objective>", "warning");
-        return;
-      }
-      const built = buildRequest({ objective });
-      if (!built.ok) {
-        ctx.ui.notify(built.message, "error");
-        return;
-      }
-      const hash = requestSha256(built.value);
-      const grantId = createId();
-      const binding = {
-        sessionId: ctx.sessionManager.getSessionId(),
-        turnNonce: `slash:${grantId}`,
-        promptSha256: sha256(`/rlm ${objective}`),
-      };
-      const authorization = mintAndConsume(
-        "slash_command",
-        binding,
-        binding,
-        hash,
-        hash,
-        `command:${grantId}`,
-      );
-      if (!authorization.ok) {
-        ctx.ui.notify(`${denialCode(authorization.denial)}: pi-rlm launch denied.`, "error");
-        return;
-      }
-      audit(authorization.grant);
+      // Bind ownership before the first asynchronous source-capture checkpoint.
       const commandController = new AbortController();
+      let sessionId: string;
+      try { sessionId = ctx.sessionManager.getSessionId(); }
+      catch { return; }
+      const lifecycle: CommandLifecycle = {
+        controller: commandController,
+        sessionId,
+        authorizationGeneration,
+      };
       activeCommandRuns.add(commandController);
-      ctx.ui.setStatus("pi-rlm", "running...");
+
       try {
-        const result = await run(built.value, commandController.signal, "slash_command");
+        let built: Awaited<ReturnType<typeof captureCommandRequest>>;
+        try {
+          built = await captureCommandRequest(args, ctx, commandController.signal);
+        } catch (error) {
+          if (wasAborted(error, commandController.signal)
+            || !sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          deliverCommandResult(
+            failureProjection("RLM_SOURCE_FAILED", "pi-rlm source capture failed."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        if (!built.ok) {
+          deliverCommandResult(failureProjection(built.error.code, built.error.message), lifecycle, ctx);
+          return;
+        }
+
+        let authorization: ReturnType<typeof mintAndConsume>;
+        try {
+          const hash = requestSha256(built.value);
+          const grantId = createId();
+          const binding = {
+            sessionId,
+            turnNonce: `slash:${grantId}`,
+            promptSha256: sha256(`/rlm ${args}`),
+          };
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          authorization = mintAndConsume(
+            "slash_command",
+            binding,
+            binding,
+            hash,
+            hash,
+            `command:${grantId}`,
+          );
+        } catch {
+          deliverCommandResult(
+            failureProjection("RLM_GRANT_FAILED", "pi-rlm launch authorization failed."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+        if (!authorization.ok) {
+          const code = denialCode(authorization.denial);
+          deliverCommandResult(failureProjection(code, "pi-rlm launch was denied."), lifecycle, ctx);
+          return;
+        }
+
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        try { audit(authorization.grant); }
+        catch {
+          deliverCommandResult(
+            failureProjection("RLM_AUDIT_FAILED", "pi-rlm launch audit failed; no run was started."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
+
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        try { ctx.ui.setStatus("pi-rlm", "running..."); } catch { /* Best-effort transient status. */ }
+        let result: RunResult;
+        try {
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          result = await run(built.value, commandController.signal, "slash_command");
+        } catch (error) {
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          const cancelled = wasAborted(error, commandController.signal);
+          deliverCommandResult(failureProjection(
+            cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
+            cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
+            null,
+            cancelled ? "cancelled" : "failed",
+          ), lifecycle, ctx);
+          return;
+        }
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         auditWarnings(result);
-        ctx.ui.notify(summarize(result), result.status === "completed" ? "info" : "error");
-      } catch (error) {
-        ctx.ui.notify(
-          wasAborted(error, commandController.signal) ? "pi-rlm cancelled." : "pi-rlm failed before producing a result.",
-          "error",
-        );
+        if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+        deliverCommandResult(projectRunResult(result), lifecycle, ctx);
       } finally {
         activeCommandRuns.delete(commandController);
-        ctx.ui.setStatus("pi-rlm", "");
+        if (sessionMatches(sessionId, lifecycle.authorizationGeneration, undefined, ctx)) {
+          try { ctx.ui.setStatus("pi-rlm", ""); } catch { /* Best-effort transient status. */ }
+        }
       }
     },
   });
@@ -511,7 +585,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     description: [
       "Run a long-context recursive model/agent workflow (pi-rlm).",
       "Use only when the user requests it; prompt wording is never launch authority.",
-      "Provide { objective, context } for the shorthand, or { program, sources } for a typed program.",
+      "Provide { objective, context } with non-empty context, or a complete { program, sources } typed program.",
       "Requires interactive host confirmation and a host-owned, exact-request, one-shot grant before spending.",
     ].join(" "),
     promptSnippet: "rlm_run: start an explicitly requested recursive long-context program",
@@ -521,7 +595,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       "Do not use rlm_run for routine tasks one agent can complete directly.",
     ],
     parameters: RlmRunParams,
-    async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<{ status: string }>> {
+    async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<RlmResultMetadata>> {
       const toolSignal = signal ?? new AbortController().signal;
       const callKey = `${ctx.sessionManager.getSessionId()}:${toolCallId}`;
       if (pendingToolCalls.has(callKey) || consumedToolCalls.has(callKey))
@@ -530,11 +604,10 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       let reservedCorrelation: InputCorrelation | undefined;
       let consumedCorrelation = false;
       try {
+        const built = buildInlineRequest(params);
+        if (!built.ok) return projectedToolResult(failureProjection(built.error.code, built.error.message));
         if (!ctx.hasUI)
           return denied("RLM_OPT_IN_REQUIRED: rlm_run requires interactive exact-request confirmation; use /rlm for a direct host launch.");
-        const built = buildRequest(params as LaunchParams);
-        if (!built.ok)
-          return { content: [{ type: "text", text: built.message }], details: { status: "invalid" } };
         const initialBinding = bindingFor(ctx);
         if (!initialBinding || !inputCorrelation)
           return denied("RLM_OPT_IN_REQUIRED: no current Pi user-turn correlation is available for confirmation.");
@@ -553,14 +626,19 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           ), toolSignal);
         } catch (error) {
           if (wasAborted(error, toolSignal)) return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
-          throw error;
+          return projectedToolResult(failureProjection(
+            "RLM_CONFIRMATION_FAILED",
+            "pi-rlm confirmation failed; no run was started.",
+          ));
         }
         if (!approved) return denied("RLM_OPT_IN_REQUIRED: pi-rlm launch was not approved.");
         if (toolSignal.aborted) return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
         if (confirmationGeneration !== authorizationGeneration)
           return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before authorization consumption.");
+        if (ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+          return denied("RLM_GRANT_SESSION_MISMATCH: session changed before authorization consumption.");
 
-        const current = buildRequest(params as LaunchParams);
+        const current = buildInlineRequest(params);
         const actualHash = current.ok ? requestSha256(current.value) : "invalid-after-approval";
         const actualBinding = bindingFor(ctx) ?? {
           sessionId: ctx.sessionManager.getSessionId(),
@@ -581,20 +659,42 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         consumedCorrelation = true;
         if (inputCorrelation === reservedCorrelation) inputCorrelation = undefined;
         consumedToolCalls.add(callKey);
-        audit(authorization.grant);
-        try {
-          const result = await run(built.value, toolSignal, "confirmed");
-          auditWarnings(result);
-          return { content: [{ type: "text", text: summarize(result) }], details: { status: result.status } };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: wasAborted(error, toolSignal) ? "pi-rlm cancelled." : "pi-rlm failed before producing a result.",
-            }],
-            details: { status: toolSignal.aborted ? "cancelled" : "error" },
-          };
+        if (confirmationGeneration !== authorizationGeneration
+          || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+          return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch audit.");
+        try { audit(authorization.grant); }
+        catch {
+          return projectedToolResult(failureProjection(
+            "RLM_AUDIT_FAILED",
+            "pi-rlm launch audit failed; no run was started.",
+          ));
         }
+        try {
+          if (confirmationGeneration !== authorizationGeneration
+            || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+            return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch.");
+          const result = await run(built.value, toolSignal, "confirmed");
+          if (confirmationGeneration !== authorizationGeneration
+            || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
+            return denied("RLM_GRANT_GENERATION_MISMATCH: session changed while pi-rlm was running.");
+          auditWarnings(result);
+          return projectedToolResult(projectRunResult(result));
+        } catch (error) {
+          const cancelled = wasAborted(error, toolSignal);
+          return projectedToolResult(failureProjection(
+            cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
+            cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
+            null,
+            cancelled ? "cancelled" : "failed",
+          ));
+        }
+      } catch (error) {
+        if (wasAborted(error, toolSignal))
+          return denied("RLM_CANCELLED: pi-rlm launch was cancelled before authorization.");
+        return projectedToolResult(failureProjection(
+          "RLM_TOOL_FAILED",
+          "pi-rlm tool authorization failed; no run was started.",
+        ));
       } finally {
         if (
           !consumedCorrelation &&

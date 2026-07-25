@@ -40,6 +40,7 @@
     "test:core": "bun test src/core",
     "test:runtime": "bun test src/runtime",
     "smoke:packed": "bash scripts/smoke-packed-install.sh",
+    "test:smoke-isolation": "bash scripts/test-smoke-packed-install-isolation.sh",
     "typecheck": "tsc --noEmit"
   },
   "pi": {

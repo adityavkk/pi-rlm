@@ -43,11 +43,17 @@ const failedRun = {
   error: { code: "TEST_FAILURE", message: "test run finished" },
 } as unknown as RunResult;
 
-const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {}) => {
+const harness = (options: {
+  ttl?: number;
+  runtime?: RlmRuntimeDependencies;
+  executeRun?: (request: unknown, signal: AbortSignal) => Promise<RunResult>;
+} = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
   const events = new Map<string, EventHandler[]>();
   const audits: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const resultEntries: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const resultMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const notifications: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
   const runs: unknown[] = [];
@@ -58,6 +64,7 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
   let nextId = 0;
   let hasUI = true;
   let confirm: (title: string, message: string) => boolean | Promise<boolean> = () => true;
+  let appendFaultType: string | undefined;
 
   const ctx = {
     get hasUI() {
@@ -65,7 +72,11 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     },
     mode: "tui",
     cwd: process.cwd(),
-    sessionManager: { getSessionId: () => sessionId },
+    isProjectTrusted: () => true,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      buildContextEntries: () => [],
+    },
     ui: {
       confirm: async (title: string, message: string) => {
         confirmations.push({ title, message });
@@ -81,8 +92,12 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     registerCommand: (name: string, definition: CapturedCommand) => commands.set(name, definition),
     on: (name: string, handler: EventHandler) => events.set(name, [...(events.get(name) ?? []), handler]),
     appendEntry: (type: string, data: Record<string, unknown>) => {
-      audits.push({ type, data });
-      return `entry-${audits.length}`;
+      if (type === appendFaultType) throw new Error("injected append failure with /private/host/path");
+      (type === "pi-rlm-result" ? resultEntries : audits).push({ type, data });
+      return `entry-${audits.length + resultEntries.length}`;
+    },
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+      resultMessages.push({ message, options });
     },
   };
 
@@ -94,7 +109,7 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
             initializationAuditCounts.push(audits.length);
             runSignals.push(signal);
             runs.push(request);
-            return failedRun;
+            return options.executeRun ? options.executeRun(request, signal) : failedRun;
           },
         }),
     now: () => clock,
@@ -114,6 +129,8 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     tools,
     commands,
     audits,
+    resultEntries,
+    resultMessages,
     notifications,
     confirmations,
     runs,
@@ -135,10 +152,24 @@ const harness = (options: { ttl?: number; runtime?: RlmRuntimeDependencies } = {
     setConfirm: (value: typeof confirm) => {
       confirm = value;
     },
+    setAppendFaultType: (value: string | undefined) => {
+      appendFaultType = value;
+    },
   };
 };
 
-const rlmTool = (h: ReturnType<typeof harness>): CapturedTool => h.tools.find((tool) => tool.name === "rlm_run")!;
+const rlmTool = (h: ReturnType<typeof harness>): CapturedTool => {
+  const tool = h.tools.find((candidate) => candidate.name === "rlm_run")!;
+  return {
+    ...tool,
+    execute: (id, params, signal, onUpdate, ctx) => {
+      if (params && typeof params === "object" && !Array.isArray(params)
+        && "objective" in params && !("context" in params) && !("program" in params))
+        (params as Record<string, unknown>)["context"] = "index test source";
+      return tool.execute(id, params, signal, onUpdate, ctx);
+    },
+  };
+};
 
 const pendingOfflineRuntime = (dir: string): {
   readonly dependencies: RlmRuntimeDependencies;
@@ -627,11 +658,65 @@ describe("pi-rlm extension wiring", () => {
 
   test("/rlm mints, consumes, and audits its own one-shot command grant", async () => {
     const h = harness();
-    await h.commands.get("rlm")!.handler("Summarize the notes", h.ctx);
+    await h.commands.get("rlm")!.handler('{"objective":"Summarize the notes","context":"fixture notes"}', h.ctx);
     expect(h.runs).toHaveLength(1);
     expect(h.audits).toHaveLength(1);
     expect(h.audits[0]?.data["mode"]).toBe("slash_command");
     expect(h.audits[0]?.data["toolCallId"]).toMatch(/^command:host-/);
+  });
+
+  test("a command transition during capture launches and delivers nothing into the replacement", async () => {
+    const h = harness();
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    await h.emit("session_before_switch", { reason: "resume" });
+    h.setSessionId("session-2");
+    await pending;
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+    expect(h.resultEntries).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(0);
+  });
+
+  test("a command transition during a long run retains the run result without cross-delivery", async () => {
+    let resolveRun!: (result: RunResult) => void;
+    const pendingRun = new Promise<RunResult>((resolve) => { resolveRun = resolve; });
+    const h = harness({ executeRun: async () => pendingRun });
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    while (h.runs.length === 0) await Promise.resolve();
+    await h.emit("session_before_fork", { entryId: "entry-1", position: "at" });
+    h.setSessionId("session-2");
+    resolveRun(failedRun);
+    await pending;
+    expect(h.runs).toHaveLength(1);
+    expect(h.resultEntries).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(0);
+  });
+
+  test("launch audit failure is bounded, launches no run, and does not expose raw errors", async () => {
+    const h = harness();
+    h.setAppendFaultType("pi-rlm-launch-grant");
+    await h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    expect(h.runs).toHaveLength(0);
+    expect(h.resultMessages).toHaveLength(1);
+    expect(h.resultMessages[0]?.message["content"]).toContain("RLM_AUDIT_FAILED");
+    expect(JSON.stringify(h.resultMessages)).not.toContain("/private/host/path");
+  });
+
+  test("confirmation and tool audit exceptions return structured results without launch", async () => {
+    const confirmation = harness();
+    await confirmation.startTurn("Use pi-rlm");
+    confirmation.setConfirm(() => Promise.reject(new Error("/private/confirm/path")));
+    const confirmationResult = await rlmTool(confirmation).execute("confirm-fault", { objective: "Review" }, undefined, undefined, confirmation.ctx);
+    expect(confirmationResult.content[0]?.text).toContain("RLM_CONFIRMATION_FAILED");
+    expect(confirmation.runs).toHaveLength(0);
+    expect(confirmationResult.content[0]?.text).not.toContain("/private/confirm/path");
+
+    const audited = harness();
+    await audited.startTurn("Use pi-rlm");
+    audited.setAppendFaultType("pi-rlm-launch-grant");
+    const auditResult = await rlmTool(audited).execute("audit-fault", { objective: "Review" }, undefined, undefined, audited.ctx);
+    expect(auditResult.content[0]?.text).toContain("RLM_AUDIT_FAILED");
+    expect(audited.runs).toHaveLength(0);
   });
 
   test("removed ambient bypass cannot authorize a headless call", async () => {
@@ -698,7 +783,7 @@ describe("pi-rlm extension wiring", () => {
     } });
     await h.startTurn("Use pi-rlm for this preflight run");
     const result = await rlmTool(h).execute("call-preflight", { objective: "Preflight" }, undefined, undefined, h.ctx);
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     expect(directoryCalls).toBe(0);
   });
 
@@ -729,12 +814,12 @@ describe("pi-rlm extension wiring", () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-command-"));
     const offline = pendingOfflineRuntime(dir);
     const h = harness({ runtime: offline.dependencies });
-    const pending = h.commands.get("rlm")!.handler("Wait offline", h.ctx);
+    const pending = h.commands.get("rlm")!.handler('{"objective":"Wait offline","context":"fixture"}', h.ctx);
     await offline.started;
     await h.emit(eventName, event);
     await pending;
 
-    expect(h.notifications.at(-1)).toContain("cancelled");
+    expect(h.resultMessages).toHaveLength(0);
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -767,7 +852,7 @@ describe("pi-rlm extension wiring", () => {
       expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
       const text = result.content[0]?.text ?? "";
       expect(text.match(/RETENTION_METADATA_FAILED/g)).toHaveLength(1);
-      expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+      expect(text).toContain('"warningCodes":["RETENTION_METADATA_FAILED"]');
       expect(text).not.toContain("failed before producing a result");
       const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
       expect(warningAudit?.data["runId"]).toBe(journalRunId);
@@ -807,7 +892,7 @@ describe("pi-rlm extension wiring", () => {
       const warnings = text.match(/RETENTION_METADATA_FAILED/g) ?? [];
       expect(warnings).toHaveLength(fault === "unlink" ? 0 : 1);
       if (fault !== "unlink")
-        expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+        expect(text).toContain('"warningCodes":["RETENTION_METADATA_FAILED"]');
       const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
       expect(warningAudit?.data["codes"] ?? []).toEqual(fault === "unlink" ? [] : ["RETENTION_METADATA_FAILED"]);
       const listing = await new ManagedRunStore({ root: stateRoot }).list();
@@ -858,7 +943,7 @@ describe("pi-rlm extension wiring", () => {
   test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-"));
     const { result } = await managedStatusRun("failed", { root: stateRoot }, () => " invalid nonce ");
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     const listing = await new ManagedRunStore({ root: stateRoot }).list();
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs[0]).toMatchObject({ activity: "stale", metadata: { status: "active" } });
@@ -880,7 +965,7 @@ describe("pi-rlm extension wiring", () => {
       root: stateRoot,
       metadataFileSystem: releaseFaultFileSystem(fault),
     }, () => " invalid nonce ");
-    expect(result.details?.status).toBe("error");
+    expect(result.details?.status).toBe("failed");
     expect(result.content[0]?.text ?? "").not.toContain("RETENTION_METADATA_FAILED");
     const listing = await new ManagedRunStore({ root: stateRoot }).list();
     expect(listing.runs).toHaveLength(1);

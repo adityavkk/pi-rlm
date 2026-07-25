@@ -96,11 +96,19 @@ describe("runProgram e2e", () => {
     const workspace = events.find((event) => event.type === "workspace_committed");
     const calls = events.filter((event) => event.type === "call_committed");
     const answer = events.find((event) => event.type === "answer_committed");
+    const terminal = events.find((event) => event.type === "run_completed");
     expect(started?.type === "run_started" && started.inputRefs).toHaveLength(1);
     expect(workspace?.type === "workspace_committed" && workspace.workspaceRef).toMatch(/^ctx_[0-9a-f]{64}$/);
     expect(calls).toHaveLength(3);
     expect(calls.every((event) => event.type === "call_committed" && /^ctx_[0-9a-f]{64}$/.test(event.outputRef ?? ""))).toBe(true);
     expect(answer?.type === "answer_committed" && answer.outputRef).toMatch(/^ctx_[0-9a-f]{64}$/);
+    expect(terminal).toMatchObject({
+      type: "run_completed", runId: result.runId, completionMode: "answer",
+      outputRef: answer?.type === "answer_committed" ? answer.outputRef : undefined,
+    });
+    expect(result.output).toEqual(answer?.type === "answer_committed" ? {
+      ref: answer.outputRef, sha256: answer.outputSha256!, bytes: answer.outputBytes!,
+    } : undefined);
 
     const references = [
       ...(started?.type === "run_started" ? started.inputRefs ?? [] : []),

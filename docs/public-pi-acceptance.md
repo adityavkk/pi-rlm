@@ -1,0 +1,9 @@
+# Public Pi acceptance boundary
+
+Pinned Pi version: `@earendil-works/pi-coding-agent` 0.80.10.
+
+Credential-free integration uses Pi's public `CreateAgentSessionRuntimeFactory`, `createAgentSessionServices`, `createAgentSessionFromServices`, and `createAgentSessionRuntime` APIs. `resourceLoaderOptions.extensionFactories` injects `createRlmExtension` with its public `executeRun` seam; no provider call or credential is used. For every extension mode binding (`tui`, `rpc`, `json`, and `print`), the real `AgentSession` and `ExtensionRunner` path is observed through public `session.subscribe()`: exactly one matching `pi-rlm-result` `message_start`, `message_end`, and session entry are required.
+
+The actual public `runPrintMode()` adapter is exercised in both text and JSON modes. JSON exposes the custom-message lifecycle. Pi's text adapter owns output policy and prints only a final assistant message, so a command-only custom result remains durable in the session but is not written to text stdout. The actual public `runRpcMode()` adapter is exercised in a subprocess through its JSON stdin/stdout protocol; the test observes the custom event, reads the durable entry with `get_entries`, closes stdin, and requires deterministic process shutdown.
+
+`AgentSessionRuntime` can receive injected resource loaders and extension factories through its public factory. Remaining limits are adapter-owned I/O and lifecycle: `runRpcMode()` owns process stdin/stdout and exits the process on shutdown; print mode owns its output/disposal lifecycle; and `InteractiveMode` requires a real terminal/TUI event loop. The headless suite therefore tests the real `AgentSession` plus `ExtensionRunner` with `mode: "tui"`, but does not claim to execute the terminal-bound `InteractiveMode` adapter. `ExtensionAPI.sendMessage()` also returns `void`, so Pi 0.80.10 exposes no awaited message-persistence acknowledgement to extensions.
