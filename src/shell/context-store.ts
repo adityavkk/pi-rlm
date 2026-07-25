@@ -440,20 +440,26 @@ export class ContextStore {
         } catch (cause) {
           if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
             let bytes = orphan.bytes;
+            let exists = true;
             try {
               const measured = this.instrumentation.fileBytes
                 ? await this.instrumentation.fileBytes(path)
                 : (await stat(path)).size;
               if (Number.isSafeInteger(measured) && measured >= 0 && measured <= bytes) bytes = measured;
-            } catch {}
-            if (bytes < orphan.bytes) {
-              orphan.reservation?.release(orphan.bytes - bytes);
-              this.uniqueBytes -= orphan.bytes - bytes;
-              orphan.bytes = bytes;
+            } catch (measurementCause) {
+              const code = (measurementCause as NodeJS.ErrnoException).code;
+              if (code === "ENOENT" || code === "ENOTDIR") exists = false;
             }
-            orphan.cause = cause;
-            failures.push({ path, bytes: orphan.bytes, cause });
-            continue;
+            if (exists) {
+              if (bytes < orphan.bytes) {
+                orphan.reservation?.release(orphan.bytes - bytes);
+                this.uniqueBytes -= orphan.bytes - bytes;
+                orphan.bytes = bytes;
+              }
+              orphan.cause = cause;
+              failures.push({ path, bytes: orphan.bytes, cause });
+              continue;
+            }
           }
         }
         this.orphans.delete(path);
