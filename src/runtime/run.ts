@@ -15,7 +15,7 @@ import {
 import { type Clock, systemClock } from "../shell/clock.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
-import { JournalStore } from "../shell/journal-store.ts";
+import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { contextControl, withContextMutation } from "./broker.ts";
@@ -40,6 +40,8 @@ export interface RunInput {
   readonly clock?: Clock;
   readonly profile?: Profile;
   readonly extractor?: Extractor;
+  /** Optional store injection for fault testing and embedded runtimes. */
+  readonly journal?: JournalStore;
 }
 
 export interface RunError {
@@ -49,12 +51,19 @@ export interface RunError {
   readonly cause?: { readonly name: string; readonly code?: string };
 }
 
+export interface RunWarning {
+  readonly code: "STATUS_CACHE_REFRESH_FAILED" | "JOURNAL_APPEND_CLEANUP_FAILED";
+  readonly message: string;
+  readonly cause?: RunError["cause"];
+}
+
 export interface RunResult {
   readonly runId: string;
   readonly status: "completed" | "failed" | "cancelled";
   readonly completionMode?: "answer" | "fallback_extract";
   readonly answer?: JsonValue;
   readonly error?: RunError;
+  readonly warnings?: readonly RunWarning[];
   readonly ledger: Ledger;
 }
 
@@ -140,8 +149,35 @@ const terminalEvent = (result: PlannedResult): RlmEvent => {
   };
 };
 
-const isTerminalEvent = (event: RlmEvent): boolean =>
+type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
+
+const isTerminalEvent = (event: RlmEvent): event is TerminalEvent =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
+
+const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): PlannedResult => {
+  if (event.type === "run_completed") {
+    return {
+      runId: event.runId,
+      status: "completed",
+      completionMode: event.completionMode,
+      ...(initial.status === "completed" && initial.completionMode === event.completionMode && initial.answer !== undefined
+        ? { answer: initial.answer }
+        : {}),
+    };
+  }
+  if (event.type === "run_cancelled") {
+    return {
+      runId: event.runId,
+      status: "cancelled",
+      error: { code: event.code, message: event.message },
+    };
+  }
+  const matchingCause = initial.status === "failed" &&
+    initial.error?.code === event.code && initial.error.message === event.message
+    ? initial.error.cause
+    : undefined;
+  return failure(event.runId, event.code, event.message, matchingCause);
+};
 
 /** Close every successfully opened frame, then append the sole run terminal. */
 const finalize = async (
@@ -151,12 +187,55 @@ const finalize = async (
   ledgerRef: { current: Ledger },
 ): Promise<RunResult> => {
   let planned = initial;
+  const durableAppendFailures: JournalAppendError[] = [];
+  const observeDurableFailure = (error: unknown): boolean => {
+    if (!(error instanceof JournalAppendError) || !error.eventDurable) return false;
+    if (!durableAppendFailures.includes(error)) durableAppendFailures.push(error);
+    return true;
+  };
+  const appendDurably = async (event: RlmEvent): Promise<void> => {
+    try {
+      await journal.append(event);
+    } catch (error) {
+      if (!observeDurableFailure(error)) throw error;
+    }
+  };
+  const finish = (result: PlannedResult): RunResult => {
+    const warnings: RunWarning[] = [];
+    if (journal.statusCacheFailures().length > 0) {
+      const cause = safeCause(journal.statusCacheFailures()[0]?.cause);
+      warnings.push({
+        code: "STATUS_CACHE_REFRESH_FAILED",
+        message: "journal status cache refresh failed; authoritative status remains available from events",
+        ...(cause ? { cause } : {}),
+      });
+    }
+    if (durableAppendFailures.length > 0) {
+      const cause = safeCause(durableAppendFailures[0]?.cause);
+      warnings.push({
+        code: "JOURNAL_APPEND_CLEANUP_FAILED",
+        message: "journal event was durable but append cleanup failed",
+        ...(cause ? { cause } : {}),
+      });
+    }
+    return { ...result, ...(warnings.length > 0 ? { warnings } : {}), ledger: ledgerRef.current };
+  };
+
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await journal.drain().catch(() => undefined);
+      let drainFailure: unknown;
+      try {
+        await journal.drain();
+      } catch (error) {
+        drainFailure = error;
+      }
       const scanned = await journal.readEvents();
       if (!scanned.ok) throw scanned.error;
-      if (scanned.value.some(isTerminalEvent)) return { ...planned, ledger: ledgerRef.current };
+      const existingTerminal = scanned.value.find(isTerminalEvent);
+      if (existingTerminal) return finish(resultFromTerminal(existingTerminal, initial));
+      if (drainFailure !== undefined && !observeDurableFailure(drainFailure)) {
+        planned = failure(initial.runId, "JOURNAL_FAILED", "failed to finalize run journal", drainFailure);
+      }
 
       const openOrder: string[] = [];
       const open = new Set<string>();
@@ -177,25 +256,34 @@ const finalize = async (
             : frameId === rootFrameId
               ? "answered"
               : "closed";
-        await journal.append({ type: "frame_closed", frameId, state });
+        await appendDurably({ type: "frame_closed", frameId, state });
       }
       const event = terminalEvent(planned);
       if (event.type === "run_completed" && planned.completionMode === "fallback_extract") {
         const events = await journal.readEvents();
         if (events.ok) {
           const answer = [...events.value].reverse().find((candidate) => candidate.type === "answer_committed");
-          if (answer?.type === "answer_committed")
-            await journal.append({ ...event, outputRef: answer.outputRef });
-          else await journal.append(event);
-        } else await journal.append(event);
-      } else await journal.append(event);
-      await journal.drain();
-      return { ...planned, ledger: ledgerRef.current };
+          await appendDurably(answer?.type === "answer_committed" ? { ...event, outputRef: answer.outputRef } : event);
+        } else await appendDurably(event);
+      } else await appendDurably(event);
+
+      const finalized = await journal.readEvents();
+      if (!finalized.ok) throw finalized.error;
+      const committedTerminal = finalized.value.find(isTerminalEvent);
+      if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial));
+      throw new Error("terminal event was not committed");
     } catch (error) {
+      try {
+        const rescued = await journal.readEvents();
+        const committedTerminal = rescued.ok ? rescued.value.find(isTerminalEvent) : undefined;
+        if (committedTerminal) return finish(resultFromTerminal(committedTerminal, initial));
+      } catch {
+        // Preserve the original finalization failure classification.
+      }
       planned = failure(initial.runId, "JOURNAL_FAILED", "failed to finalize run journal", error);
     }
   }
-  return { ...planned, ledger: ledgerRef.current };
+  return finish(planned);
 };
 
 export const runProgram = async (input: RunInput): Promise<RunResult> => {
@@ -206,7 +294,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const ledgerRef = { current: createLedger(limits) };
   const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`).slice(0, 16)}`;
   const rootFrameId = `${runId}:f0`;
-  const journal = new JournalStore(input.dir);
+  const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
   let phase: Phase = "journal";

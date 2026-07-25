@@ -35,9 +35,11 @@ import {
   type RunResult,
 } from "./src/runtime/index.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./src/runtime/abort.ts";
+import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { QuickJsBackend } from "./src/shell/interpreter/quickjs.ts";
 import { sha256 } from "./src/shell/hash.ts";
+import type { ModelClient } from "./src/shell/model/client.ts";
 import { PiModelClient } from "./src/shell/model/pi-model.ts";
 
 export const LAUNCH_SNIPPET =
@@ -146,14 +148,30 @@ const summarize = (result: RunResult): string => {
   return `pi-rlm failed (${result.error?.code}): ${result.error?.message}`;
 };
 
-const executeRun = async (request: LaunchRequest, signal: AbortSignal): Promise<RunResult> => {
+export interface RlmRuntimeDependencies {
+  readonly resolveProfile?: () => Profile;
+  readonly createBackend?: () => InterpreterBackend | Promise<InterpreterBackend>;
+  readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
+  readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
+  readonly createRunDirectory?: () => Promise<string>;
+}
+
+const executeRun = async (
+  request: LaunchRequest,
+  signal: AbortSignal,
+  dependencies: RlmRuntimeDependencies = {},
+): Promise<RunResult> => {
   throwIfAborted(signal);
-  const profile = resolveProfile();
-  const [backend, runtime] = await waitForAbort(Promise.all([getBackend(), getRuntime()]), signal);
+  const profile = (dependencies.resolveProfile ?? resolveProfile)();
+  const backendWork = Promise.resolve((dependencies.createBackend ?? getBackend)());
+  const modelWork = dependencies.createModel
+    ? Promise.resolve(dependencies.createModel(profile))
+    : getRuntime().then((runtime) => new PiModelClient(runtime, profile.models.medium));
+  const [backend, model] = await waitForAbort(Promise.all([backendWork, modelWork]), signal);
   throwIfAborted(signal);
-  const model = new PiModelClient(runtime, profile.models.medium);
-  const controller = new ModelController(model, { model: profile.models.large });
-  const dirWork = mkdtemp(join(tmpdir(), "pi-rlm-run-"));
+  const controller = (dependencies.createController ??
+    ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
+  const dirWork = (dependencies.createRunDirectory ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-run-"))))();
   let dir: string;
   try {
     dir = await waitForAbort(dirWork, signal);
@@ -168,7 +186,7 @@ const executeRun = async (request: LaunchRequest, signal: AbortSignal): Promise<
     sources: request.sources,
     controller,
     model,
-    backend: backend as InterpreterBackend,
+    backend,
     dir,
     profile,
     signal,
@@ -177,6 +195,7 @@ const executeRun = async (request: LaunchRequest, signal: AbortSignal): Promise<
 
 export interface RlmExtensionDependencies {
   readonly executeRun?: (request: LaunchRequest, signal: AbortSignal) => Promise<RunResult>;
+  readonly runtime?: RlmRuntimeDependencies;
   readonly now?: () => number;
   readonly createId?: () => string;
   readonly grantTtlMs?: number;
@@ -216,7 +235,7 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
-  const run = dependencies.executeRun ?? executeRun;
+  const run = dependencies.executeRun ?? ((request, signal) => executeRun(request, signal, dependencies.runtime));
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;

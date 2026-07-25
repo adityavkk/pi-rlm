@@ -1,12 +1,12 @@
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import type { RlmEvent } from "../core/journal.ts";
+import { reduceStatus, type RlmEvent } from "../core/journal.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "../shell/interpreter/backend.ts";
-import { JournalStore } from "../shell/journal-store.ts";
+import { JournalStore, type JournalFileHandle, type JournalFileSystem } from "../shell/journal-store.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
 import { FunctionExtractor } from "./extractor.ts";
@@ -82,6 +82,42 @@ const events = async (dir: string): Promise<RlmEvent[]> =>
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line) as RlmEvent);
+
+type TerminalStatusFault = "status write" | "status sync" | "status close" | "status rename" | "directory sync";
+
+const terminalStatusFaultFileSystem = (root: string, fault: TerminalStatusFault): JournalFileSystem => {
+  const eventsPath = join(root, "events.jsonl");
+  const statusTmpPath = join(root, "status.json.tmp");
+  const maybeFail = (operation: TerminalStatusFault): void => {
+    if (operation === fault) throw new Error(`injected ${operation} failure`);
+  };
+  const wrap = (path: string, handle: JournalFileHandle): JournalFileHandle => ({
+    appendFile: (data, encoding) => handle.appendFile(data, encoding),
+    readFile: () => handle.readFile(),
+    truncate: (length) => handle.truncate(length),
+    writeFile: async (data, encoding) => {
+      if (path === statusTmpPath) maybeFail("status write");
+      await handle.writeFile(data, encoding);
+    },
+    sync: async () => {
+      if (path === statusTmpPath) maybeFail("status sync");
+      if (path === root) maybeFail("directory sync");
+      await handle.sync();
+    },
+    close: async () => {
+      await handle.close();
+      if (path === statusTmpPath) maybeFail("status close");
+    },
+  });
+  return {
+    open: async (path, flags) => wrap(path, await open(path, flags)),
+    readFile: async (path) => readFile(path),
+    rename: async (oldPath, newPath) => {
+      if (oldPath === statusTmpPath) maybeFail("status rename");
+      await rename(oldPath, newPath);
+    },
+  };
+};
 
 const expectSingleTerminal = async (dir: string, result: RunResult): Promise<void> => {
   const journalEvents = await events(dir);
@@ -277,6 +313,39 @@ describe("run cancellation and terminal finalization", () => {
     expect(result.error?.code).toBe("BUDGET_DEADLINE");
     await expectSingleTerminal(dir, result);
   });
+
+  for (const [classification, fault] of (["completed", "failed", "cancelled"] as const).flatMap((classification) =>
+    (["status write", "status sync", "status close", "status rename", "directory sync"] as const)
+      .map((fault) => [classification, fault] as const))) {
+    test(`${classification} terminal remains authoritative after ${fault} failure`, async () => {
+      const dir = await tmp();
+      const journal = new JournalStore(dir, terminalStatusFaultFileSystem(dir, fault));
+      const owner = new AbortController();
+      if (classification === "cancelled") owner.abort();
+      const controller: ControllerDriver = classification === "failed"
+        ? { async next() { throw new Error("expected failure"); }, fork() { return this; } }
+        : new OneCellController();
+      const backend = new FunctionBackend(async (options) => {
+        options.effect("answer", { value: { answer: "done" } });
+        return valueOutcome();
+      });
+      const result = await runProgram({
+        program: program(), sources: {}, controller, model: unusedModel, backend, dir,
+        signal: owner.signal, journal,
+      });
+
+      expect(result.status).toBe(classification);
+      expect(result.warnings?.map((warning) => warning.code)).toContain("STATUS_CACHE_REFRESH_FAILED");
+      const journalEvents = await events(dir);
+      const terminals = journalEvents.filter((event) =>
+        event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled");
+      expect(terminals).toHaveLength(1);
+      expect(reduceStatus(journalEvents).state).toBe(result.status);
+      const rebuilt = await journal.status();
+      expect(rebuilt.ok).toBe(true);
+      if (rebuilt.ok) expect(rebuilt.value.state).toBe(result.status);
+    });
+  }
 
   test("filesystem journal failure returns a typed terminal result", async () => {
     const dir = await tmp();
