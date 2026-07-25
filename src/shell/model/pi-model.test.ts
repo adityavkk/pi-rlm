@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { StopReason } from "@earendil-works/pi-ai";
+import { MAX_CALL_DURATION_MS } from "../../core/usage.ts";
 import { ManualClock } from "../clock.ts";
 import { PiModelClient, PiModelError, type PiModelErrorCode } from "./pi-model.ts";
 
@@ -154,10 +155,11 @@ describe("PiModelClient stop reasons", () => {
 
   test("bounds invalid and non-monotonic clock readings", async () => {
     const cases = [
+      { readings: [0, 1.9], expected: 1 },
       { readings: [100, 50], expected: 0 },
       { readings: [Number.NaN, 100], expected: 0 },
       { readings: [0, Number.POSITIVE_INFINITY], expected: 0 },
-      { readings: [-Number.MAX_VALUE, Number.MAX_VALUE], expected: Number.MAX_SAFE_INTEGER },
+      { readings: [-Number.MAX_VALUE, Number.MAX_VALUE], expected: MAX_CALL_DURATION_MS },
     ];
     for (const { readings, expected } of cases) {
       let index = 0;

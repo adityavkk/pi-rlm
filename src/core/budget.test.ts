@@ -66,8 +66,21 @@ describe("budget ledger", () => {
     expect(over.ok).toBe(false);
     if (!over.ok) expect(over.error.code).toBe("BUDGET_TOKENS");
     const settled = settleAttempt(a.value, 40, 30);
-    expect(settled.usage.tokensReserved).toBe(0);
-    expect(settled.usage.tokensUsed).toBe(30);
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) return;
+    expect(settled.value.usage.tokensReserved).toBe(0);
+    expect(settled.value.usage.tokensUsed).toBe(30);
+  });
+
+  test("settlement rejects unsafe or over-reservation usage without changing the ledger", () => {
+    const reserved = reserveAttempt(createLedger(limits), 0, 40);
+    if (!reserved.ok) throw new Error("reservation failed");
+    const before = JSON.stringify(reserved.value);
+    for (const actual of [41, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE]) {
+      const settled = settleAttempt(reserved.value, 40, actual);
+      expect(settled).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" } });
+      expect(JSON.stringify(reserved.value)).toBe(before);
+    }
   });
 
   test("deadline blocks reservations", () => {

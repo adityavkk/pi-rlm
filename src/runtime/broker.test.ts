@@ -284,6 +284,37 @@ describe("dispatchCall cancellation ownership", () => {
     expect(state.ledger.current.usage.tokensUsed).toBe(0);
   });
 
+  test("rejects hostile ModelClient usage without poisoning cumulative tokens", async () => {
+    const usages = [
+      { attempts: 1, totalTokens: Number.MAX_VALUE, durationMs: 1 },
+      { attempts: 1, totalTokens: Number.MAX_SAFE_INTEGER, durationMs: 1 },
+      { attempts: 1, totalTokens: 1, costUsd: 10_001, durationMs: 1 },
+      { attempts: 1, totalTokens: 1, durationMs: 86_400_001 },
+    ];
+    const model: ModelClient = {
+      id: "hostile-usage",
+      async complete(): Promise<ModelResponse> {
+        return { text: "unsafe", usage: usages.shift() as never };
+      },
+    };
+    const state = await brokerState(model, "run_hostile_usage");
+    for (let index = 0; index < 4; index++) {
+      const result = await dispatchCall(
+        state,
+        testFrame,
+        "llm",
+        { key: `hostile-${index}`, prompt: "test" },
+        noRecurse,
+        new AbortController().signal,
+        Date.now() + 5_000,
+      ) as GuestCallResult;
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" }, usage: ZERO_CALL_USAGE });
+      expect(state.ledger.current.usage.tokensReserved).toBe(0);
+      expect(state.ledger.current.usage.tokensUsed).toBe(0);
+      expect(Object.values(state.ledger.current.usage).every(Number.isSafeInteger)).toBe(true);
+    }
+  });
+
   test("does not invoke accessors or trust malformed Pi error accounting", async () => {
     let getterCalls = 0;
     const topAccessor = new PiModelError(

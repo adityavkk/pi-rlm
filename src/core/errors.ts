@@ -6,6 +6,8 @@
  * guest code. Budget errors are non-retryable unless a human raises a limit.
  */
 
+import { normalizeCallUsage } from "./usage.ts";
+
 export const CALL_ERROR_CODES = [
   "FAILED",
   "DENIED",
@@ -98,28 +100,9 @@ const ownData = (value: object, key: string): unknown => {
 const boundedString = (value: unknown, maxLength: number): string | undefined =>
   typeof value === "string" ? value.slice(0, maxLength) : undefined;
 
-const nonNegativeNumber = (value: unknown): number | undefined =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-
 const normalizeSafeUsage = (value: unknown): SafeErrorUsage | undefined => {
-  if (!value || typeof value !== "object") return undefined;
-  const attempts = nonNegativeNumber(ownData(value, "attempts"));
-  const durationMs = nonNegativeNumber(ownData(value, "durationMs"));
-  if (attempts === undefined || durationMs === undefined) return undefined;
-  const optional = (key: "inputTokens" | "outputTokens" | "totalTokens" | "costUsd"): number | undefined =>
-    nonNegativeNumber(ownData(value, key));
-  const inputTokens = optional("inputTokens");
-  const outputTokens = optional("outputTokens");
-  const totalTokens = optional("totalTokens");
-  const costUsd = optional("costUsd");
-  return {
-    attempts,
-    durationMs,
-    ...(inputTokens !== undefined ? { inputTokens } : {}),
-    ...(outputTokens !== undefined ? { outputTokens } : {}),
-    ...(totalTokens !== undefined ? { totalTokens } : {}),
-    ...(costUsd !== undefined ? { costUsd } : {}),
-  };
+  const normalized = normalizeCallUsage(value);
+  return normalized.ok ? normalized.value : undefined;
 };
 
 /** Copy only bounded, data-only fields that are safe to expose to a guest. */

@@ -8,7 +8,7 @@
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Context, StopReason } from "@earendil-works/pi-ai";
-import type { CallUsage } from "../../core/usage.ts";
+import { MAX_CALL_DURATION_MS, type CallUsage } from "../../core/usage.ts";
 import { monotonicClock, type Clock } from "../clock.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "./client.ts";
 
@@ -44,7 +44,7 @@ const splitModel = (id: string): { provider: string; model: string } => {
 const elapsedMs = (startedMs: number, completedMs: number): number => {
   if (!Number.isFinite(startedMs) || !Number.isFinite(completedMs) || completedMs <= startedMs) return 0;
   const elapsed = completedMs - startedMs;
-  return Number.isFinite(elapsed) ? Math.min(elapsed, Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
+  return Number.isFinite(elapsed) ? Math.min(Math.floor(elapsed), MAX_CALL_DURATION_MS) : MAX_CALL_DURATION_MS;
 };
 
 const mapUsage = (message: AssistantMessage, durationMs: number): CallUsage => ({
