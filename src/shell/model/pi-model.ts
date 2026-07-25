@@ -110,7 +110,7 @@ export class PiModelClient implements ModelClient {
     try {
       message = await this.runtime.completeSimple(resolved, context, {
         ...(reasoning ? { reasoning } : {}),
-        ...(request.maxOutputTokens ? { maxTokens: request.maxOutputTokens } : {}),
+        ...(request.maxOutputTokens !== undefined ? { maxTokens: request.maxOutputTokens } : {}),
         ...(request.signal ? { signal: request.signal } : {}),
       });
     } catch {

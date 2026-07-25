@@ -113,7 +113,7 @@ export const reserveAttempt = (
   return ok(patch(ledger, { attempts: ledger.usage.attempts + 1, tokensReserved: nextReserved }));
 };
 
-/** Settle an attempt. Invalid accounting leaves the ledger unchanged. */
+/** Settle an attempt. Actual usage may exceed its optimistic reservation. */
 export const settleAttempt = (
   ledger: Ledger,
   reservedTokens: number,
@@ -124,7 +124,7 @@ export const settleAttempt = (
     return err(callError("INVALID_RESULT", "invalid ledger accounting"));
   if (!Number.isSafeInteger(reservedTokens) || reservedTokens < 0 || reservedTokens > ledger.usage.tokensReserved)
     return err(callError("INVALID_RESULT", "invalid token reservation settlement"));
-  if (!Number.isSafeInteger(actualTokens) || actualTokens < 0 || actualTokens > reservedTokens
+  if (!Number.isSafeInteger(actualTokens) || actualTokens < 0 || actualTokens > MAX_CALL_TOKENS
     || ledger.usage.tokensUsed > Number.MAX_SAFE_INTEGER - actualTokens)
     return err(callError("INVALID_RESULT", "invalid reported token usage"));
   return ok(patch(ledger, {

@@ -59,6 +59,7 @@ const brokerState = async (model: ModelClient, runId: string): Promise<RunState>
     backend: {} as InterpreterBackend,
     callCache: new Map(),
     inflight: new Map(),
+    keyIdentities: new Map(),
     semaphore: new Semaphore(1),
     contextSemaphore: new Semaphore(1),
     frameSeq: { current: 1 },
@@ -217,6 +218,7 @@ describe("dispatchCall cancellation ownership", () => {
       backend: {} as InterpreterBackend,
       callCache: new Map(),
       inflight: new Map(),
+      keyIdentities: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
@@ -286,6 +288,7 @@ describe("dispatchCall cancellation ownership", () => {
 
   test("rejects hostile ModelClient usage without poisoning cumulative tokens", async () => {
     const usages = [
+      { attempts: 1, totalTokens: 10_000_001, durationMs: 1 },
       { attempts: 1, totalTokens: Number.MAX_VALUE, durationMs: 1 },
       { attempts: 1, totalTokens: Number.MAX_SAFE_INTEGER, durationMs: 1 },
       { attempts: 1, totalTokens: 1, costUsd: 10_001, durationMs: 1 },
@@ -298,7 +301,7 @@ describe("dispatchCall cancellation ownership", () => {
       },
     };
     const state = await brokerState(model, "run_hostile_usage");
-    for (let index = 0; index < 4; index++) {
+    for (let index = 0; index < 5; index++) {
       const result = await dispatchCall(
         state,
         testFrame,
@@ -313,6 +316,44 @@ describe("dispatchCall cancellation ownership", () => {
       expect(state.ledger.current.usage.tokensUsed).toBe(0);
       expect(Object.values(state.ledger.current.usage).every(Number.isSafeInteger)).toBe(true);
     }
+  });
+
+  test("accounts token overshoot and blocks later calls while enforcing the output default", async () => {
+    const requests: ModelRequest[] = [];
+    const model: ModelClient = {
+      id: "overshoot",
+      async complete(request): Promise<ModelResponse> {
+        requests.push(request);
+        return { text: "ok", usage: { attempts: 1, totalTokens: 600, durationMs: 1 } };
+      },
+    };
+    const state = await brokerState(model, "run_token_overshoot");
+    state.ledger.current = createLedger({ ...state.ledger.current.limits, tokenLimit: 520 });
+
+    const first = await dispatchCall(
+      state,
+      testFrame,
+      "llm",
+      { key: "first", prompt: "x" },
+      noRecurse,
+      new AbortController().signal,
+      Date.now() + 5_000,
+    ) as GuestCallResult;
+    expect(first).toMatchObject({ ok: true, usage: { totalTokens: 600 } });
+    expect(requests[0]?.maxOutputTokens).toBe(512);
+    expect(state.ledger.current.usage).toMatchObject({ tokensReserved: 0, tokensUsed: 600 });
+
+    const second = await dispatchCall(
+      state,
+      testFrame,
+      "llm",
+      { key: "second", prompt: "x" },
+      noRecurse,
+      new AbortController().signal,
+      Date.now() + 5_000,
+    ) as GuestCallResult;
+    expect(second).toMatchObject({ ok: false, error: { code: "BUDGET_TOKENS" } });
+    expect(requests).toHaveLength(1);
   });
 
   test("does not invoke accessors or trust malformed Pi error accounting", async () => {

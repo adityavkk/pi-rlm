@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MAX_CALL_TOKENS } from "./usage.ts";
 import {
   acquireLeaf,
   budgetView,
@@ -72,11 +73,14 @@ describe("budget ledger", () => {
     expect(settled.value.usage.tokensUsed).toBe(30);
   });
 
-  test("settlement rejects unsafe or over-reservation usage without changing the ledger", () => {
+  test("settlement accounts finite overshoot but rejects usage above the absolute cap", () => {
     const reserved = reserveAttempt(createLedger(limits), 0, 40);
     if (!reserved.ok) throw new Error("reservation failed");
+    const overshoot = settleAttempt(reserved.value, 40, 41);
+    expect(overshoot).toMatchObject({ ok: true, value: { usage: { tokensReserved: 0, tokensUsed: 41 } } });
+
     const before = JSON.stringify(reserved.value);
-    for (const actual of [41, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE]) {
+    for (const actual of [MAX_CALL_TOKENS + 1, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE]) {
       const settled = settleAttempt(reserved.value, 40, actual);
       expect(settled).toMatchObject({ ok: false, error: { code: "INVALID_RESULT" } });
       expect(JSON.stringify(reserved.value)).toBe(before);
