@@ -1,10 +1,19 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "./src/core/journal.ts";
 import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controller.ts";
-import { DEFAULT_PROFILE, type RunResult } from "./src/runtime/index.ts";
+import {
+  DEFAULT_PROFILE,
+  ManagedRunStore,
+  RUN_ACTIVE_FILE,
+  RUN_INACTIVE_FILE_PREFIX,
+  RUN_LIFECYCLE_FILE,
+  type ManagedRunStoreOptions,
+  type RunResult,
+  type RunRetentionMetadataFileSystem,
+} from "./src/runtime/index.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
@@ -174,6 +183,181 @@ const pendingOfflineRuntime = (dir: string): {
       createRunDirectory: async () => dir,
     },
   };
+};
+
+type MetadataFault =
+  | "temp-open"
+  | "temp-write"
+  | "temp-sync"
+  | "temp-close"
+  | "rename"
+  | "directory-open"
+  | "directory-sync"
+  | "directory-close"
+  | "write+cleanup-unlink"
+  | "rename+cleanup-unlink"
+  | "directory-sync+close";
+type ResultStatus = RunResult["status"];
+
+const injectedIo = (stage: string): Error & { code: string } =>
+  Object.assign(new Error(`injected ${stage} failure`), { code: "EIO" });
+
+const metadataFaultFileSystem = (fault: MetadataFault): RunRetentionMetadataFileSystem => {
+  let lifecycleOpens = 0;
+  let terminalPending = false;
+  return {
+    async open(path, flags, mode) {
+      const lifecycleTemp = path.includes(RUN_LIFECYCLE_FILE) && path.endsWith(".tmp");
+      if (lifecycleTemp) lifecycleOpens++;
+      const terminalOpen = lifecycleTemp && lifecycleOpens === 3;
+      if (terminalOpen && fault === "temp-open") throw injectedIo("terminal metadata temp open");
+      if (flags === "r" && terminalPending && fault === "directory-open")
+        throw injectedIo("terminal metadata directory open");
+      const handle = await open(path, flags, mode);
+      let terminalHandle = terminalOpen;
+      return {
+        async writeFile(data, encoding) {
+          terminalHandle ||= lifecycleTemp && /\"status\":\"(?:completed|failed|cancelled)\"/.test(data);
+          if (terminalHandle) {
+            terminalPending = true;
+            if (fault === "temp-write" || fault === "write+cleanup-unlink")
+              throw injectedIo("terminal metadata temp write");
+          }
+          await handle.writeFile(data, encoding);
+        },
+        async sync() {
+          if (terminalHandle && fault === "temp-sync") throw injectedIo("terminal metadata temp sync");
+          if (flags === "r" && terminalPending && (fault === "directory-sync" || fault === "directory-sync+close"))
+            throw injectedIo("terminal metadata directory sync");
+          await handle.sync();
+        },
+        async close() {
+          await handle.close();
+          if (terminalHandle && fault === "temp-close") throw injectedIo("terminal metadata temp close");
+          if (flags === "r" && terminalPending && (fault === "directory-close" || fault === "directory-sync+close"))
+            throw injectedIo("terminal metadata directory close");
+        },
+      };
+    },
+    async rename(from, to) {
+      if (terminalPending && to.endsWith(RUN_LIFECYCLE_FILE)
+        && (fault === "rename" || fault === "rename+cleanup-unlink"))
+        throw injectedIo("terminal metadata rename");
+      await rename(from, to);
+    },
+    async unlink(path) {
+      if (terminalPending && path.endsWith(".tmp")
+        && (fault === "write+cleanup-unlink" || fault === "rename+cleanup-unlink"))
+        throw injectedIo("terminal metadata temp cleanup unlink");
+      await unlink(path);
+    },
+  };
+};
+
+type ReleaseFault =
+  | "unlink"
+  | "rename"
+  | "directory-open"
+  | "directory-sync"
+  | "directory-close"
+  | "directory-sync+close";
+const releaseFaultFileSystem = (fault: ReleaseFault): RunRetentionMetadataFileSystem => {
+  let tombstoneMoved = false;
+  return {
+    async open(path, flags, mode) {
+      if (fault === "directory-open" && tombstoneMoved && flags === "r")
+        throw injectedIo("inactive tombstone directory open");
+      const handle = await open(path, flags, mode);
+      return {
+        writeFile: (data, encoding) => handle.writeFile(data, encoding),
+        async sync() {
+          if ((fault === "directory-sync" || fault === "directory-sync+close") && tombstoneMoved && flags === "r")
+            throw injectedIo("inactive tombstone directory sync");
+          await handle.sync();
+        },
+        async close() {
+          await handle.close();
+          if ((fault === "directory-close" || fault === "directory-sync+close") && tombstoneMoved && flags === "r")
+            throw injectedIo("inactive tombstone directory close");
+        },
+      };
+    },
+    async rename(from, to) {
+      if (from.endsWith(RUN_ACTIVE_FILE)) {
+        if (fault === "rename") throw injectedIo("inactive tombstone rename");
+        await rename(from, to);
+        tombstoneMoved = true;
+        return;
+      }
+      await rename(from, to);
+    },
+    async unlink(path) {
+      if (path.endsWith(RUN_ACTIVE_FILE)) throw injectedIo("active marker unlink");
+      await unlink(path);
+    },
+  };
+};
+
+const managedStatusRun = async (
+  status: ResultStatus,
+  runRetention: ManagedRunStoreOptions,
+  createRunNonce?: () => string,
+): Promise<{ readonly result: ToolResult; readonly harness: ReturnType<typeof harness>; readonly journalRunId?: string }> => {
+  let started!: () => void;
+  const controllerStarted = new Promise<void>((resolve) => { started = resolve; });
+  const never = new Promise<Cell>(() => {});
+  const controller: ControllerDriver = {
+    identity: { id: "test/retention-result-controller", version: "1", configuration: { status } },
+    async next() {
+      if (status === "failed") throw new Error("expected controller failure");
+      if (status === "cancelled") { started(); return never; }
+      return { reasoning: "done", code: "answer({ answer: 'done' })" };
+    },
+    fork() { return this; },
+  };
+  const backend: InterpreterBackend = {
+    id: "retention-result-backend", version: "1",
+    async evalCell(options) {
+      options.effect("answer", { value: { answer: "done" } });
+      return { kind: "value", result: undefined, hasResult: false, workspace: {}, workspaceInvalidPaths: [] };
+    },
+    async dispose() {},
+  };
+  const model: ModelClient = {
+    id: "retention-result-model",
+    identity: { id: "test/retention-result-model", version: "1", configuration: {} },
+    async complete() { throw new Error("unexpected provider call"); },
+  };
+  const h = harness({ runtime: {
+    resolveProfile: () => ({ ...DEFAULT_PROFILE, wallMs: 10_000 }),
+    createBackend: () => backend,
+    createModel: () => model,
+    createController: () => controller,
+    createRunNonce,
+    runRetention,
+  } });
+  await h.startTurn(`Run managed ${status} fixture`);
+  const owner = new AbortController();
+  const pending = rlmTool(h).execute(`retention-${status}`, { objective: `Managed ${status}` }, owner.signal, undefined, h.ctx);
+  if (status === "cancelled") { await controllerStarted; owner.abort(); }
+  const result = await pending;
+  const entries = await readdir(runRetention.root!);
+  const retained = entries.find((entry) => entry.startsWith("run-") || entry.startsWith(".pi-rlm-quarantine-"));
+  let journalRunId: string | undefined;
+  if (retained) {
+    try {
+      const raw = await readFile(join(runRetention.root!, retained, "events.jsonl"), "utf8");
+      const events = raw.trim().split("\n").flatMap((line) => {
+        const parsed = JSON.parse(line) as RlmEvent | { events: RlmEvent[] };
+        return "events" in parsed ? parsed.events : [parsed];
+      });
+      journalRunId = events.find((event) =>
+        event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled")?.runId;
+    } catch (error) {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+  }
+  return { result, harness: h, journalRunId };
 };
 
 const assertCancelledJournal = async (dir: string): Promise<string> => {
@@ -555,6 +739,202 @@ describe("pi-rlm extension wiring", () => {
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  const metadataFaultCases = (["completed", "failed", "cancelled"] as const)
+    .flatMap((status) => ([
+      "temp-open",
+      "temp-write",
+      "temp-sync",
+      "temp-close",
+      "rename",
+      "directory-open",
+      "directory-sync",
+      "directory-close",
+      "write+cleanup-unlink",
+      "rename+cleanup-unlink",
+      "directory-sync+close",
+    ] as const).map((fault) => [status, fault] as const));
+  test.each(metadataFaultCases)(
+    "authoritative %s result survives terminal metadata %s failure with one warning",
+    async (status, fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
+      const { result, harness: h, journalRunId } = await managedStatusRun(status, {
+        root: stateRoot,
+        metadataFileSystem: metadataFaultFileSystem(fault),
+      });
+      expect(result.details?.status).toBe(status);
+      expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
+      const text = result.content[0]?.text ?? "";
+      expect(text.match(/RETENTION_METADATA_FAILED/g)).toHaveLength(1);
+      expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+      expect(text).not.toContain("failed before producing a result");
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["runId"]).toBe(journalRunId);
+      expect(warningAudit?.data["status"]).toBe(status);
+      expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_METADATA_FAILED")).toHaveLength(1);
+      const listing = await new ManagedRunStore({ root: stateRoot }).list();
+      expect(listing.runs).toHaveLength(1);
+      expect(listing.runs[0]?.activity).not.toBe("owned");
+      await expect(readFile(join(listing.runs[0]!.path, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await new ManagedRunStore({
+        root: stateRoot,
+        policy: { abandonedGraceMs: 0 },
+      }).cleanup({ force: true })).deleted).toEqual([listing.runs[0]!.name]);
+    },
+  );
+
+  const releaseFaultCases = (["completed", "failed", "cancelled"] as const)
+    .flatMap((status) => ([
+      "unlink",
+      "rename",
+      "directory-open",
+      "directory-sync",
+      "directory-close",
+      "directory-sync+close",
+    ] as const).map((fault) => [status, fault] as const));
+  test.each(releaseFaultCases)(
+    "authoritative %s result survives active-marker release %s fault",
+    async (status, fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-release-"));
+      const { result, harness: h, journalRunId } = await managedStatusRun(status, {
+        root: stateRoot,
+        metadataFileSystem: releaseFaultFileSystem(fault),
+      });
+      expect(result.details?.status).toBe(status);
+      expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
+      const text = result.content[0]?.text ?? "";
+      const warnings = text.match(/RETENTION_METADATA_FAILED/g) ?? [];
+      expect(warnings).toHaveLength(fault === "unlink" ? 0 : 1);
+      if (fault !== "unlink")
+        expect(text).toContain("RETENTION_METADATA_FAILED: authoritative run result retained, but lifecycle metadata finalization failed");
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["codes"] ?? []).toEqual(fault === "unlink" ? [] : ["RETENTION_METADATA_FAILED"]);
+      const listing = await new ManagedRunStore({ root: stateRoot }).list();
+      expect(listing.runs).toHaveLength(1);
+      expect(listing.runs[0]?.activity).not.toBe("owned");
+      const entries = await readdir(listing.runs[0]!.path);
+      if (fault === "rename") {
+        expect(listing.runs[0]?.activity).toBe("ambiguous");
+        expect(entries).toContain(RUN_ACTIVE_FILE);
+        expect((await new ManagedRunStore({ root: stateRoot }).cleanup({ force: true })).retained)
+          .toEqual([listing.runs[0]!.name]);
+      } else {
+        expect(listing.runs[0]?.activity).toBe("inactive");
+        expect(entries).not.toContain(RUN_ACTIVE_FILE);
+        expect(entries).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listing.runs[0]!.metadata.owner}.json`);
+        expect((await new ManagedRunStore({ root: stateRoot }).cleanup({ force: true })).deleted)
+          .toEqual([listing.runs[0]!.name]);
+      }
+    },
+  );
+
+  const cleanupFaultCases = (["completed", "failed", "cancelled"] as const)
+    .flatMap((status) => (["scan", "delete"] as const).map((fault) => [status, fault] as const));
+  test.each(cleanupFaultCases)(
+    "authoritative %s result survives post-run cleanup %s failure with one warning",
+    async (status, fault) => {
+      const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
+      const retention: ManagedRunStoreOptions = fault === "scan"
+        ? { root: stateRoot, policy: { maxScanEntries: 1 } }
+        : {
+            root: stateRoot,
+            policy: { terminalMaxAgeMs: 0 },
+            removeDirectory: async () => { throw Object.assign(new Error("injected delete failure"), { code: "EIO" }); },
+          };
+      const { result, harness: h, journalRunId } = await managedStatusRun(status, retention);
+      expect(result.details?.status).toBe(status);
+      expect(journalRunId).toMatch(/^run_[a-f0-9]{64}$/);
+      const text = result.content[0]?.text ?? "";
+      expect(text.match(/RETENTION_CLEANUP_FAILED/g)).toHaveLength(1);
+      expect(text).not.toContain("failed before producing a result");
+      const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
+      expect(warningAudit?.data["runId"]).toBe(journalRunId);
+      expect(warningAudit?.data["status"]).toBe(status);
+      expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_CLEANUP_FAILED")).toHaveLength(1);
+    },
+  );
+
+  test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-"));
+    const { result } = await managedStatusRun("failed", { root: stateRoot }, () => " invalid nonce ");
+    expect(result.details?.status).toBe("error");
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.runs).toHaveLength(1);
+    expect(listing.runs[0]).toMatchObject({ activity: "stale", metadata: { status: "active" } });
+    expect(listing.runs[0]?.metadata.runId).toBeUndefined();
+    expect(listing.runs[0]?.metadata.terminalAtMs).toBeUndefined();
+    await expect(readFile(join(listing.runs[0]!.path, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    "unlink",
+    "rename",
+    "directory-open",
+    "directory-sync",
+    "directory-close",
+    "directory-sync+close",
+  ] as const)("pre-manifest abandonment releases ownership across marker %s fault", async (fault) => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-release-"));
+    const { result } = await managedStatusRun("failed", {
+      root: stateRoot,
+      metadataFileSystem: releaseFaultFileSystem(fault),
+    }, () => " invalid nonce ");
+    expect(result.details?.status).toBe("error");
+    expect(result.content[0]?.text ?? "").not.toContain("RETENTION_METADATA_FAILED");
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.runs).toHaveLength(1);
+    expect(listing.runs[0]?.activity).not.toBe("owned");
+    expect(listing.runs[0]?.metadata).toMatchObject({ status: "active" });
+    expect(listing.runs[0]?.metadata.runId).toBeUndefined();
+    const entries = await readdir(listing.runs[0]!.path);
+    if (fault === "rename") {
+      expect(listing.runs[0]?.activity).toBe("ambiguous");
+      expect(entries).toContain(RUN_ACTIVE_FILE);
+      expect((await new ManagedRunStore({ root: stateRoot, policy: { abandonedGraceMs: 0 } }).cleanup({ force: true })).retained)
+        .toEqual([listing.runs[0]!.name]);
+    } else {
+      expect(listing.runs[0]?.activity).toBe("stale");
+      expect(entries).not.toContain(RUN_ACTIVE_FILE);
+      expect((await new ManagedRunStore({ root: stateRoot, policy: { abandonedGraceMs: 0 } }).cleanup({ force: true })).deleted)
+        .toEqual([listing.runs[0]!.name]);
+    }
+  });
+
+  test("default runtime uses retained managed state while injected directories keep legacy ownership", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-extension-state-"));
+    const backend: InterpreterBackend = {
+      id: "managed-test-backend", version: "1",
+      async evalCell() { throw new Error("unused"); },
+      async dispose() {},
+    };
+    const model: ModelClient = {
+      id: "managed-test-model",
+      identity: { id: "test/managed-model", version: "1", configuration: {} },
+      async complete() { throw new Error("unused"); },
+    };
+    const controller: ControllerDriver = {
+      identity: { id: "test/managed-controller", version: "1", configuration: {} },
+      async next() { throw new Error("unused"); },
+      fork() { return this; },
+    };
+    const h = harness({ runtime: {
+      resolveProfile: () => ({ ...DEFAULT_PROFILE, maxControllerTurns: 0 }),
+      createBackend: () => backend,
+      createModel: () => model,
+      createController: () => controller,
+      runRetention: { root: stateRoot },
+    } });
+    await h.startTurn("Use pi-rlm with managed retention");
+    const result = await rlmTool(h).execute("call-managed", { objective: "Retain this run" }, undefined, undefined, h.ctx);
+    expect(result.details?.status).toBe("failed");
+    const listing = await new ManagedRunStore({ root: stateRoot }).list();
+    expect(listing.issues).toEqual([]);
+    expect(listing.runs).toHaveLength(1);
+    expect(listing.runs[0]?.metadata).toMatchObject({ status: "failed", runId: expect.stringMatching(/^run_[a-f0-9]{64}$/) });
+    expect((await lstat(join(listing.runs[0]!.path, "manifest.json"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(join(listing.runs[0]!.path, "events.jsonl"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(join(listing.runs[0]!.path, "contexts"))).mode & 0o777).toBe(0o700);
   });
 
   test("runtime initialization is not called when no consumable turn grant exists", async () => {

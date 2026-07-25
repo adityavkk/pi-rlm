@@ -238,7 +238,7 @@ export class ContextStore {
     const root = await this.trustedRootPath(contextId);
     if (create) {
       try {
-        await mkdir(this.contentDir);
+        await mkdir(this.contentDir, { mode: 0o700 });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }

@@ -33,13 +33,13 @@ export interface JournalFileHandle {
 }
 
 export interface JournalFileSystem {
-  open(path: string, flags: string): Promise<JournalFileHandle>;
+  open(path: string, flags: string, mode?: number): Promise<JournalFileHandle>;
   readFile(path: string): Promise<Buffer>;
   rename(oldPath: string, newPath: string): Promise<void>;
 }
 
 const nodeFileSystem: JournalFileSystem = {
-  open: async (path, flags) => open(path, flags),
+  open: async (path, flags, mode) => open(path, flags, mode),
   readFile: async (path) => readFile(path),
   rename,
 };
@@ -255,7 +255,7 @@ export class JournalStore {
       let failure: JournalAppendError | undefined;
 
       try {
-        handle = await this.fileSystem.open(this.eventsPath, "a+");
+        handle = await this.fileSystem.open(this.eventsPath, "a+", 0o600);
         let raw = await handle.readFile();
         let scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
@@ -413,7 +413,7 @@ export class JournalStore {
 
   private async writeStatus(status: RunStatus): Promise<void> {
     const tmp = `${this.statusPath}.tmp`;
-    const handle = await this.fileSystem.open(tmp, "w");
+    const handle = await this.fileSystem.open(tmp, "w", 0o600);
     try {
       await handle.writeFile(JSON.stringify(status, null, 2), "utf8");
       await handle.sync();

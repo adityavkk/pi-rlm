@@ -7,9 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -35,7 +33,13 @@ import {
   preflightRunComponents,
   runProgram,
   type RunResult,
+  type RunWarning,
 } from "./src/runtime/index.ts";
+import {
+  ManagedRunStore,
+  RunRetentionError,
+  type ManagedRunStoreOptions,
+} from "./src/runtime/run-retention.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./src/runtime/abort.ts";
 import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
@@ -143,11 +147,39 @@ const confirmationMessage = (request: LaunchRequest, hash: string): string => {
   ].join("\n");
 };
 
+const warningSummary = (result: RunResult): string => result.warnings?.length
+  ? `\n\nWarnings: ${result.warnings.map((warning) => `${warning.code}: ${warning.message}`).join("; ")}`
+  : "";
+
 const summarize = (result: RunResult): string => {
+  const warnings = warningSummary(result);
   if (result.status === "completed")
-    return `pi-rlm ${result.completionMode === "fallback_extract" ? "completed via fallback extraction" : "completed"}.\n\nResult:\n${JSON.stringify(result.answer, null, 2)}\n\nUsage: ${result.ledger.usage.logicalCalls} calls, ${result.ledger.usage.attempts} attempts, ${result.ledger.usage.framesOpened} child frames.`;
-  if (result.status === "cancelled") return "pi-rlm cancelled.";
-  return `pi-rlm failed (${result.error?.code}): ${result.error?.message}`;
+    return `pi-rlm ${result.completionMode === "fallback_extract" ? "completed via fallback extraction" : "completed"}.\n\nResult:\n${JSON.stringify(result.answer, null, 2)}\n\nUsage: ${result.ledger.usage.logicalCalls} calls, ${result.ledger.usage.attempts} attempts, ${result.ledger.usage.framesOpened} child frames.${warnings}`;
+  if (result.status === "cancelled") return `pi-rlm cancelled.${warnings}`;
+  return `pi-rlm failed (${result.error?.code}): ${result.error?.message}${warnings}`;
+};
+
+const retentionWarning = (
+  result: RunResult,
+  code: Extract<RunWarning["code"], "RETENTION_METADATA_FAILED" | "RETENTION_CLEANUP_FAILED">,
+  error: unknown,
+): RunResult => {
+  const candidate = error && typeof error === "object" ? error as { name?: unknown; code?: unknown } : undefined;
+  const name = typeof candidate?.name === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(candidate.name)
+    ? candidate.name
+    : "Error";
+  const causeCode = typeof candidate?.code === "string" && /^[A-Z0-9_-]{1,64}$/.test(candidate.code)
+    ? candidate.code
+    : undefined;
+  const warning: RunWarning = {
+    code,
+    message: code === "RETENTION_METADATA_FAILED"
+      ? "authoritative run result retained, but lifecycle metadata finalization failed"
+      : "authoritative run result retained, but the post-run retention sweep failed",
+    cause: { name, ...(causeCode ? { code: causeCode } : {}) },
+  };
+  const warnings = [...(result.warnings ?? []), warning].slice(-8);
+  return { ...result, warnings };
 };
 
 export interface RlmRuntimeDependencies {
@@ -155,8 +187,12 @@ export interface RlmRuntimeDependencies {
   readonly createBackend?: () => InterpreterBackend | Promise<InterpreterBackend>;
   readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
   readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
+  /** Custom directories retain the legacy caller-owned lifecycle and are never swept. */
   readonly createRunDirectory?: () => Promise<string>;
   readonly createRunNonce?: () => string;
+  readonly runRetention?: ManagedRunStoreOptions;
+  /** Observer for detached cleanup after cancellation wins a directory-allocation race. */
+  readonly onRetentionError?: (error: RunRetentionError) => void;
 }
 
 const executeRun = async (
@@ -176,35 +212,71 @@ const executeRun = async (
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
   preflightRunComponents({ backend, model, controller });
-  const dirWork = (dependencies.createRunDirectory ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-run-"))))();
-  let dir: string;
+  if (dependencies.createRunDirectory) {
+    const dirWork = dependencies.createRunDirectory();
+    let dir: string;
+    try {
+      dir = await waitForAbort(dirWork, signal);
+    } catch (error) {
+      if (wasAborted(error, signal))
+        void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
+      throw error;
+    }
+    try {
+      throwIfAborted(signal);
+      const result = await runProgram({
+        program: request.program, sources: request.sources, controller, model, backend, dir, profile, signal,
+        authorizationMode, createRunNonce: dependencies.createRunNonce,
+      });
+      if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
+      return result;
+    } catch (error) {
+      await rm(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  const store = new ManagedRunStore(dependencies.runRetention);
+  const allocationWork = store.create();
+  let lease: Awaited<typeof allocationWork>;
   try {
-    dir = await waitForAbort(dirWork, signal);
+    lease = await waitForAbort(allocationWork, signal);
   } catch (error) {
-    if (wasAborted(error, signal))
-      void dirWork.then((lateDir) => rm(lateDir, { recursive: true, force: true })).catch(() => {});
+    if (wasAborted(error, signal)) {
+      void allocationWork.then((lateLease) => lateLease.discard()).catch((cause: unknown) => {
+        const observed = cause instanceof RunRetentionError
+          ? cause
+          : new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "late managed allocation cleanup failed", cause);
+        (dependencies.onRetentionError ?? ((failure) => console.error(failure.code, failure.message)))(observed);
+      });
+    }
     throw error;
   }
+
+  let result: RunResult;
   try {
     throwIfAborted(signal);
-    const result = await runProgram({
-      program: request.program,
-      sources: request.sources,
-      controller,
-      model,
-      backend,
-      dir,
-      profile,
-      signal,
-      authorizationMode,
-      createRunNonce: dependencies.createRunNonce,
+    result = await runProgram({
+      program: request.program, sources: request.sources, controller, model, backend, dir: lease.dir, profile, signal,
+      authorizationMode, createRunNonce: dependencies.createRunNonce, runLifecycle: lease.lifecycle,
     });
-    if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
-    return result;
-  } catch (error) {
-    await rm(dir, { recursive: true, force: true });
-    throw error;
+  } catch (primary) {
+    const cleanupFailures: unknown[] = [];
+    try { await lease.abandon(); } catch (error) { cleanupFailures.push(error); }
+    try { await store.cleanup(); } catch (error) { cleanupFailures.push(error); }
+    if (cleanupFailures.length > 0)
+      throw new RunRetentionError(
+        "RUN_RETENTION_CLEANUP_FAILED",
+        "run failure and managed lifecycle cleanup both failed",
+        new AggregateError([primary, ...cleanupFailures]),
+      );
+    throw primary;
   }
+  try { await lease.finish(result.status, result.runId); }
+  catch (error) { result = retentionWarning(result, "RETENTION_METADATA_FAILED", error); }
+  try { await store.cleanup(); }
+  catch (error) { result = retentionWarning(result, "RETENTION_CLEANUP_FAILED", error); }
+  return result;
 };
 
 export interface RlmExtensionDependencies {
@@ -342,6 +414,15 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     });
   };
 
+  const auditWarnings = (result: RunResult): void => {
+    if (!result.warnings?.length) return;
+    pi.appendEntry("pi-rlm-run-warnings", {
+      runId: result.runId,
+      status: result.status,
+      codes: result.warnings.map((warning) => warning.code).slice(-8),
+    });
+  };
+
   pi.on("input", (event, ctx) => {
     inputCorrelation = {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -410,6 +491,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       ctx.ui.setStatus("pi-rlm", "running...");
       try {
         const result = await run(built.value, commandController.signal, "slash_command");
+        auditWarnings(result);
         ctx.ui.notify(summarize(result), result.status === "completed" ? "info" : "error");
       } catch (error) {
         ctx.ui.notify(
@@ -502,6 +584,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         audit(authorization.grant);
         try {
           const result = await run(built.value, toolSignal, "confirmed");
+          auditWarnings(result);
           return { content: [{ type: "text", text: summarize(result) }], details: { status: result.status } };
         } catch (error) {
           return {
