@@ -4,14 +4,19 @@ import { types as utilTypes } from "node:util";
 import { MAX_JSON_DEPTH, type JsonValue } from "../core/json.ts";
 import type { RlmOutputField } from "../core/program.ts";
 import { byteLength, headTailPreview } from "../core/preview.ts";
-import { projectTrajectory, type TrajectoryEntry, type TrajectoryProjection } from "../core/trajectory.ts";
+import {
+  projectTrajectory,
+  type ProjectedEntry,
+  type ProjectionOptions,
+  type TrajectoryEntry,
+} from "../core/trajectory.ts";
 import type { ContextDescriptor, ContextStore } from "../shell/context-store.ts";
 import { prepareCanonicalJson } from "../shell/canonical-json.ts";
 import { throwIfAborted } from "./abort.ts";
 import type { Profile } from "./profile.ts";
 import type { ArtifactDescriptor } from "./state.ts";
 
-export const EXTRACTOR_EVIDENCE_VERSION = "1.1.0";
+export const EXTRACTOR_EVIDENCE_VERSION = "1.2.0";
 
 /** ECMAScript UTF-16 code-unit order; independent of host locale and ICU data. */
 export const compareCodeUnits = (left: string, right: string): number =>
@@ -30,6 +35,7 @@ export interface ExtractorVariableDescriptor {
 }
 
 export interface ExtractorExactValue {
+  readonly evidenceId: string;
   readonly key: string;
   readonly value: JsonValue;
   readonly exact: true;
@@ -38,6 +44,7 @@ export interface ExtractorExactValue {
 }
 
 export interface ExtractorAnswerCandidate {
+  readonly evidenceId: string;
   readonly iteration: number;
   readonly value: JsonValue;
   readonly exact: true;
@@ -48,6 +55,8 @@ export interface ExtractorAnswerCandidate {
 }
 
 export interface ExtractorHandleProjection {
+  /** Absent when the represented preview has zero source-content bytes. */
+  readonly evidenceId?: string;
   readonly id: string;
   readonly kind: "context" | "artifact";
   readonly sha256: string;
@@ -62,6 +71,17 @@ export interface ExtractorHandleProjection {
   readonly references: readonly string[];
 }
 
+export interface ExtractorProjectedEntry extends ProjectedEntry {
+  /** Absent when reasoning, code, and output all contain zero represented bytes. */
+  readonly evidenceId?: string;
+}
+
+export interface ExtractorTrajectoryProjection {
+  readonly entries: readonly ExtractorProjectedEntry[];
+  readonly omittedCount: number;
+  readonly total: number;
+}
+
 export interface ExtractorEvidenceProjection {
   readonly version: typeof EXTRACTOR_EVIDENCE_VERSION;
   readonly outputContract: readonly RlmOutputField[];
@@ -69,7 +89,7 @@ export interface ExtractorEvidenceProjection {
   readonly answerCandidates: readonly ExtractorAnswerCandidate[];
   readonly workspaceValues: readonly ExtractorExactValue[];
   readonly handles: readonly ExtractorHandleProjection[];
-  readonly trajectory: TrajectoryProjection;
+  readonly trajectory: ExtractorTrajectoryProjection;
   readonly maxBytes: number;
   readonly serializedBytes: number;
   readonly omittedBytes: number;
@@ -92,6 +112,8 @@ export interface ExtractorEvidenceMetadata {
   readonly omittedBytes: number;
   readonly omittedItems: number;
   readonly truncatedItems: number;
+  readonly evidenceIdCount: number;
+  readonly evidenceIdsHash: string;
   readonly truncated: boolean;
 }
 
@@ -181,6 +203,36 @@ export const snapshotExtractorJson = (
 
 const jsonBytes = (value: JsonValue, checkpoint: () => void): number =>
   prepareCanonicalJson(value, checkpoint).bytes;
+
+const contentEvidenceId = (kind: string, item: unknown, checkpoint: () => void): string =>
+  `ev_${prepareCanonicalJson({ version: EXTRACTOR_EVIDENCE_VERSION, kind, item } as JsonValue, checkpoint).sha256}`;
+
+const substantiveTrajectoryEntry = (entry: ProjectedEntry): boolean =>
+  byteLength(entry.reasoning) > 0
+  || entry.codePreview.originalBytes - entry.codePreview.omittedBytes > 0
+  || byteLength(entry.outputPreview) > 0;
+
+const projectExtractorTrajectory = (
+  entries: readonly TrajectoryEntry[],
+  options: ProjectionOptions,
+  checkpoint: () => void,
+): ExtractorTrajectoryProjection => {
+  const projected = projectTrajectory(entries, options);
+  return {
+    ...projected,
+    entries: projected.entries.map((entry) => substantiveTrajectoryEntry(entry)
+      ? { ...entry, evidenceId: contentEvidenceId("trajectory", entry, checkpoint) }
+      : entry),
+  };
+};
+
+/** IDs that may be cited by an extractor, in deterministic projection order. */
+export const extractorSubstantiveEvidenceIds = (projection: ExtractorEvidenceProjection): readonly string[] => [
+  ...projection.answerCandidates.map((item) => item.evidenceId),
+  ...projection.workspaceValues.map((item) => item.evidenceId),
+  ...projection.handles.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
+  ...projection.trajectory.entries.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
+];
 
 const saturatingAdd = (left: number, right: number): number =>
   left > Number.MAX_SAFE_INTEGER - right ? Number.MAX_SAFE_INTEGER : left + right;
@@ -290,7 +342,9 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   const answerCandidates: ExtractorAnswerCandidate[] = [];
   const workspaceValues: ExtractorExactValue[] = [];
   const handles: ExtractorHandleProjection[] = [];
-  const emptyTrajectory: TrajectoryProjection = { entries: [], omittedCount: input.entries.length, total: input.entries.length };
+  const emptyTrajectory: ExtractorTrajectoryProjection = {
+    entries: [], omittedCount: input.entries.length, total: input.entries.length,
+  };
   const projection = Object.assign(Object.create(null), {
     version: EXTRACTOR_EVIDENCE_VERSION,
     outputContract: contractSnapshot.value,
@@ -353,13 +407,17 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       continue;
     }
     const bytes = jsonBytes(snapshot.value, checkpoint);
-    const candidate: ExtractorAnswerCandidate = {
+    const candidateContent = {
       iteration: entry.iteration,
       value: snapshot.value,
-      exact: true,
+      exact: true as const,
       required,
       bytes,
       validationErrors,
+    };
+    const candidate: ExtractorAnswerCandidate = {
+      evidenceId: contentEvidenceId("answerCandidate", candidateContent, checkpoint),
+      ...candidateContent,
     };
     if (bytes > input.profile.extractorValueMaxBytes || bytes > input.profile.extractorValuesMaxBytes - exactValueBytes) {
       omittedBytes = saturatingAdd(omittedBytes, bytes);
@@ -406,7 +464,11 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       continue;
     }
     const bytes = jsonBytes(value, checkpoint);
-    const item: ExtractorExactValue = { key, value, exact: true, required, bytes };
+    const itemContent = { key, value, exact: true as const, required, bytes };
+    const item: ExtractorExactValue = {
+      evidenceId: contentEvidenceId("workspaceValue", itemContent, checkpoint),
+      ...itemContent,
+    };
     if (bytes <= input.profile.extractorValueMaxBytes
       && bytes <= input.profile.extractorValuesMaxBytes - exactValueBytes) {
       workspaceValues.push(item);
@@ -443,28 +505,35 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
         selected = (head.endByte - head.startByte) + (tail.endByte - tail.startByte);
         preview = `${head.text}\n... [${descriptor.bytes - selected} bytes omitted] ...\n${tail.text}`;
       }
-      return {
-        id: descriptor.id, kind: "context", sha256: descriptor.sha256, bytes: descriptor.bytes,
-        preview, previewBytes: selected, previewStrategy: exact ? "exact" : "head-tail",
+      const content = {
+        id: descriptor.id, kind: "context" as const, sha256: descriptor.sha256, bytes: descriptor.bytes,
+        preview, previewBytes: selected, previewStrategy: exact ? "exact" as const : "head-tail" as const,
         omittedBytes: descriptor.bytes - selected, truncated: !exact,
         required: request.required,
         references: [...request.references].sort(compareCodeUnits),
       };
+      return selected > 0
+        ? { evidenceId: contentEvidenceId("handlePreview", content, checkpoint), ...content }
+        : content;
     }
     const artifact = input.artifacts.get(request.id);
     if (!artifact) return undefined;
     const preview = request.required
       ? headTailPreview(artifact.text, { headBytes: artifact.descriptor.bytes, tailBytes: 0 })
       : headTailPreview(artifact.text, { headBytes, tailBytes });
-    return {
-      id: artifact.descriptor.id, kind: "artifact", sha256: artifact.descriptor.sha256,
+    const previewBytes = artifact.descriptor.bytes - preview.omittedBytes;
+    const content = {
+      id: artifact.descriptor.id, kind: "artifact" as const, sha256: artifact.descriptor.sha256,
       bytes: artifact.descriptor.bytes, preview: preview.text,
-      previewBytes: artifact.descriptor.bytes - preview.omittedBytes,
-      previewStrategy: preview.truncated ? "head-tail" : "exact",
+      previewBytes,
+      previewStrategy: preview.truncated ? "head-tail" as const : "exact" as const,
       omittedBytes: preview.omittedBytes, truncated: preview.truncated,
       required: request.required,
       references: [...request.references].sort(compareCodeUnits),
     };
+    return previewBytes > 0
+      ? { evidenceId: contentEvidenceId("handlePreview", content, checkpoint), ...content }
+      : content;
   };
 
   const sortedHandles = [...handleRequests.values()].sort((left, right) =>
@@ -511,18 +580,22 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     if (item.truncated) truncatedItems++;
   }
 
-  let trajectory = projectTrajectory(input.entries, input.profile.trajectory);
-  (projection as { trajectory: TrajectoryProjection }).trajectory = trajectory;
+  let trajectory = projectExtractorTrajectory(input.entries, input.profile.trajectory, checkpoint);
+  (projection as { trajectory: ExtractorTrajectoryProjection }).trajectory = trajectory;
   while (!fits() && (trajectory.entries.length > 0)) {
     const nextCount = trajectory.entries.length - 1;
     const headEntries = Math.min(input.profile.trajectory.headEntries, Math.ceil(nextCount / 2));
     const tailEntries = Math.max(0, nextCount - headEntries);
-    trajectory = projectTrajectory(input.entries, { ...input.profile.trajectory, headEntries, tailEntries });
-    (projection as { trajectory: TrajectoryProjection }).trajectory = trajectory;
+    trajectory = projectExtractorTrajectory(
+      input.entries,
+      { ...input.profile.trajectory, headEntries, tailEntries },
+      checkpoint,
+    );
+    (projection as { trajectory: ExtractorTrajectoryProjection }).trajectory = trajectory;
   }
   if (!fits()) {
     trajectory = emptyTrajectory;
-    (projection as { trajectory: TrajectoryProjection }).trajectory = trajectory;
+    (projection as { trajectory: ExtractorTrajectoryProjection }).trajectory = trajectory;
   }
   const projectedIterations = new Set(trajectory.entries.map((entry) => entry.iteration));
   for (const entry of input.entries) {
@@ -540,11 +613,8 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   omittedItems += trajectory.omittedCount;
 
   const substantiveItems = answerCandidates.length + workspaceValues.length
-    + handles.filter((handle) => handle.previewStrategy === "exact" || handle.previewBytes > 0).length
-    + trajectory.entries.filter((entry) =>
-      byteLength(entry.reasoning) > 0
-      || entry.codePreview.originalBytes - entry.codePreview.omittedBytes > 0
-      || byteLength(entry.outputPreview) > 0).length;
+    + handles.filter((handle) => handle.evidenceId !== undefined).length
+    + trajectory.entries.filter((entry) => entry.evidenceId !== undefined).length;
   Object.assign(projection, {
     omittedBytes,
     omittedItems,
@@ -577,6 +647,7 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   if (final.bytes > input.profile.extractorEvidenceMaxBytes)
     return fail("fallback evidence projection exceeds its aggregate byte limit");
   freezeDeep(projection);
+  const evidenceIds = extractorSubstantiveEvidenceIds(projection);
   const metadata: ExtractorEvidenceMetadata = {
     projectionVersion: EXTRACTOR_EVIDENCE_VERSION,
     projectionHash: final.sha256,
@@ -585,6 +656,8 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     omittedBytes,
     omittedItems,
     truncatedItems,
+    evidenceIdCount: evidenceIds.length,
+    evidenceIdsHash: prepareCanonicalJson(evidenceIds as JsonValue, checkpoint).sha256,
     truncated: projection.truncated,
   };
   checkpoint();

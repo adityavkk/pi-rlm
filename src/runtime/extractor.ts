@@ -1,14 +1,19 @@
 /** Accounted fallback extractor contract over one bounded evidence projection. */
 
-import type { JsonValue } from "../core/json.ts";
+import type { JsonObject, JsonValue } from "../core/json.ts";
 import type { ModelRequest, ModelResponse } from "../shell/model/client.ts";
-import { snapshotExtractorJson, type ExtractorEvidenceProjection } from "./extractor-evidence.ts";
+import {
+  compareCodeUnits,
+  extractorSubstantiveEvidenceIds,
+  snapshotExtractorJson,
+  type ExtractorEvidenceProjection,
+} from "./extractor-evidence.ts";
 
 /** Compatibility alias; the value is always the bounded projection. */
 export type ExtractorEvidence = ExtractorEvidenceProjection;
 
 export type ExtractorResult =
-  | { readonly ok: true; readonly value: JsonValue }
+  | { readonly ok: true; readonly value: JsonValue; readonly evidenceRefs: readonly string[] }
   | {
       readonly ok: false;
       readonly code: "FALLBACK_EVIDENCE_TRUNCATED" | "FAILED" | "INVALID_RESULT";
@@ -45,18 +50,31 @@ const ownData = (value: object, key: string): unknown => {
   return property && "value" in property ? property.value : undefined;
 };
 
+const invalidResult = (message = "fallback extractor returned an invalid result"): ExtractorResult => ({
+  ok: false,
+  code: "INVALID_RESULT",
+  message,
+});
+
 /** Normalize an opaque result without invoking getters or proxy traps. */
 export const normalizeExtractorResult = (input: unknown): ExtractorResult => {
   const snapshot = snapshotExtractorJson(input);
   if (!snapshot.ok || typeof snapshot.value !== "object" || snapshot.value === null || Array.isArray(snapshot.value))
-    return { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" };
+    return invalidResult();
   const object = snapshot.value as object;
   const ok = ownData(object, "ok");
   if (ok === true) {
     const value = ownData(object, "value");
-    return value === undefined
-      ? { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" }
-      : { ok: true, value: value as JsonValue };
+    const evidenceRefs = ownData(object, "evidenceRefs");
+    if (value === undefined || !Array.isArray(evidenceRefs) || evidenceRefs.length === 0)
+      return invalidResult("fallback extractor must cite at least one evidenceId");
+    const seen = new Set<string>();
+    for (const ref of evidenceRefs) {
+      if (typeof ref !== "string" || !/^ev_[a-f0-9]{64}$/.test(ref) || seen.has(ref))
+        return invalidResult("fallback extractor evidenceRefs must be nonempty, unique evidenceIds");
+      seen.add(ref);
+    }
+    return { ok: true, value: value as JsonValue, evidenceRefs };
   }
   if (ok === false) {
     const code = ownData(object, "code");
@@ -65,7 +83,63 @@ export const normalizeExtractorResult = (input: unknown): ExtractorResult => {
       && typeof message === "string" && message.length > 0 && message.length <= 2048)
       return { ok: false, code, message };
   }
-  return { ok: false, code: "INVALID_RESULT", message: "fallback extractor returned an invalid result" };
+  return invalidResult();
+};
+
+/** Resolve every citation against content actually represented in this projection. */
+export const validateExtractorProvenance = (
+  result: ExtractorResult,
+  evidence: ExtractorEvidenceProjection,
+): ExtractorResult => {
+  if (!result.ok) return result;
+  const represented = extractorSubstantiveEvidenceIds(evidence);
+  if (represented.length === 0) {
+    return {
+      ok: false,
+      code: "FALLBACK_EVIDENCE_TRUNCATED",
+      message: "fallback evidence contains no substantive content that can be cited",
+    };
+  }
+  const available = new Set(represented);
+  if (result.evidenceRefs.some((ref) => !available.has(ref)))
+    return invalidResult("fallback extractor cited evidence that is not represented in the projection");
+  return { ...result, evidenceRefs: [...result.evidenceRefs].sort(compareCodeUnits) };
+};
+
+/** Force provider-backed extractors to ask for the same provenance envelope as external extractors. */
+export const buildExtractorModelRequest = (
+  evidence: ExtractorEvidenceProjection,
+  request: ModelRequest,
+): ModelRequest => {
+  const evidenceIds = extractorSubstantiveEvidenceIds(evidence);
+  const valueProperties = Object.create(null) as Record<string, JsonValue>;
+  for (const field of evidence.outputContract) valueProperties[field.name] = field.schema;
+  const schema = {
+    type: "object",
+    required: ["value", "evidenceRefs"],
+    properties: {
+      value: {
+        type: "object",
+        required: evidence.outputContract.map((field) => field.name),
+        properties: valueProperties,
+        additionalProperties: false,
+      },
+      evidenceRefs: { type: "array", items: { type: "string" } },
+    },
+    additionalProperties: false,
+  } as JsonObject;
+  const contract = [
+    "Fallback extraction provenance contract:",
+    "Return ONLY one JSON object shaped as {\"value\": <output object>, \"evidenceRefs\": [\"evidenceId\", ...]}.",
+    "evidenceRefs must be nonempty and unique. Cite only IDs whose represented content supports the value.",
+    "A truncated preview may be cited only for the nonempty content shown; omitted bytes are not evidence.",
+    `Available substantive evidenceIds, in projection order: ${JSON.stringify(evidenceIds)}`,
+  ].join("\n");
+  return {
+    ...request,
+    prompt: `${request.prompt}\n\n${contract}`,
+    schema,
+  };
 };
 
 export class FunctionExtractor implements Extractor {

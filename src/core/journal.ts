@@ -58,7 +58,15 @@ export type RlmEvent =
       readonly omittedBytes: number;
       readonly omittedItems: number;
       readonly truncatedItems: number;
+      readonly evidenceIdCount: number;
+      readonly evidenceIdsHash: string;
       readonly truncated: boolean;
+    }
+  | {
+      readonly type: "fallback_evidence_cited";
+      readonly frameId: string;
+      readonly evidenceRefs: readonly string[];
+      readonly evidenceRefsHash: string;
     }
   | {
       readonly type: "provider_attempted";
@@ -177,6 +185,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       }
       case "emit":
       case "fallback_evidence_projected":
+      case "fallback_evidence_cited":
       case "provider_attempted":
         break;
       case "key_bound": {

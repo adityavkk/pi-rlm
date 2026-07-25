@@ -19,7 +19,12 @@ import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { persistAnswer } from "./answer-persistence.ts";
 import type { ControllerDriver } from "./controller.ts";
-import { normalizeExtractorResult, type Extractor } from "./extractor.ts";
+import {
+  buildExtractorModelRequest,
+  normalizeExtractorResult,
+  validateExtractorProvenance,
+  type Extractor,
+} from "./extractor.ts";
 import {
   buildExtractorEvidence,
   ExtractorEvidenceDeadlineError,
@@ -460,7 +465,10 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
         });
         const raw = input.extractor.accountingMode === "provider"
           ? await waitForAbort(input.extractor.extract(built.projection, scope.signal, {
-              complete: (request) => operation.complete(state.model, request),
+              complete: (request) => operation.complete(
+                state.model,
+                buildExtractorModelRequest(built.projection, request),
+              ),
             }), scope.signal)
           : await operation.runExternal(() => input.extractor!.extract(built.projection, scope.signal));
         if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
@@ -469,7 +477,10 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
             operation.usage,
           );
         throwIfAborted(scope.signal);
-        const extracted = normalizeExtractorResult(raw);
+        const extracted = validateExtractorProvenance(
+          normalizeExtractorResult(raw),
+          built.projection,
+        );
         if (extracted.ok) {
           const outputErrors = validateOutputContract(extracted.value, rootFrame.outputs);
           if (outputErrors.length > 0) {
@@ -481,6 +492,11 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
               `fallback:${rootFrameId}`,
               extracted.value,
               (outputRef) => [{
+                type: "fallback_evidence_cited",
+                frameId: rootFrameId,
+                evidenceRefs: extracted.evidenceRefs,
+                evidenceRefsHash: sha256(JSON.stringify(extracted.evidenceRefs)),
+              }, {
                 type: "answer_committed",
                 frameId: rootFrameId,
                 completionMode: "fallback_extract",

@@ -61,7 +61,11 @@ describe("bounded fallback extraction", () => {
       profile: boundedProfile(),
       extractor: new FunctionExtractor((evidence) => {
         expect(evidence.answerCandidates[0]?.value).toEqual({ answer: 7 });
-        return { ok: true, value: { answer: 7 } };
+        return {
+          ok: true,
+          value: { answer: 7 },
+          evidenceRefs: [evidence.answerCandidates[0]!.evidenceId],
+        };
       }),
     });
 
@@ -71,6 +75,46 @@ describe("bounded fallback extraction", () => {
     expect(result.error?.message).toBe(directError?.message);
     expect(journal.filter((event) => event.type === "answer_committed")).toHaveLength(0);
     expect(terminals(journal)).toHaveLength(1);
+  });
+
+  test("schema-valid synthesized output without evidenceRefs never commits", async () => {
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(), sources: { context: "represented" }, backend, dir,
+      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
+      extractor: new FunctionExtractor((() => ({
+        ok: true,
+        value: { answer: "fabricated" },
+      })) as never),
+    });
+
+    expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" } });
+    const journal = await events(dir);
+    expect(journal.filter((event) => event.type === "fallback_evidence_cited")).toHaveLength(0);
+    expect(journal.filter((event) => event.type === "answer_committed")).toHaveLength(0);
+  });
+
+  test("empty, duplicate, and unknown evidenceRefs are rejected", async () => {
+    for (const kind of ["empty", "duplicate", "unknown"] as const) {
+      const dir = await tmp();
+      const result = await runProgram({
+        program: program(), sources: { context: "represented" }, backend, dir,
+        controller: new MockController([]), model: new MockModelClient(() => "unused"),
+        signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
+        extractor: new FunctionExtractor((evidence) => {
+          const represented = evidence.handles[0]!.evidenceId!;
+          const evidenceRefs = kind === "empty"
+            ? []
+            : kind === "duplicate"
+              ? [represented, represented]
+              : [`ev_${"0".repeat(64)}`];
+          return { ok: true, value: { answer: "fabricated" }, evidenceRefs };
+        }),
+      });
+      expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" } });
+      expect((await events(dir)).some((event) => event.type === "answer_committed")).toBe(false);
+    }
   });
 
   test("oversized invalid candidate is omitted before exact workspace recovery", async () => {
@@ -87,7 +131,12 @@ describe("bounded fallback extraction", () => {
       extractor: new FunctionExtractor((evidence) => {
         seen = evidence;
         const recovery = evidence.workspaceValues.find((item) => item.key === "recovery");
-        return { ok: true, value: { answer: String(recovery?.value) } };
+        if (!recovery) throw new Error("missing recovery evidence");
+        return {
+          ok: true,
+          value: { answer: String(recovery.value) },
+          evidenceRefs: [recovery.evidenceId],
+        };
       }),
     });
 
@@ -95,9 +144,10 @@ describe("bounded fallback extraction", () => {
       status: "completed", completionMode: "fallback_extract", answer: { answer: "represented-workspace" },
     });
     expect(seen?.answerCandidates).toHaveLength(0);
-    expect(seen?.workspaceValues).toContainEqual({
+    expect(seen?.workspaceValues).toContainEqual(expect.objectContaining({
       key: "recovery", value: "represented-workspace", exact: true, required: false, bytes: 23,
-    });
+      evidenceId: expect.stringMatching(/^ev_[a-f0-9]{64}$/),
+    }));
     expect(seen?.omittedAnswerCandidates).toBe(1);
     expect(seen?.omittedBytes).toBeGreaterThan(2000);
     const metadata = (await events(dir)).find((event) => event.type === "fallback_evidence_projected");
@@ -114,7 +164,10 @@ describe("bounded fallback extraction", () => {
       }]),
       model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
       profile: boundedProfile(),
-      extractor: new FunctionExtractor(() => { calls++; return { ok: true, value: { answer: "must not run" } }; }),
+      extractor: new FunctionExtractor(() => {
+        calls++;
+        return { ok: false, code: "FAILED", message: "must not run" };
+      }),
     });
 
     expect(result).toMatchObject({
@@ -131,13 +184,36 @@ describe("bounded fallback extraction", () => {
       program: program(false), sources: {}, backend, dir: await tmp(), controller: new MockController([]),
       model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0 }),
-      extractor: new FunctionExtractor(() => { calls++; return { ok: true, value: { answer: "guess" } }; }),
+      extractor: new FunctionExtractor(() => {
+        calls++;
+        return { ok: false, code: "FAILED", message: "must not run" };
+      }),
     });
     expect(result).toMatchObject({
       status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
       ledger: { usage: { logicalCalls: 0, attempts: 0 } },
     });
     expect(calls).toBe(0);
+  });
+
+  test("an empty input handle fails before extractor or provider work", async () => {
+    let extractorCalls = 0;
+    const model = new MockModelClient(() => "must not run");
+    const result = await runProgram({
+      program: program(), sources: { context: "" }, backend, dir: await tmp(),
+      controller: new MockController([]), model, signal: new AbortController().signal,
+      profile: boundedProfile({ maxControllerTurns: 0 }),
+      extractor: new FunctionExtractor(() => {
+        extractorCalls++;
+        return { ok: false, code: "FAILED", message: "must not run" };
+      }),
+    });
+    expect(result).toMatchObject({
+      status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
+      ledger: { usage: { logicalCalls: 0, attempts: 0 } },
+    });
+    expect(extractorCalls).toBe(0);
+    expect(model.callCount).toBe(0);
   });
 
   test("huge source handle is head-tail bounded in the provider request", async () => {
@@ -147,9 +223,15 @@ describe("bounded fallback extraction", () => {
     let seen: ExtractorEvidenceProjection | undefined;
     const model = new MockModelClient((request) => {
       requestText = request.prompt;
-      const projected = JSON.parse(request.prompt) as { handles: Array<{ preview: string }> };
+      const projectionText = request.prompt.split("\n\nFallback extraction provenance contract:")[0]!;
+      const projected = JSON.parse(projectionText) as {
+        handles: Array<{ preview: string; evidenceId: string }>;
+      };
       const represented = `${projected.handles[0]?.preview.slice(0, 5)}${projected.handles[0]?.preview.slice(-5)}`;
-      return response(JSON.stringify({ answer: represented }));
+      return response(JSON.stringify({
+        value: { answer: represented },
+        evidenceRefs: [projected.handles[0]!.evidenceId],
+      }));
     });
     const dir = await tmp();
     const result = await runProgram({
@@ -161,7 +243,8 @@ describe("bounded fallback extraction", () => {
         const completed = await operation.complete({
           prompt: canonicalStringify(evidence as unknown as never), maxOutputTokens: 32,
         });
-        return { ok: true, value: JSON.parse(completed.text) };
+        const envelope = JSON.parse(completed.text) as { value: { answer: string }; evidenceRefs: string[] };
+        return { ok: true, ...envelope };
       }, "provider"),
     });
 
@@ -173,8 +256,20 @@ describe("bounded fallback extraction", () => {
     expect(seen?.serializedBytes).toBeLessThanOrEqual(8 * 1024);
     expect(seen?.handles[0]).toMatchObject({ kind: "context", previewStrategy: "head-tail", truncated: true });
     expect(seen?.omittedBytes).toBe(seen?.handles[0]?.omittedBytes);
-    const metadata = (await events(dir)).find((event) => event.type === "fallback_evidence_projected");
+    const journal = await events(dir);
+    const metadata = journal.find((event) => event.type === "fallback_evidence_projected");
+    expect(metadata).toMatchObject({
+      type: "fallback_evidence_projected",
+      evidenceIdCount: expect.any(Number),
+      evidenceIdsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
     expect(metadata?.type === "fallback_evidence_projected" && metadata.projectionHash).toMatch(/^[a-f0-9]{64}$/);
+    const cited = journal.find((event) => event.type === "fallback_evidence_cited");
+    expect(cited).toMatchObject({
+      type: "fallback_evidence_cited",
+      evidenceRefs: [seen?.handles[0]?.evidenceId],
+      evidenceRefsHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
   });
 
   test("huge artifact handles are bounded and explicit", async () => {
@@ -190,7 +285,9 @@ describe("bounded fallback extraction", () => {
       profile: boundedProfile(),
       extractor: new FunctionExtractor((evidence) => {
         seen = evidence;
-        return { ok: true, value: { answer: "artifact" } };
+        const handle = evidence.handles.find((item) => item.kind === "artifact");
+        if (!handle?.evidenceId) throw new Error("missing artifact evidence");
+        return { ok: true, value: { answer: "artifact" }, evidenceRefs: [handle.evidenceId] };
       }),
     });
     expect(result.status).toBe("completed");
@@ -201,6 +298,8 @@ describe("bounded fallback extraction", () => {
 
   test("non-ASCII projection order and evidence hash are locale-independent", async () => {
     const hashes: string[] = [];
+    const evidenceHashes: string[] = [];
+    const evidenceIdOrders: string[][] = [];
     const projections: string[] = [];
     for (let run = 0; run < 2; run++) {
       const dir = await tmp();
@@ -214,18 +313,30 @@ describe("bounded fallback extraction", () => {
         profile: boundedProfile(),
         extractor: new FunctionExtractor((evidence) => {
           expect(evidence.workspaceValues.map((item) => item.key)).toEqual(["a", "z", "é", "中", "😀"]);
+          const ids = evidence.workspaceValues.map((item) => item.evidenceId);
+          expect(ids.every((id) => /^ev_[a-f0-9]{64}$/.test(id))).toBe(true);
+          evidenceIdOrders.push(ids);
           projections.push(canonicalStringify(evidence as unknown as never));
-          return { ok: true, value: { answer: "stable" } };
+          return {
+            ok: true,
+            value: { answer: "stable" },
+            evidenceRefs: [evidence.workspaceValues[0]!.evidenceId],
+          };
         }),
       });
       expect(result.status).toBe("completed");
       const journalText = await readFile(join(dir, "events.jsonl"), "utf8");
       const event = (await events(dir)).find((candidate) => candidate.type === "fallback_evidence_projected");
-      if (event?.type === "fallback_evidence_projected") hashes.push(event.projectionHash);
+      if (event?.type === "fallback_evidence_projected") {
+        hashes.push(event.projectionHash);
+        evidenceHashes.push(event.evidenceIdsHash);
+      }
       expect(journalText).not.toContain("stable source");
       expect(journalText).not.toContain('"workspaceValues"');
     }
     expect(hashes[0]).toBe(hashes[1]);
+    expect(evidenceHashes[0]).toBe(evidenceHashes[1]);
+    expect(evidenceIdOrders[0]).toEqual(evidenceIdOrders[1]);
     expect(projections[0]).toBe(projections[1]);
   });
 
@@ -282,7 +393,10 @@ describe("bounded fallback extraction", () => {
       controller: new MockController([]), model: new MockModelClient(() => "unused"),
       signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0, maxAttempts: 0 }),
-      extractor: new FunctionExtractor(() => { calls++; return { ok: true, value: { answer: "free" } }; }),
+      extractor: new FunctionExtractor(() => {
+        calls++;
+        return { ok: false, code: "FAILED", message: "must not run" };
+      }),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "BUDGET_ATTEMPTS" }, ledger: { usage: { attempts: 0 } } });
     expect(calls).toBe(0);
@@ -358,7 +472,11 @@ describe("bounded fallback extraction", () => {
       controller: new MockController([]), model: new MockModelClient(() => "unused"),
       signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0, storedByteLimit: 1 }),
-      extractor: new FunctionExtractor(() => ({ ok: true, value: { answer: "too large" } })),
+      extractor: new FunctionExtractor((evidence) => ({
+        ok: true,
+        value: { answer: "too large" },
+        evidenceRefs: [evidence.handles[0]!.evidenceId!],
+      })),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "BUDGET_BYTES" }, ledger: { usage: { storedBytes: 0 } } });
     const journal = await events(dir);
