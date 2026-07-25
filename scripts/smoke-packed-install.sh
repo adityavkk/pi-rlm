@@ -54,6 +54,36 @@ isolated() {
     "$@"
 }
 
+runtime_network_denied() {
+  local base=$1
+  shift
+  case "$(uname -s)" in
+    Darwin)
+      if [[ ! -x /usr/bin/sandbox-exec ]]; then
+        echo "packed smoke requires sandbox-exec for runtime network denial" >&2
+        return 1
+      fi
+      isolated "$base" /usr/bin/sandbox-exec \
+        -p '(version 1) (allow default) (deny network*)' \
+        "$@"
+      ;;
+    Linux)
+      if command -v bwrap >/dev/null 2>&1; then
+        isolated "$base" bwrap --unshare-net --bind / / -- "$@"
+      elif command -v unshare >/dev/null 2>&1; then
+        isolated "$base" unshare --user --map-root-user --net -- "$@"
+      else
+        echo "packed smoke requires bwrap or unshare for runtime network denial" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "packed smoke has no network-denial backend for $(uname -s)" >&2
+      return 1
+      ;;
+  esac
+}
+
 pack_dir="$tmp_dir/pack"
 prepare_roots "$pack_dir"
 pack_json="$pack_dir/pack.json"
@@ -122,7 +152,7 @@ NODE
 
   if ! (
     cd "$fixture"
-    isolated "$case_dir" env \
+    runtime_network_denied "$case_dir" env \
       NO_COLOR=1 \
       PI_OFFLINE=1 \
       PI_TELEMETRY=0 \

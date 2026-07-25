@@ -9,8 +9,12 @@ installed-discovery case puts the installed package directory in isolated Pi
 settings, validates its packed `pi.extensions` manifest, and invokes Pi without
 `-e`; Pi alone resolves the extension entry. Every npm, Bun, Node, and Pi helper
 runs from an explicit `env -i` allowlist. Registry network remains available
-only for temporary dependency installation. Pi runs with its public `--offline`
-flag and loopback proxy tripwires, not an OS sandbox.
+only for temporary dependency installation. Pi runtime runs with its public
+`--offline` flag and loopback proxy tripwires inside an OS-enforced network-deny
+boundary: `sandbox-exec` with `(deny network*)` on macOS, or a fresh network
+namespace through `bwrap`/`unshare` on Linux. The smoke fails closed when no
+supported network-denial backend is available. This process-level acceptance
+control is separate from, and does not broaden, pi-rlm's QuickJS security claim.
 
 Each case uses an explicit isolated session file. Its strict bounded JSONL parser
 accepts only the session header, one `pi-rlm-result` custom append, and one exact
