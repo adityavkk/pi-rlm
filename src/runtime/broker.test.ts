@@ -10,8 +10,10 @@ import { ContextStore } from "../shell/context-store.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalStore } from "../shell/journal-store.ts";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
-import { PiModelError } from "../shell/model/pi-model.ts";
+import { ManualClock } from "../shell/clock.ts";
+import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
 import { dispatchCall } from "./broker.ts";
 import type { GuestCallResult } from "./call-result.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
@@ -31,6 +33,40 @@ const within = async <T>(promise: Promise<T>, timeoutMs = 250): Promise<T> => {
     if (timeout) clearTimeout(timeout);
   }
 };
+
+const brokerState = async (model: ModelClient, runId: string): Promise<RunState> => {
+  const normalized = normalizeProgram({
+    objective: "broker error boundary",
+    profile: "default",
+    inputs: [],
+    outputs: [{ name: "answer", schema: { type: "string" } }],
+  });
+  if (!normalized.ok) throw new Error("invalid test program");
+  const dir = await mkdtemp(join(tmpdir(), "pi-rlm-broker-"));
+  const startMs = Date.now();
+  return {
+    runId,
+    startMs,
+    profile: DEFAULT_PROFILE,
+    clock: systemClock,
+    hasher: sha256,
+    program: normalized.value,
+    ledger: { current: createLedger(resolveLimits(DEFAULT_PROFILE, startMs)) },
+    store: new ContextStore(dir),
+    artifacts: new Map(),
+    model,
+    journal: new JournalStore(dir),
+    backend: {} as InterpreterBackend,
+    callCache: new Map(),
+    inflight: new Map(),
+    semaphore: new Semaphore(1),
+    contextSemaphore: new Semaphore(1),
+    frameSeq: { current: 1 },
+  };
+};
+
+const testFrame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };
+const noRecurse = async (): Promise<GuestCallResult> => { throw new Error("unexpected recurse"); };
 
 describe("dispatchCall cancellation ownership", () => {
   test("releases a timed-out holder and aborted waiter, then admits an independent call", async () => {
@@ -207,5 +243,121 @@ describe("dispatchCall cancellation ownership", () => {
     });
     expect(JSON.stringify(result)).not.toContain("sensitive provider message");
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
+  });
+
+  test("passes sanitized runtime rejection metadata through to the guest", async () => {
+    const clock = new ManualClock();
+    const runtime = {
+      getModel: () => ({ provider: "test-provider", id: "test-model" }),
+      completeSimple: async () => {
+        clock.advance(47);
+        throw new Error("sensitive runtime failure");
+      },
+    } as unknown as ModelRuntime;
+    const state = await brokerState(new PiModelClient(runtime, "test-provider/test-model", clock), "run_runtime_failure");
+    const result = await dispatchCall(
+      state,
+      testFrame,
+      "llm",
+      { key: "runtime-failure", prompt: "fail", model: { model: "test-provider/test-model" } },
+      noRecurse,
+      new AbortController().signal,
+      Date.now() + 5_000,
+    ) as GuestCallResult;
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "FAILED",
+        message: "model provider failed",
+        details: {
+          stopReason: "error",
+          provider: "test-provider",
+          model: "test-model",
+          usage: { attempts: 1, durationMs: 47 },
+        },
+      },
+      usage: { attempts: 1, durationMs: 47 },
+    });
+    expect(JSON.stringify(result)).not.toContain("sensitive");
+    expect(state.ledger.current.usage.tokensReserved).toBe(0);
+    expect(state.ledger.current.usage.tokensUsed).toBe(0);
+  });
+
+  test("does not invoke accessors or trust malformed Pi error accounting", async () => {
+    let getterCalls = 0;
+    const topAccessor = new PiModelError(
+      "PROVIDER_ERROR",
+      "error",
+      "provider",
+      "model",
+      { attempts: 1, totalTokens: 999, durationMs: 1 },
+      "hidden",
+    );
+    Object.defineProperty(topAccessor, "usage", {
+      get: () => {
+        getterCalls++;
+        return { attempts: 1, totalTokens: 999, durationMs: 1 };
+      },
+    });
+
+    const nestedUsage = Object.create(null) as Record<string, unknown>;
+    nestedUsage["attempts"] = 1;
+    nestedUsage["durationMs"] = 1;
+    Object.defineProperty(nestedUsage, "totalTokens", {
+      get: () => {
+        getterCalls++;
+        return 999;
+      },
+    });
+    const nestedAccessor = new PiModelError("PROVIDER_ERROR", "error", "provider", "model", nestedUsage as never, "hidden");
+
+    const cyclicUsage = Object.create(null) as Record<string, unknown>;
+    cyclicUsage["attempts"] = 1;
+    cyclicUsage["durationMs"] = 2;
+    cyclicUsage["cycle"] = cyclicUsage;
+    const cyclic = new PiModelError("PROVIDER_ERROR", "error", "provider", "model", cyclicUsage as never, "hidden");
+    const oversized = new PiModelError(
+      "PROVIDER_ERROR",
+      "error",
+      "p".repeat(257),
+      "model",
+      { attempts: 1, totalTokens: Number.NaN, durationMs: 1 },
+      "hidden",
+    );
+    const failures = [topAccessor, nestedAccessor, cyclic, oversized];
+    const model: ModelClient = {
+      id: "hostile-errors",
+      async complete(): Promise<ModelResponse> { throw failures.shift(); },
+    };
+    const state = await brokerState(model, "run_hostile_errors");
+    const results: GuestCallResult[] = [];
+    for (let index = 0; index < 4; index++) {
+      results.push(await dispatchCall(
+        state,
+        testFrame,
+        "llm",
+        { key: `failure-${index}`, prompt: "fail" },
+        noRecurse,
+        new AbortController().signal,
+        Date.now() + 5_000,
+      ) as GuestCallResult);
+    }
+
+    expect(getterCalls).toBe(0);
+    expect(results[0]).toMatchObject({ ok: false, error: { code: "FAILED" }, usage: ZERO_CALL_USAGE });
+    expect(results[0]?.error?.details).toBeUndefined();
+    expect(results[1]?.error?.details).toBeUndefined();
+    expect(results[1]?.usage).toEqual(ZERO_CALL_USAGE);
+    expect(results[2]).toMatchObject({
+      error: { details: { usage: { attempts: 1, durationMs: 2 } } },
+      usage: { attempts: 1, durationMs: 2 },
+    });
+    expect(JSON.stringify(results[2])).not.toContain("cycle");
+    expect(results[3]?.error?.details).toBeUndefined();
+    expect(results[3]?.usage).toEqual(ZERO_CALL_USAGE);
+    expect(JSON.stringify(results)).not.toContain("pppppppp");
+    expect(state.ledger.current.usage.tokensReserved).toBe(0);
+    expect(state.ledger.current.usage.tokensUsed).toBe(0);
   });
 });

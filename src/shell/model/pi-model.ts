@@ -42,8 +42,9 @@ const splitModel = (id: string): { provider: string; model: string } => {
 };
 
 const elapsedMs = (startedMs: number, completedMs: number): number => {
+  if (!Number.isFinite(startedMs) || !Number.isFinite(completedMs) || completedMs <= startedMs) return 0;
   const elapsed = completedMs - startedMs;
-  return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
+  return Number.isFinite(elapsed) ? Math.min(elapsed, Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
 };
 
 const mapUsage = (message: AssistantMessage, durationMs: number): CallUsage => ({
@@ -112,19 +113,19 @@ export class PiModelClient implements ModelClient {
         ...(request.maxOutputTokens ? { maxTokens: request.maxOutputTokens } : {}),
         ...(request.signal ? { signal: request.signal } : {}),
       });
-    } catch (error) {
+    } catch {
       const durationMs = elapsedMs(startedMs, this.clock.now());
-      if (request.signal?.aborted) {
-        throw new PiModelError(
-          "CANCELLED",
-          "aborted",
-          provider,
-          model,
-          { attempts: 1, durationMs },
-          `completion aborted for ${provider}/${model}`,
-        );
-      }
-      throw error;
+      const cancelled = request.signal?.aborted === true;
+      throw new PiModelError(
+        cancelled ? "CANCELLED" : "PROVIDER_ERROR",
+        cancelled ? "aborted" : "error",
+        provider,
+        model,
+        { attempts: 1, durationMs },
+        cancelled
+          ? `completion aborted for ${provider}/${model}`
+          : `provider ${provider} failed to complete model ${model}`,
+      );
     }
 
     return mapMessage(message, provider, model, elapsedMs(startedMs, this.clock.now()));

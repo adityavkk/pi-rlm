@@ -7,7 +7,7 @@
  */
 
 import { releaseBytes, releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
-import { callError } from "../core/errors.ts";
+import { callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
 import { deriveCallId, identityHash, type CallKind } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
 import { canonicalStringify, isJsonObject } from "../core/json.ts";
@@ -228,7 +228,68 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
   };
 };
 
-const piFailure = (error: PiModelError) => {
+const PI_ERROR_CODES = new Set(["CANCELLED", "PROVIDER_ERROR", "OUTPUT_TRUNCATED", "UNEXPECTED_TOOL_USE", "MISSING_TEXT"]);
+const PI_STOP_REASONS = new Set(["stop", "length", "toolUse", "error", "aborted"]);
+const USAGE_KEYS = ["attempts", "inputTokens", "outputTokens", "totalTokens", "costUsd", "durationMs"] as const;
+
+type NormalizedPiFailure = {
+  readonly code: string;
+  readonly stopReason: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly usage: CallUsage;
+};
+
+const ownDataValue = (value: object, key: string): { readonly found: boolean; readonly value?: unknown } => {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) return { found: false };
+    return "value" in descriptor ? { found: true, value: descriptor.value } : { found: true };
+  } catch {
+    return { found: true };
+  }
+};
+
+const boundedOwnString = (value: object, key: string): string | undefined => {
+  const property = ownDataValue(value, key);
+  return property.found
+    && typeof property.value === "string"
+    && property.value.length > 0
+    && property.value.length <= ERROR_DETAIL_MAX_LENGTH
+    ? property.value
+    : undefined;
+};
+
+const normalizedUsage = (value: unknown): CallUsage | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const result = Object.create(null) as Record<(typeof USAGE_KEYS)[number], number>;
+  for (const key of USAGE_KEYS) {
+    const property = ownDataValue(value, key);
+    if (!property.found) {
+      if (key === "attempts" || key === "durationMs") return undefined;
+      continue;
+    }
+    if (typeof property.value !== "number" || !Number.isFinite(property.value) || property.value < 0)
+      return undefined;
+    result[key] = property.value;
+  }
+  return result;
+};
+
+/** Snapshot only own data descriptors. Provider errors cross an untrusted adapter boundary. */
+const normalizePiFailure = (error: PiModelError): NormalizedPiFailure | undefined => {
+  const code = boundedOwnString(error, "code");
+  const stopReason = boundedOwnString(error, "stopReason");
+  const provider = boundedOwnString(error, "provider");
+  const model = boundedOwnString(error, "model");
+  const usageProperty = ownDataValue(error, "usage");
+  const usage = usageProperty.found ? normalizedUsage(usageProperty.value) : undefined;
+  if (!code || !PI_ERROR_CODES.has(code) || !stopReason || !PI_STOP_REASONS.has(stopReason) || !provider || !model || !usage)
+    return undefined;
+  return Object.assign(Object.create(null), { code, stopReason, provider, model, usage }) as NormalizedPiFailure;
+};
+
+const piFailure = (error: NormalizedPiFailure) => {
   const code = error.code === "CANCELLED"
     ? "CANCELLED"
     : error.code === "PROVIDER_ERROR"
@@ -239,12 +300,7 @@ const piFailure = (error: PiModelError) => {
     : code === "FAILED"
       ? "model provider failed"
       : "model completion returned an invalid result";
-  return callError(code, message, {
-    stopReason: error.stopReason,
-    provider: error.provider,
-    model: error.model,
-    usage: error.usage,
-  });
+  return callError(code, message, error);
 };
 
 /** Handle one value-returning guest call. */
@@ -573,12 +629,15 @@ const llm = async (
       if (wasAborted(error, signal)) return cancelled(usage);
       logicalReserved = false;
       if (error instanceof PiModelError) {
-        usage = addUsage(usage, error.usage);
-        if (pendingTokenReservation > 0) {
-          state.ledger.current = settle(state, pendingTokenReservation, error.usage.totalTokens ?? 0);
-          pendingTokenReservation = 0;
+        const failure = normalizePiFailure(error);
+        if (failure) {
+          usage = addUsage(usage, failure.usage);
+          if (pendingTokenReservation > 0) {
+            state.ledger.current = settle(state, pendingTokenReservation, failure.usage.totalTokens ?? 0);
+            pendingTokenReservation = 0;
+          }
+          return errResult(callId, piFailure(failure), usage, false);
         }
-        return errResult(callId, piFailure(error), usage, false);
       }
       return errResult(callId, callError("FAILED", "model completion failed"), usage, false);
     } finally {

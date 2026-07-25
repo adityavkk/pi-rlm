@@ -123,6 +123,59 @@ describe("PiModelClient stop reasons", () => {
     }
   });
 
+  test("sanitizes ordinary runtime rejection and includes elapsed duration", async () => {
+    const clock = new ManualClock();
+    const runtime = {
+      getModel: () => ({ provider: "test-provider", id: "test-model" }),
+      completeSimple: async () => {
+        clock.advance(90);
+        const providerError = new Error("sensitive provider failure");
+        providerError.stack = "sensitive provider stack";
+        throw providerError;
+      },
+    } as unknown as ModelRuntime;
+
+    try {
+      await new PiModelClient(runtime, "test-provider/test-model", clock).complete({ prompt: "test" });
+      throw new Error("expected PiModelError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PiModelError);
+      expect(error).toMatchObject({
+        code: "PROVIDER_ERROR",
+        stopReason: "error",
+        provider: "test-provider",
+        model: "test-model",
+        usage: { attempts: 1, durationMs: 90 },
+      });
+      expect((error as Error).message).not.toContain("sensitive");
+      expect((error as Error).stack).not.toContain("provider stack");
+    }
+  });
+
+  test("bounds invalid and non-monotonic clock readings", async () => {
+    const cases = [
+      { readings: [100, 50], expected: 0 },
+      { readings: [Number.NaN, 100], expected: 0 },
+      { readings: [0, Number.POSITIVE_INFINITY], expected: 0 },
+      { readings: [-Number.MAX_VALUE, Number.MAX_VALUE], expected: Number.MAX_SAFE_INTEGER },
+    ];
+    for (const { readings, expected } of cases) {
+      let index = 0;
+      const clock = { now: () => readings[index++]! };
+      const runtime = {
+        getModel: () => ({ provider: "test-provider", id: "test-model" }),
+        completeSimple: async () => { throw new Error("runtime failure"); },
+      } as unknown as ModelRuntime;
+      try {
+        await new PiModelClient(runtime, "test-provider/test-model", clock).complete({ prompt: "test" });
+        throw new Error("expected PiModelError");
+      } catch (error) {
+        expect(error).toBeInstanceOf(PiModelError);
+        expect((error as PiModelError).usage.durationMs).toBe(expected);
+      }
+    }
+  });
+
   test("types runtime rejection after cancellation and includes elapsed duration", async () => {
     const clock = new ManualClock();
     const runtime = {
