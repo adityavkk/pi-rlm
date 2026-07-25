@@ -10,6 +10,7 @@
 import { isJsonObject } from "../core/json.ts";
 import { validateAgainstSchema } from "../core/schema.ts";
 import type { ModelClient } from "../shell/model/client.ts";
+import { throwIfAborted, waitForAbort } from "./abort.ts";
 import { buildBasePrompt, buildTurnMessage, CELL_SCHEMA } from "./controller-prompt.ts";
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
 
@@ -39,7 +40,8 @@ export class ModelController implements ControllerDriver {
     private readonly options: ModelControllerOptions = {},
   ) {}
 
-  async next(state: FrameState): Promise<Cell> {
+  async next(state: FrameState, signal?: AbortSignal): Promise<Cell> {
+    throwIfAborted(signal);
     const user = buildTurnMessage(state);
     const request = {
       prompt: user,
@@ -47,14 +49,17 @@ export class ModelController implements ControllerDriver {
       schema: CELL_SCHEMA,
       ...(this.options.model ? { model: this.options.model } : {}),
       ...(this.options.maxOutputTokens ? { maxOutputTokens: this.options.maxOutputTokens } : {}),
+      ...(signal ? { signal } : {}),
     };
-    const first = await this.model.complete(request);
+    const first = await waitForAbort(this.model.complete(request), signal);
+    throwIfAborted(signal);
     let cell = parseCell(first.text);
     if (!cell) {
-      const repair = await this.model.complete({
+      const repair = await waitForAbort(this.model.complete({
         ...request,
         prompt: `${user}\n\nYour previous response was not valid JSON of the form {"reasoning","code"}. Respond with ONLY that JSON now.`,
-      });
+      }), signal);
+      throwIfAborted(signal);
       cell = parseCell(repair.text);
     }
     return cell ?? { reasoning: "controller produced no valid cell", code: "" };

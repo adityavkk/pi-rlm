@@ -22,6 +22,7 @@ interface RunOpts {
   dispatch?: HostDispatch;
   effect?: HostEffect;
   deadlineMs?: number;
+  signal?: AbortSignal;
 }
 
 const run = async (code: string, opts: RunOpts = {}) => {
@@ -32,6 +33,7 @@ const run = async (code: string, opts: RunOpts = {}) => {
     deadlineMs: opts.deadlineMs ?? Date.now() + 5000,
     memoryBytes: 64 * 1024 * 1024,
     globals: baseGlobals(opts.workspace ?? {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
     dispatch: opts.dispatch ?? (async () => null),
     effect: opts.effect ?? (() => {}),
   });
@@ -83,6 +85,26 @@ describe("QuickJsBackend", () => {
     const out = await run("while (true) {}", { deadlineMs: Date.now() + 50 });
     expect(out.kind).toBe("terminal");
     if (out.kind === "terminal") expect(out.error.code).toBe("CPU_LIMIT");
+  });
+
+  test("owner cancellation aborts dispatch and nested evaluation", async () => {
+    const owner = new AbortController();
+    let dispatchAborted = false;
+    const started = Date.now();
+    const timer = setTimeout(() => owner.abort(), 20);
+    const out = await run("await llm({ key: 'k', prompt: 'p' })", {
+      signal: owner.signal,
+      deadlineMs: started + 250,
+      dispatch: async (_name, _args, signal) => {
+        signal.addEventListener("abort", () => { dispatchAborted = true; }, { once: true });
+        return new Promise<never>(() => {});
+      },
+    });
+    clearTimeout(timer);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(out.kind).toBe("terminal");
+    if (out.kind === "terminal") expect(out.error.code).toBe("DISPOSED");
+    expect(dispatchAborted).toBe(true);
   });
 
   test("unawaited host work fails the cell", async () => {

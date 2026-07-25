@@ -1,10 +1,11 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
+import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
 import { MockController } from "./mock-controller.ts";
 import { FunctionExtractor } from "./extractor.ts";
 import { DEFAULT_PROFILE } from "./profile.ts";
@@ -94,6 +95,61 @@ describe("runProgram e2e", () => {
     expect(result.answer).toEqual({ answer: "child-result" });
     expect(result.ledger.usage.framesOpened).toBe(1);
   });
+
+  test("parent cell cancellation detaches a delayed child controller without late mutations", async () => {
+    class DelayedChildController implements ControllerDriver {
+      calls = 0;
+      aborted = false;
+
+      async next(_state: FrameState, signal?: AbortSignal): Promise<Cell> {
+        this.calls += 1;
+        signal?.addEventListener("abort", () => { this.aborted = true; }, { once: true });
+        if (this.calls === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          return { reasoning: "late child cell", code: "1" };
+        }
+        return { reasoning: "must not run", code: "answer('late'); 'done'" };
+      }
+
+      fork(): ControllerDriver {
+        return new DelayedChildController();
+      }
+    }
+
+    const child = new DelayedChildController();
+    const controller = new MockController(
+      [{
+        reasoning: "delegate",
+        code: "await recurse({ key: 'slow', objective: 'slow child', context: input }); 'done'",
+      }],
+      () => child,
+    );
+    const dir = await tmp();
+    const started = Date.now();
+    const result = await runProgram({
+      program: program({ objective: "cancel child" }),
+      sources: { context: "hello" },
+      controller,
+      model: new MockModelClient(() => "unused"),
+      backend,
+      dir,
+      profile: { ...DEFAULT_PROFILE, cellWallMs: 50 },
+    });
+
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("CPU_LIMIT");
+    expect(child.aborted).toBe(true);
+    expect(child.calls).toBe(1);
+    const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
+    expect(result.ledger.usage.controllerTurns).toBe(2);
+
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(eventsAtFinalization);
+    // A late continuation would reserve another controller turn before this
+    // second next() call, so one call proves both scheduling and ledger stopped.
+    expect(child.calls).toBe(1);
+  }, 2_000);
 
   test("duplicate llm keys coalesce to one model call (cache)", async () => {
     let n = 0;

@@ -6,7 +6,7 @@
  * (guest-catchable); call failures return a typed CallResult.
  */
 
-import { reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
+import { releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
 import { callError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
@@ -15,10 +15,11 @@ import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
+import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
-export type RecurseFn = (args: JsonValue) => Promise<GuestCallResult>;
+export type RecurseFn = (args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<GuestCallResult>;
 
 class DslError extends Error {
   constructor(readonly code: string, message: string) {
@@ -81,14 +82,17 @@ export const dispatchCall = async (
   name: string,
   args: JsonValue,
   recurse: RecurseFn,
+  signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<unknown> => {
+  throwIfAborted(signal);
   switch (name) {
     case "llm":
-      return llm(state, frame, asObject(args));
+      return llm(state, frame, asObject(args), signal);
     case "llm.batch":
-      return llmBatch(state, frame, asObject(args), recurse);
+      return llmBatch(state, frame, asObject(args), recurse, signal);
     case "recurse":
-      return recurse(args);
+      return recurse(args, signal, deadlineMs);
     case "agent": {
       const spec = asObject(args);
       const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "agent", key: reqStr(spec, "key"), identity: spec });
@@ -124,15 +128,15 @@ export const dispatchCall = async (
           maxChunks: o.maxChunks ?? 32,
           ...(o.overlapTokens !== undefined ? { overlapTokens: o.overlapTokens } : {}),
           ...(o.boundary ? { boundary: o.boundary } : {}),
-        }),
+        }), signal,
       ) as unknown as JsonValue;
     }
     case "context.provenance":
       return [] as unknown as JsonValue;
     case "contexts.derive":
-      return withBytes(state, () => state.store.derive(deriveSpec(asObject(args)))) as unknown as JsonValue;
+      return withBytes(state, () => state.store.derive(deriveSpec(asObject(args))), signal) as unknown as JsonValue;
     case "contexts.concat":
-      return withBytes(state, () => state.store.concat(concatSpec(asObject(args)))) as unknown as JsonValue;
+      return withBytes(state, () => state.store.concat(concatSpec(asObject(args))), signal) as unknown as JsonValue;
     case "contexts.open": {
       const id = reqStr(asObject(args), "id");
       const desc = state.store.get(id);
@@ -152,7 +156,7 @@ export const dispatchCall = async (
       const id = isJsonObject(artifact) && typeof artifact["id"] === "string" ? artifact["id"] : "";
       const entry = state.artifacts.get(id);
       if (!entry) throw new DslError("INVALID_STATE", `artifact ${id} not found`);
-      return withBytes(state, () => state.store.ingestText(entry.descriptor.name, entry.text, entry.descriptor.mimeType)) as unknown as JsonValue;
+      return withBytes(state, () => state.store.ingestText(entry.descriptor.name, entry.text, entry.descriptor.mimeType), signal) as unknown as JsonValue;
     }
     default:
       throw new DslError("INVALID_SPEC", `unknown bridge call "${name}"`);
@@ -176,9 +180,11 @@ const concatSpec = (spec: JsonObject): { key: string; refs: Array<{ id: string }
   return { key: reqStr(spec, "key"), refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) };
 };
 
-const withBytes = async <T>(state: RunState, op: () => Promise<T> | T): Promise<T> => {
+const withBytes = async <T>(state: RunState, op: () => Promise<T> | T, signal: AbortSignal): Promise<T> => {
+  throwIfAborted(signal);
   const before = state.store.totalBytes();
-  const result = await op();
+  const result = await waitForAbort(Promise.resolve(op()), signal);
+  throwIfAborted(signal);
   const delta = state.store.totalBytes() - before;
   if (delta > 0) {
     const reserved = reserveBytes(state.ledger.current, delta);
@@ -206,7 +212,7 @@ const writeArtifact = async (state: RunState, spec: JsonObject) => {
   return descriptor;
 };
 
-const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<GuestCallResult> => {
+const llm = async (state: RunState, frame: FrameRef, spec: JsonObject, signal: AbortSignal): Promise<GuestCallResult> => {
   const key = reqStr(spec, "key");
   const prompt = reqStr(spec, "prompt");
   const { model, thinking } = resolveModel(state, spec["model"]);
@@ -233,20 +239,41 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
   };
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "llm", key, identity });
 
+  const cancelled = (usage: CallUsage = ZERO_CALL_USAGE): GuestCallResult =>
+    errResult(callId, callError("CANCELLED", "cell epoch closed"), usage, false);
+  if (signal.aborted) return cancelled();
+
   const cached = state.callCache.get(callId);
   if (cached) return { ...cached, cached: true };
   const pending = state.inflight.get(callId);
-  if (pending) return { ...(await pending), cached: true };
+  if (pending) {
+    try {
+      return { ...(await waitForAbort(pending, signal)), cached: true };
+    } catch (error) {
+      if (wasAborted(error, signal)) return cancelled();
+      throw error;
+    }
+  }
 
-  const task = (async (): Promise<GuestCallResult> => {
-    const reservedCall = reserveLogicalCall(state.ledger.current, now(state));
-    if (!reservedCall.ok) return errResult(callId, reservedCall.error, ZERO_CALL_USAGE, false);
-    state.ledger.current = reservedCall.value;
-
-    const release = await state.semaphore.acquire();
+  let task!: Promise<GuestCallResult>;
+  task = (async (): Promise<GuestCallResult> => {
+    let release: (() => void) | undefined;
+    let logicalReserved = false;
+    let pendingTokenReservation = 0;
     let usage: CallUsage = ZERO_CALL_USAGE;
     try {
-      const contexts = await Promise.all(ctxIds.map((id) => state.store.load(id)));
+      throwIfAborted(signal);
+      const reservedCall = reserveLogicalCall(state.ledger.current, now(state));
+      if (!reservedCall.ok) return errResult(callId, reservedCall.error, usage, false);
+      state.ledger.current = reservedCall.value;
+      logicalReserved = true;
+
+      release = await state.semaphore.acquire(signal);
+      if (!release) return cancelled(usage);
+      throwIfAborted(signal);
+
+      const contexts = await waitForAbort(Promise.all(ctxIds.map((id) => state.store.load(id))), signal);
+      throwIfAborted(signal);
       const request: ModelRequest = {
         prompt,
         context: contexts,
@@ -254,15 +281,19 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
         ...(thinking ? { thinking } : {}),
         ...(schema ? { schema } : {}),
         ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+        signal,
       };
       const reserveTokens = Math.ceil(prompt.length / 4) + (maxOutputTokens ?? 512);
       const reservedAttempt = reserveAttempt(state.ledger.current, now(state), reserveTokens);
       if (!reservedAttempt.ok) return errResult(callId, reservedAttempt.error, usage, false);
       state.ledger.current = reservedAttempt.value;
+      pendingTokenReservation = reserveTokens;
 
-      const first = await state.model.complete(request);
+      const first = await waitForAbort(state.model.complete(request), signal);
+      throwIfAborted(signal);
       usage = first.usage;
       state.ledger.current = settle(state, reserveTokens, first.usage.totalTokens ?? 0);
+      pendingTokenReservation = 0;
 
       let value: JsonValue;
       if (schema) {
@@ -270,15 +301,19 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
         let candidate = parsed.ok ? parsed.value : undefined;
         let errors = candidate === undefined ? ["not valid JSON"] : validateAgainstSchema(candidate, schema);
         if (candidate === undefined || errors.length > 0) {
+          throwIfAborted(signal);
           const repairReserve = reserveAttempt(state.ledger.current, now(state), reserveTokens);
           if (repairReserve.ok) {
             state.ledger.current = repairReserve.value;
-            const repair = await state.model.complete({
+            pendingTokenReservation = reserveTokens;
+            const repair = await waitForAbort(state.model.complete({
               ...request,
               prompt: `${prompt}\n\nReturn ONLY a JSON value that matches the required schema. Previous output was invalid (${errors.join("; ")}):\n${first.text}`,
-            });
+            }), signal);
+            throwIfAborted(signal);
             usage = addUsage(usage, repair.usage);
             state.ledger.current = settle(state, reserveTokens, repair.usage.totalTokens ?? 0);
+            pendingTokenReservation = 0;
             const reparsed = strictJson(repair.text);
             candidate = reparsed.ok ? reparsed.value : undefined;
             errors = candidate === undefined ? ["not valid JSON"] : validateAgainstSchema(candidate, schema);
@@ -291,14 +326,25 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
         value = first.text;
       }
 
+      throwIfAborted(signal);
       const result = okResult(callId, value, usage, false);
       await state.journal.append({ type: "call_committed", frameId: frame.frameId, callId, kind: "llm", key, cached: false, ok: true, usage });
+      throwIfAborted(signal);
       state.callCache.set(callId, result);
+      logicalReserved = false;
       return result;
     } catch (error) {
+      if (wasAborted(error, signal)) return cancelled(usage);
+      logicalReserved = false;
       return errResult(callId, callError("FAILED", (error as Error).message), usage, false);
     } finally {
-      release();
+      if (pendingTokenReservation > 0) {
+        state.ledger.current = settle(state, pendingTokenReservation, 0);
+      }
+      if (logicalReserved && signal.aborted) {
+        state.ledger.current = releaseLogicalCall(state.ledger.current);
+      }
+      release?.();
     }
   })();
 
@@ -306,14 +352,20 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
   try {
     return await task;
   } finally {
-    state.inflight.delete(callId);
+    if (state.inflight.get(callId) === task) state.inflight.delete(callId);
   }
 };
 
 const settle = (state: RunState, reserved: number, actual: number) =>
   settleAttempt(state.ledger.current, reserved, actual);
 
-const llmBatch = async (state: RunState, frame: FrameRef, spec: JsonObject, recurse: RecurseFn): Promise<unknown> => {
+const llmBatch = async (
+  state: RunState,
+  frame: FrameRef,
+  spec: JsonObject,
+  recurse: RecurseFn,
+  signal: AbortSignal,
+): Promise<unknown> => {
   void recurse;
   reqStr(spec, "key");
   const items = spec["items"];
@@ -323,11 +375,15 @@ const llmBatch = async (state: RunState, frame: FrameRef, spec: JsonObject, recu
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length || 1) }, async () => {
     for (;;) {
+      throwIfAborted(signal);
       const index = cursor++;
       if (index >= items.length) return;
-      results[index] = await llm(state, frame, asObject(items[index] as JsonValue));
+      const result = await llm(state, frame, asObject(items[index] as JsonValue), signal);
+      throwIfAborted(signal);
+      results[index] = result;
     }
   });
-  await Promise.all(workers);
+  await waitForAbort(Promise.all(workers), signal);
+  throwIfAborted(signal);
   return results as unknown as JsonValue;
 };
