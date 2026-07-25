@@ -1,13 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pi-rlm-packed-smoke.XXXXXX")
+tmp_dir=""
 cleanup() {
-  rm -rf "$tmp_dir"
+  if [[ -n "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
 }
 trap cleanup EXIT
 
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pi-rlm-packed-smoke.XXXXXX")
+export HOME="$tmp_dir/home"
+export XDG_CONFIG_HOME="$tmp_dir/config"
+export XDG_CACHE_HOME="$tmp_dir/cache"
+export XDG_STATE_HOME="$tmp_dir/state"
+export npm_config_cache="$tmp_dir/npm-cache"
+export NPM_CONFIG_CACHE="$npm_config_cache"
+export npm_config_userconfig="$tmp_dir/npmrc"
+export NPM_CONFIG_USERCONFIG="$npm_config_userconfig"
+export npm_config_globalconfig="$tmp_dir/global-npmrc"
+export NPM_CONFIG_GLOBALCONFIG="$npm_config_globalconfig"
+export BUN_INSTALL="$tmp_dir/bun"
+export BUN_INSTALL_CACHE_DIR="$tmp_dir/bun-cache"
+export BUN_RUNTIME_TRANSPILER_CACHE_PATH="$tmp_dir/bun-transpiler-cache"
+export TMPDIR="$tmp_dir/tmp"
+mkdir -p \
+  "$HOME" \
+  "$XDG_CONFIG_HOME" \
+  "$XDG_CACHE_HOME" \
+  "$XDG_STATE_HOME" \
+  "$npm_config_cache" \
+  "$BUN_INSTALL" \
+  "$BUN_INSTALL_CACHE_DIR" \
+  "$BUN_RUNTIME_TRANSPILER_CACHE_PATH" \
+  "$TMPDIR"
+: > "$NPM_CONFIG_USERCONFIG"
+: > "$NPM_CONFIG_GLOBALCONFIG"
+
+root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 pack_json="$tmp_dir/pack.json"
 npm pack "$root_dir" --json --pack-destination "$tmp_dir" > "$pack_json"
 tarball_name=$(node -e 'const result = require(process.argv[1]); if (result.length !== 1) process.exit(1); process.stdout.write(result[0].filename);' "$pack_json")
@@ -66,17 +96,10 @@ if (!Array.isArray(extensions) || extensions.length !== 1 || typeof extensions[0
 process.stdout.write(path.resolve(path.dirname(manifestPath), extensions[0]));
 NODE
 )
-smoke_home="$tmp_dir/home"
 smoke_output="$tmp_dir/pi-output.jsonl"
-mkdir -p "$smoke_home" "$tmp_dir/config" "$tmp_dir/state" "$tmp_dir/cache"
 (
   cd "$fixture"
-  HOME="$smoke_home" \
-  XDG_CONFIG_HOME="$tmp_dir/config" \
-  XDG_STATE_HOME="$tmp_dir/state" \
-  XDG_CACHE_HOME="$tmp_dir/cache" \
-  NO_COLOR=1 \
-    "$fixture/node_modules/.bin/pi" --mode json -e "$extension_path" "/rlm" > "$smoke_output"
+  NO_COLOR=1 "$fixture/node_modules/.bin/pi" --mode json -e "$extension_path" "/rlm" > "$smoke_output"
 )
 node - "$smoke_output" <<'NODE'
 const fs = require("node:fs");
