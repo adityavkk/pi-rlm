@@ -8,7 +8,7 @@ import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import type { ModelResponse } from "../shell/model/client.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
-import { buildExtractorEvidence } from "./extractor-evidence.ts";
+import { buildExtractorEvidence, isSubstantiveJsonEvidence } from "./extractor-evidence.ts";
 import { FunctionExtractor, type ExtractorEvidenceProjection } from "./index.ts";
 import { MockController } from "./mock-controller.ts";
 import { DEFAULT_PROFILE, type Profile } from "./profile.ts";
@@ -64,7 +64,7 @@ describe("bounded fallback extraction", () => {
         return {
           ok: true,
           value: { answer: 7 },
-          evidenceRefs: [evidence.answerCandidates[0]!.evidenceId],
+          evidenceRefs: [evidence.answerCandidates[0]!.evidenceId!],
         };
       }),
     });
@@ -135,7 +135,7 @@ describe("bounded fallback extraction", () => {
         return {
           ok: true,
           value: { answer: String(recovery.value) },
-          evidenceRefs: [recovery.evidenceId],
+          evidenceRefs: [recovery.evidenceId!],
         };
       }),
     });
@@ -214,6 +214,67 @@ describe("bounded fallback extraction", () => {
     });
     expect(extractorCalls).toBe(0);
     expect(model.callCount).toBe(0);
+  });
+
+  test("empty exact JSON values are metadata, not substantive evidence", async () => {
+    expect([
+      null, "", " \t\n", [], {},
+    ].map((value) => isSubstantiveJsonEvidence(value))).toEqual([false, false, false, false, false]);
+    expect([
+      false, 0, "value", [null], { value: null },
+    ].map((value) => isSubstantiveJsonEvidence(value))).toEqual([true, true, true, true, true]);
+
+    let extractorCalls = 0;
+    const result = await runProgram({
+      program: program(), sources: { context: "" }, backend, dir: await tmp(),
+      controller: new MockController([{
+        reasoning: "",
+        code: "workspace.empty = ''; workspace.whitespace = '   '; workspace.object = {}; workspace.array = []; workspace.nil = null; answer(null)",
+      }]),
+      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      profile: boundedProfile({
+        trajectory: { ...DEFAULT_PROFILE.trajectory, headEntries: 0, tailEntries: 0 },
+      }),
+      extractor: new FunctionExtractor(() => {
+        extractorCalls++;
+        return { ok: false, code: "FAILED", message: "must not run" };
+      }),
+    });
+    expect(result).toMatchObject({
+      status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
+      ledger: { usage: { logicalCalls: 0, attempts: 0 } },
+    });
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("false and zero have distinct citeable exact-value IDs", async () => {
+    const result = await runProgram({
+      program: program(), sources: { context: "" }, backend, dir: await tmp(),
+      controller: new MockController([{
+        reasoning: "",
+        code: "workspace.falseValue = false; workspace.zeroValue = 0",
+      }]),
+      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      profile: boundedProfile({
+        trajectory: { ...DEFAULT_PROFILE.trajectory, headEntries: 0, tailEntries: 0 },
+      }),
+      extractor: new FunctionExtractor((evidence) => {
+        const falseItem = evidence.workspaceValues.find((item) => item.key === "falseValue");
+        const zeroItem = evidence.workspaceValues.find((item) => item.key === "zeroValue");
+        expect(falseItem?.evidenceId).toMatch(/^ev_[a-f0-9]{64}$/);
+        expect(zeroItem?.evidenceId).toMatch(/^ev_[a-f0-9]{64}$/);
+        expect(falseItem?.evidenceId).not.toBe(zeroItem?.evidenceId);
+        if (!falseItem?.evidenceId || !zeroItem?.evidenceId) throw new Error("missing exact-value evidence IDs");
+        return {
+          ok: true,
+          value: { answer: "false and zero" },
+          evidenceRefs: [falseItem.evidenceId, zeroItem.evidenceId],
+        };
+      }),
+    });
+    expect(result).toMatchObject({
+      status: "completed", completionMode: "fallback_extract", answer: { answer: "false and zero" },
+    });
   });
 
   test("huge source handle is head-tail bounded in the provider request", async () => {
@@ -313,14 +374,14 @@ describe("bounded fallback extraction", () => {
         profile: boundedProfile(),
         extractor: new FunctionExtractor((evidence) => {
           expect(evidence.workspaceValues.map((item) => item.key)).toEqual(["a", "z", "é", "中", "😀"]);
-          const ids = evidence.workspaceValues.map((item) => item.evidenceId);
+          const ids = evidence.workspaceValues.map((item) => item.evidenceId!);
           expect(ids.every((id) => /^ev_[a-f0-9]{64}$/.test(id))).toBe(true);
           evidenceIdOrders.push(ids);
           projections.push(canonicalStringify(evidence as unknown as never));
           return {
             ok: true,
             value: { answer: "stable" },
-            evidenceRefs: [evidence.workspaceValues[0]!.evidenceId],
+            evidenceRefs: [evidence.workspaceValues[0]!.evidenceId!],
           };
         }),
       });

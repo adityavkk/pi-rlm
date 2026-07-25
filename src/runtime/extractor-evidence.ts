@@ -16,7 +16,7 @@ import { throwIfAborted } from "./abort.ts";
 import type { Profile } from "./profile.ts";
 import type { ArtifactDescriptor } from "./state.ts";
 
-export const EXTRACTOR_EVIDENCE_VERSION = "1.2.0";
+export const EXTRACTOR_EVIDENCE_VERSION = "1.3.0";
 
 /** ECMAScript UTF-16 code-unit order; independent of host locale and ICU data. */
 export const compareCodeUnits = (left: string, right: string): number =>
@@ -35,7 +35,8 @@ export interface ExtractorVariableDescriptor {
 }
 
 export interface ExtractorExactValue {
-  readonly evidenceId: string;
+  /** Absent when the exact JSON value is not substantive. */
+  readonly evidenceId?: string;
   readonly key: string;
   readonly value: JsonValue;
   readonly exact: true;
@@ -44,7 +45,8 @@ export interface ExtractorExactValue {
 }
 
 export interface ExtractorAnswerCandidate {
-  readonly evidenceId: string;
+  /** Absent when the exact JSON value is not substantive. */
+  readonly evidenceId?: string;
   readonly iteration: number;
   readonly value: JsonValue;
   readonly exact: true;
@@ -207,6 +209,15 @@ const jsonBytes = (value: JsonValue, checkpoint: () => void): number =>
 const contentEvidenceId = (kind: string, item: unknown, checkpoint: () => void): string =>
   `ev_${prepareCanonicalJson({ version: EXTRACTOR_EVIDENCE_VERSION, kind, item } as JsonValue, checkpoint).sha256}`;
 
+/** Deterministic top-level test for exact JSON values that can support a citation. */
+export const isSubstantiveJsonEvidence = (value: JsonValue): boolean => {
+  if (value === null) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+};
+
 const substantiveTrajectoryEntry = (entry: ProjectedEntry): boolean =>
   byteLength(entry.reasoning) > 0
   || entry.codePreview.originalBytes - entry.codePreview.omittedBytes > 0
@@ -228,8 +239,8 @@ const projectExtractorTrajectory = (
 
 /** IDs that may be cited by an extractor, in deterministic projection order. */
 export const extractorSubstantiveEvidenceIds = (projection: ExtractorEvidenceProjection): readonly string[] => [
-  ...projection.answerCandidates.map((item) => item.evidenceId),
-  ...projection.workspaceValues.map((item) => item.evidenceId),
+  ...projection.answerCandidates.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
+  ...projection.workspaceValues.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
   ...projection.handles.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
   ...projection.trajectory.entries.flatMap((item) => item.evidenceId === undefined ? [] : [item.evidenceId]),
 ];
@@ -415,10 +426,9 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
       bytes,
       validationErrors,
     };
-    const candidate: ExtractorAnswerCandidate = {
-      evidenceId: contentEvidenceId("answerCandidate", candidateContent, checkpoint),
-      ...candidateContent,
-    };
+    const candidate: ExtractorAnswerCandidate = isSubstantiveJsonEvidence(snapshot.value)
+      ? { evidenceId: contentEvidenceId("answerCandidate", candidateContent, checkpoint), ...candidateContent }
+      : candidateContent;
     if (bytes > input.profile.extractorValueMaxBytes || bytes > input.profile.extractorValuesMaxBytes - exactValueBytes) {
       omittedBytes = saturatingAdd(omittedBytes, bytes);
       omittedItems++;
@@ -465,10 +475,9 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
     }
     const bytes = jsonBytes(value, checkpoint);
     const itemContent = { key, value, exact: true as const, required, bytes };
-    const item: ExtractorExactValue = {
-      evidenceId: contentEvidenceId("workspaceValue", itemContent, checkpoint),
-      ...itemContent,
-    };
+    const item: ExtractorExactValue = isSubstantiveJsonEvidence(value)
+      ? { evidenceId: contentEvidenceId("workspaceValue", itemContent, checkpoint), ...itemContent }
+      : itemContent;
     if (bytes <= input.profile.extractorValueMaxBytes
       && bytes <= input.profile.extractorValuesMaxBytes - exactValueBytes) {
       workspaceValues.push(item);
@@ -612,7 +621,8 @@ export const buildExtractorEvidence = async (input: EvidenceInput): Promise<Evid
   }
   omittedItems += trajectory.omittedCount;
 
-  const substantiveItems = answerCandidates.length + workspaceValues.length
+  const substantiveItems = answerCandidates.filter((candidate) => candidate.evidenceId !== undefined).length
+    + workspaceValues.filter((item) => item.evidenceId !== undefined).length
     + handles.filter((handle) => handle.evidenceId !== undefined).length
     + trajectory.entries.filter((entry) => entry.evidenceId !== undefined).length;
   Object.assign(projection, {
