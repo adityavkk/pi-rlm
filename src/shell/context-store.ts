@@ -4,11 +4,12 @@
  * Sources are snapshotted by content; every handle is content-addressed so the
  * same bytes always yield the same id (which makes call identity and restart
  * replay stable). Reads are byte-accurate and never split a UTF-8 code point.
- * The store persists content under `<dir>/contexts/<sha>.bin` and can be rebuilt
- * from the same sources on resume.
+ * The store persists content under `<dir>/contexts/<sha>.bin`. Journaled content
+ * references support later recovery work; this store does not implement resume.
  */
 
-import { mkdir, readFile, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdir, open, readFile, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonValue } from "../core/json.ts";
@@ -19,7 +20,9 @@ import {
   type ContextByteReservation,
   ContextChunkOverflowError,
   ContextCleanupError,
+  type ContextContentReference,
   type ContextDescriptor,
+  ContextIntegrityError,
   type ContextMatch,
   type ContextOperationControl,
   type ContextRead,
@@ -36,12 +39,14 @@ export {
   ContextBudgetError,
   ContextChunkOverflowError,
   ContextCleanupError,
+  ContextIntegrityError,
   ContextSpecError,
   ContextUnavailableError,
   DEFAULT_CONTEXT_STORE_LIMITS,
 } from "./context-store-contract.ts";
 export type {
   ContextByteReservation,
+  ContextContentReference,
   ContextDescriptor,
   ContextMatch,
   ContextOperationControl,
@@ -164,8 +169,15 @@ export class ContextStore {
     this.limits = validateLimits(limits);
   }
 
+  private contentHash(value: string | Uint8Array): string {
+    const hash = this.instrumentation.hasher?.(value)
+      ?? (typeof value === "string" ? sha256(value) : sha256Bytes(value));
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new ContextSpecError("content hasher must return 64 lowercase hexadecimal characters");
+    return hash;
+  }
+
   private makeId(sha: string): string {
-    return `ctx_${sha.slice(0, 16)}`;
+    return `ctx_${sha}`;
   }
 
   private makeDescriptor(label: string, mimeType: string, sha: string, bytes: number): ContextDescriptor {
@@ -181,13 +193,13 @@ export class ContextStore {
   }
 
   private prepareText(label: string, text: string, mimeType: string): PreparedEntry {
-    const sha = sha256(text);
+    const sha = this.contentHash(text);
     const descriptor = this.makeDescriptor(label, mimeType, sha, Buffer.byteLength(text, "utf8"));
     return new PreparedEntry(descriptor, () => encoder.encode(text), this.instrumentation.onMaterialize);
   }
 
   private prepareBytes(label: string, bytes: Uint8Array, mimeType: string): PreparedEntry {
-    const descriptor = this.makeDescriptor(label, mimeType, sha256Bytes(bytes), bytes.length);
+    const descriptor = this.makeDescriptor(label, mimeType, this.contentHash(bytes), bytes.length);
     return new PreparedEntry(descriptor, () => bytes.slice(), this.instrumentation.onMaterialize);
   }
 
@@ -195,6 +207,39 @@ export class ContextStore {
     const prepared = prepareCanonicalJson(value, control?.checkpoint);
     const descriptor = this.makeDescriptor(label, "application/json", prepared.sha256, prepared.bytes);
     return new PreparedEntry(descriptor, prepared.materialize, this.instrumentation.onMaterialize);
+  }
+
+  private async syncFile(path: string): Promise<void> {
+    if (this.instrumentation.syncFile) return this.instrumentation.syncFile(path);
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async syncDirectory(): Promise<void> {
+    if (this.instrumentation.syncDirectory) return this.instrumentation.syncDirectory(this.contentDir);
+    const handle = await open(this.contentDir, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async verifyPayload(path: string, reference: ContextContentReference): Promise<Uint8Array> {
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await readFile(path));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ContextUnavailableError(reference.id);
+      throw error;
+    }
+    if (bytes.length !== reference.bytes) throw new ContextIntegrityError(reference.id, "length");
+    if (this.contentHash(bytes) !== reference.sha256) throw new ContextIntegrityError(reference.id, "hash");
+    return bytes;
   }
 
   private async acquireMutation(): Promise<() => void> {
@@ -307,7 +352,7 @@ export class ContextStore {
         try {
           control?.checkpoint?.();
           const bytesArray = candidate.materialize();
-          if (bytesArray.length !== candidate.descriptor.bytes || sha256Bytes(bytesArray) !== candidate.descriptor.sha256)
+          if (bytesArray.length !== candidate.descriptor.bytes || this.contentHash(bytesArray) !== candidate.descriptor.sha256)
             throw new Error(`prepared context ${candidate.descriptor.id} changed before commit`);
           const stagedCandidate: (typeof staged)[number] = {
             entry: { descriptor: candidate.descriptor, bytesArray },
@@ -327,19 +372,40 @@ export class ContextStore {
       for (const candidate of staged) {
         control?.checkpoint?.();
         const { entry } = candidate;
-        const path = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
-        const orphan = this.orphans.get(path);
-        if (orphan) throw new ContextCleanupError([{ path, bytes: orphan.bytes, cause: orphan.cause }]);
-        if (existsSync(path)) continue;
-        candidate.path = path;
+        const finalPath = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
+        const orphan = this.orphans.get(finalPath);
+        if (orphan) throw new ContextCleanupError([{ path: finalPath, bytes: orphan.bytes, cause: orphan.cause }]);
+
+        const tempPath = join(this.contentDir, `.${entry.descriptor.sha256}.${randomUUID()}.tmp`);
+        candidate.path = tempPath;
         candidate.ownsPath = true;
+        if (this.instrumentation.writeFile) await this.instrumentation.writeFile(tempPath, entry.bytesArray);
+        else await writeFile(tempPath, entry.bytesArray, { flag: "wx" });
+        await this.syncFile(tempPath);
+
+        let published = false;
         try {
-          if (this.instrumentation.writeFile) await this.instrumentation.writeFile(path, entry.bytesArray);
-          else await writeFile(path, entry.bytesArray, { flag: "wx" });
+          if (this.instrumentation.rename) await this.instrumentation.rename(tempPath, finalPath);
+          else await link(tempPath, finalPath);
+          published = true;
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") candidate.ownsPath = false;
-          else throw error;
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          await this.verifyPayload(finalPath, entry.descriptor);
         }
+
+        try {
+          await unlink(tempPath);
+        } catch (error) {
+          if (published) await unlink(finalPath).catch(() => undefined);
+          throw error;
+        }
+        if (published) {
+          candidate.path = finalPath;
+        } else {
+          candidate.path = undefined;
+          candidate.ownsPath = false;
+        }
+        await this.syncDirectory();
       }
       for (const { entry } of staged) this.entries.set(entry.descriptor.id, entry);
       this.uniqueBytes += delta;
@@ -731,7 +797,14 @@ export class ContextStore {
     throw new ContextUnavailableError(id);
   }
 
-  async loadFromDisk(sha: string): Promise<Uint8Array> {
-    return new Uint8Array(await readFile(join(this.contentDir, `${sha}.bin`)));
+  async loadFromDisk(reference: ContextContentReference): Promise<Uint8Array> {
+    if (typeof reference !== "object" || reference === null)
+      throw new ContextSpecError("context reference must be an object");
+    if (!/^ctx_[0-9a-f]{64}$/.test(reference.id))
+      throw new ContextSpecError("context id must be ctx_ followed by 64 lowercase hexadecimal characters");
+    if (!/^[0-9a-f]{64}$/.test(reference.sha256) || reference.id !== this.makeId(reference.sha256))
+      throw new ContextSpecError("context id and SHA-256 must be the same fixed lowercase hexadecimal digest");
+    boundedInteger(reference.bytes, "bytes", 0, Number.MAX_SAFE_INTEGER);
+    return this.verifyPayload(join(this.contentDir, `${reference.sha256}.bin`), reference);
   }
 }

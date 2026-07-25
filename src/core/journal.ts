@@ -23,7 +23,14 @@ export interface EventErrorInfo {
 }
 
 export type RlmEvent =
-  | { readonly type: "run_started"; readonly runId: string; readonly manifestHash: string; readonly limits: BudgetLimits }
+  | {
+      readonly type: "run_started";
+      readonly runId: string;
+      readonly manifestHash: string;
+      readonly limits: BudgetLimits;
+      /** Durable content references only. Recovery policy remains owned by #25. */
+      readonly inputRefs?: readonly { readonly name: string; readonly id: string; readonly sha256: string; readonly bytes: number }[];
+    }
   | { readonly type: "frame_opened"; readonly frameId: string; readonly parentFrameId: string | null; readonly depth: number; readonly objective: string }
   | { readonly type: "phase"; readonly frameId: string; readonly ordinal: number; readonly name: string }
   | { readonly type: "emit"; readonly frameId: string; readonly ordinal: number; readonly message: string }
@@ -46,7 +53,17 @@ export type RlmEvent =
       readonly outputOmittedBytes?: number;
       readonly usage?: CallUsage;
       readonly outputRef?: string;
+      readonly outputRefSha256?: string;
+      readonly outputRefBytes?: number;
       readonly error?: EventErrorInfo;
+    }
+  | {
+      readonly type: "workspace_committed";
+      readonly frameId: string;
+      readonly iteration: number;
+      readonly workspaceRef: string;
+      readonly workspaceSha256: string;
+      readonly workspaceBytes: number;
     }
   | {
       readonly type: "fallback_evidence_projected";
@@ -89,8 +106,17 @@ export type RlmEvent =
       readonly ok: boolean;
       readonly usage: CallUsage;
       readonly outputRef?: string;
+      readonly outputSha256?: string;
+      readonly outputBytes?: number;
     }
-  | { readonly type: "answer_committed"; readonly frameId: string; readonly completionMode: CompletionMode; readonly outputRef: string }
+  | {
+      readonly type: "answer_committed";
+      readonly frameId: string;
+      readonly completionMode: CompletionMode;
+      readonly outputRef: string;
+      readonly outputSha256?: string;
+      readonly outputBytes?: number;
+    }
   | { readonly type: "frame_closed"; readonly frameId: string; readonly state: FrameState }
   | { readonly type: "run_completed"; readonly runId: string; readonly completionMode: CompletionMode; readonly outputRef?: string }
   | { readonly type: "run_failed"; readonly runId: string; readonly code: string; readonly message: string }
@@ -184,6 +210,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         break;
       }
       case "emit":
+      case "workspace_committed":
       case "fallback_evidence_projected":
       case "fallback_evidence_cited":
       case "provider_attempted":

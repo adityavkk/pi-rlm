@@ -14,7 +14,7 @@ import type { JsonObject, JsonValue } from "../core/json.ts";
 import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import { MAX_CALL_TOKENS, type CallUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
-import type { ContextDescriptor, ContextOperationControl } from "../shell/context-store.ts";
+import { ContextBudgetError, type ContextDescriptor, type ContextOperationControl, type ContextStoreTransaction } from "../shell/context-store.ts";
 import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
@@ -22,7 +22,7 @@ import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import { createModelOperation, DEFAULT_MAX_OUTPUT_TOKENS, ModelInvocationError } from "./provider.ts";
 export { tokenReservation } from "./provider.ts";
 import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
-import { remainingStoredBytes, reserveStoredBytes, retainedJsonBytes } from "./stored-bytes.ts";
+import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 
 export type RecurseFn = (args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<GuestCallResult>;
 
@@ -448,7 +448,7 @@ const writeArtifact = async (
   throwIfAborted(signal);
   const text = typeof value === "string" ? value : canonicalStringify(value);
   const sha = state.hasher(text);
-  const id = `art_${sha.slice(0, 16)}`;
+  const id = `art_${sha}`;
   const existing = state.artifacts.get(id);
   if (existing) return existing.descriptor;
   const descriptor = { id, name, bytes: Buffer.byteLength(text, "utf8"), sha256: sha, mimeType };
@@ -485,41 +485,63 @@ export const retainCallResult = async (
     const cached = state.callCache.get(result.callId);
     if (cached) return cached;
 
+    let transaction: ContextStoreTransaction<ContextDescriptor>;
+    try {
+      transaction = await state.store.beginDerive(
+        { key: `call-cache:${result.callId}`, value: result as unknown as JsonValue, label: `call-cache:${result.callId}` },
+        contextControl(state, deadlineMs ?? state.ledger.current.limits.deadlineMs, signal, true),
+      );
+    } catch (error) {
+      if ((error instanceof DslError && error.code === "BUDGET_BYTES") || error instanceof ContextBudgetError)
+        return errResult(result.callId, callError("BUDGET_BYTES", error.message), result.usage, false);
+      throw error;
+    }
+
+    const retained = { ...result, outputRef: transaction.value.id };
     let journalCommitted = false;
     let journalFailure: JournalAppendError | undefined;
+    const appendWork = state.journal.append({
+      ...event,
+      outputRef: transaction.value.id,
+      outputSha256: transaction.value.sha256,
+      outputBytes: transaction.value.bytes,
+    });
     try {
-      const outcome = await waitForAbort(state.journal.append(event), signal);
-      const observed = outcome as {
-        readonly event?: "committed" | "ignored_after_terminal";
-        readonly statusCache?: { readonly state: string; readonly error?: JournalAppendError };
-      } | undefined;
-      journalCommitted = observed?.event === undefined || observed.event === "committed";
-      if (observed?.statusCache?.state === "failed" && observed.statusCache.error)
-        journalFailure = observed.statusCache.error;
+      const outcome = await waitForAbort(appendWork, signal) as Awaited<typeof appendWork> | undefined;
+      journalCommitted = outcome?.event === undefined || outcome.event === "committed";
+      if (outcome?.statusCache.state === "failed") journalFailure = outcome.statusCache.error;
     } catch (error) {
-      if (!(error instanceof JournalAppendError) || !error.eventDurable) throw error;
-      journalCommitted = true;
-      journalFailure = error;
+      if (wasAborted(error, signal)) {
+        void appendWork.then(async (outcome) => {
+          if (outcome.event === "committed") transaction.commit();
+          else await transaction.rollback();
+        }, async (appendError) => {
+          if (appendError instanceof JournalAppendError && appendError.eventDurable) transaction.commit();
+          else await transaction.rollback();
+        }).catch(() => {});
+        throw error;
+      }
+      journalCommitted = error instanceof JournalAppendError && error.eventDurable;
+      if (journalCommitted) journalFailure = error as JournalAppendError;
+      else {
+        await transaction.rollback();
+        throw error;
+      }
     }
-    if (!journalCommitted) throw new Error("call journal event ignored after terminal");
+    if (!journalCommitted) {
+      await transaction.rollback();
+      throw new Error("call journal event ignored after terminal");
+    }
+    transaction.commit();
     if (!cacheResult) {
       if (journalFailure) throw journalFailure;
-      return result;
+      return retained;
     }
 
     checkpointCall(state, signal, deadlineMs);
-    const reserved = reserveStoredBytes(state.ledger, retainedJsonBytes(result as unknown as JsonValue));
-    if (!reserved.ok) return errResult(result.callId, reserved.error, result.usage, false);
-    try {
-      state.callCache.set(result.callId, result);
-      reserved.value.commit();
-    } catch (error) {
-      if (state.callCache.get(result.callId) === result) state.callCache.delete(result.callId);
-      reserved.value.rollback();
-      throw error;
-    }
+    state.callCache.set(result.callId, retained);
     if (journalFailure) throw journalFailure;
-    return result;
+    return retained;
   } finally {
     release();
   }

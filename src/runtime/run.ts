@@ -356,7 +356,18 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throwIfAborted(scope.signal);
       phase = "journal";
       try {
-        const outcome = await journal.append({ type: "run_started", runId, manifestHash, limits });
+        const outcome = await journal.append({
+          type: "run_started",
+          runId,
+          manifestHash,
+          limits,
+          inputRefs: sourceTransaction.value.map((descriptor) => ({
+            name: descriptor.label,
+            id: descriptor.id,
+            sha256: descriptor.sha256,
+            bytes: descriptor.bytes,
+          })),
+        });
         sourceDurable = outcome.event === "committed";
       } catch (error) {
         sourceDurable = error instanceof JournalAppendError && error.eventDurable;
@@ -491,7 +502,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
               state,
               `fallback:${rootFrameId}`,
               extracted.value,
-              (outputRef) => [{
+              (outputRef, outputBytes, outputSha256) => [{
                 type: "fallback_evidence_cited",
                 frameId: rootFrameId,
                 evidenceRefs: extracted.evidenceRefs,
@@ -501,6 +512,8 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
                 frameId: rootFrameId,
                 completionMode: "fallback_extract",
                 outputRef,
+                outputSha256,
+                outputBytes,
               }],
               limits.deadlineMs,
               scope.signal,

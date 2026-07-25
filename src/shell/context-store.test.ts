@@ -6,6 +6,7 @@ import { canonicalStringify, MAX_JSON_DEPTH, type JsonValue } from "../core/json
 import {
   ContextBudgetError,
   ContextChunkOverflowError,
+  ContextIntegrityError,
   ContextSpecError,
   ContextStore,
   ContextUnavailableError,
@@ -454,7 +455,7 @@ describe("ContextStore", () => {
       maxOutputBytes: 100,
       reserveBytes,
     })).rejects.toMatchObject({ code: "CONTEXT_CLEANUP_FAILED", failures: [{ bytes: 4 }] });
-    expect(orphaned.get(`ctx_${sha256(value).slice(0, 16)}`)).toBeUndefined();
+    expect(orphaned.get(`ctx_${sha256(value)}`)).toBeUndefined();
     expect(orphaned.totalBytes()).toBe(4);
     expect(orphaned.orphanedBytes()).toBe(4);
     expect(ledgerBytes).toBe(4);
@@ -616,6 +617,79 @@ describe("ContextStore", () => {
       files: [],
     });
   });
+
+  test("uses full hashes so equal prefixes cannot alias", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-collision-"));
+    const collisionPrefix = "0123456789abcdef";
+    const hasher = (value: string | Uint8Array) => {
+      const text = typeof value === "string" ? value : new TextDecoder().decode(value);
+      return collisionPrefix + sha256(text).slice(collisionPrefix.length);
+    };
+    const collisionSafe = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, { hasher });
+    const first = await collisionSafe.ingestText("first", "alpha");
+    const second = await collisionSafe.ingestText("second", "beta");
+
+    expect(first.id).toMatch(/^ctx_[0-9a-f]{64}$/);
+    expect(first.id.slice(4, 20)).toBe(second.id.slice(4, 20));
+    expect(first.id).not.toBe(second.id);
+    expect(await collisionSafe.load(first.id)).toBe("alpha");
+    expect(await collisionSafe.load(second.id)).toBe("beta");
+  });
+
+  test("loads verified content after restart and rejects corruption, truncation, and hostile ids", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-restart-"));
+    const descriptor = await new ContextStore(dir).ingestText("restart", "durable payload");
+    const restarted = new ContextStore(dir);
+    expect(new TextDecoder().decode(await restarted.loadFromDisk(descriptor))).toBe("durable payload");
+
+    for (const id of ["ctx_../events", `ctx_${descriptor.sha256.toUpperCase()}`, "ctx_deadbeef"]) {
+      await expect(restarted.loadFromDisk({ ...descriptor, id })).rejects.toBeInstanceOf(ContextSpecError);
+    }
+
+    const path = join(dir, "contexts", `${descriptor.sha256}.bin`);
+    await writeFile(path, "xxxxxxxxxxxxxxx");
+    await expect(restarted.loadFromDisk(descriptor)).rejects.toBeInstanceOf(ContextIntegrityError);
+    await writeFile(path, "short");
+    await expect(restarted.loadFromDisk(descriptor)).rejects.toMatchObject({
+      code: "CONTEXT_INTEGRITY_FAILED",
+      contextId: descriptor.id,
+    });
+  });
+
+  test("concurrent independent writers dedupe one complete final payload", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-concurrent-"));
+    const [first, second] = await Promise.all([
+      new ContextStore(dir).ingestText("first", "same concurrent payload"),
+      new ContextStore(dir).ingestText("second", "same concurrent payload"),
+    ]);
+    expect(first.id).toBe(second.id);
+    expect(await readdir(join(dir, "contexts"))).toEqual([`${first.sha256}.bin`]);
+    expect(new TextDecoder().decode(await new ContextStore(dir).loadFromDisk(first))).toBe("same concurrent payload");
+  });
+
+  test.each(["write", "sync", "rename", "directory sync"] as const)(
+    "%s fault never leaves a partial final payload",
+    async (phase) => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-fault-"));
+      const faulted = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+        ...(phase === "write" ? {
+          writeFile: async (path, bytes) => {
+            await writeFile(path, bytes.subarray(0, 3), { flag: "wx" });
+            throw new Error("injected write fault");
+          },
+        } : {}),
+        ...(phase === "sync" ? { syncFile: async () => { throw new Error("injected sync fault"); } } : {}),
+        ...(phase === "rename" ? { rename: async () => { throw new Error("injected rename fault"); } } : {}),
+        ...(phase === "directory sync" ? {
+          syncDirectory: async () => { throw new Error("injected directory sync fault"); },
+        } : {}),
+      });
+      await expect(faulted.ingestText("fault", "complete payload")).rejects.toBeInstanceOf(Error);
+      const files = await readdir(join(dir, "contexts")).catch(() => []);
+      expect(files.filter((name) => name.endsWith(".bin"))).toEqual([]);
+      expect(files.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    },
+  );
 
   test("derive and concat produce readable contexts", async () => {
     const j = await store.derive({ key: "k", value: { a: 1 } });

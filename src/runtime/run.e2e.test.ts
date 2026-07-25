@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "../core/journal.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
+import { ContextStore } from "../shell/context-store.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
@@ -61,13 +62,14 @@ describe("runProgram e2e", () => {
           'done'`,
       },
     ]);
+    const dir = await tmp();
     const result = await runProgram({
       program: program({ objective: "count", outputs: [{ name: "total", schema: { type: "integer" } }] }),
       sources: { context: "0".repeat(200) + "1".repeat(200) + "2".repeat(100) },
       controller,
       model,
       backend,
-      dir: await tmp(),
+      dir,
       signal: new AbortController().signal,
     });
     expect(result.status).toBe("completed");
@@ -75,6 +77,35 @@ describe("runProgram e2e", () => {
     expect(result.answer).toEqual({ total: 3 });
     expect(model.callCount).toBe(3);
     expect(result.ledger.usage.logicalCalls).toBe(3);
+
+    const events = await journalEvents(dir);
+    const started = events.find((event) => event.type === "run_started");
+    const workspace = events.find((event) => event.type === "workspace_committed");
+    const calls = events.filter((event) => event.type === "call_committed");
+    const answer = events.find((event) => event.type === "answer_committed");
+    expect(started?.type === "run_started" && started.inputRefs).toHaveLength(1);
+    expect(workspace?.type === "workspace_committed" && workspace.workspaceRef).toMatch(/^ctx_[0-9a-f]{64}$/);
+    expect(calls).toHaveLength(3);
+    expect(calls.every((event) => event.type === "call_committed" && /^ctx_[0-9a-f]{64}$/.test(event.outputRef ?? ""))).toBe(true);
+    expect(answer?.type === "answer_committed" && answer.outputRef).toMatch(/^ctx_[0-9a-f]{64}$/);
+
+    const references = [
+      ...(started?.type === "run_started" ? started.inputRefs ?? [] : []),
+      ...(workspace?.type === "workspace_committed" ? [{
+        id: workspace.workspaceRef, sha256: workspace.workspaceSha256, bytes: workspace.workspaceBytes,
+      }] : []),
+      ...calls.flatMap((event) => event.type === "call_committed" && event.outputRef && event.outputSha256
+        ? [{ id: event.outputRef, sha256: event.outputSha256, bytes: event.outputBytes! }]
+        : []),
+      ...(answer?.type === "answer_committed" ? [{
+        id: answer.outputRef, sha256: answer.outputSha256!, bytes: answer.outputBytes!,
+      }] : []),
+    ];
+    const restarted = new ContextStore(dir);
+    for (const reference of references) {
+      expect(reference.id).toBe(`ctx_${reference.sha256}`);
+      expect((await restarted.loadFromDisk(reference)).length).toBe(reference.bytes);
+    }
   });
 
   test("recurse opens a child frame whose answer flows back to the parent", async () => {
@@ -406,7 +437,7 @@ describe("runProgram e2e", () => {
       const committedCells = events.filter((event) => event.type === "cell_committed");
       expect(committedCells[0]?.outputRef).toBeUndefined();
       expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
-      expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+      expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
     }
   });
 
@@ -457,7 +488,7 @@ describe("runProgram e2e", () => {
     expect(events.find((event) => event.type === "emit")?.message).toBe("0");
     expect(committedCells[0]?.outputRef).toBeUndefined();
     expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
-    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
   });
 
   test("a thrown cell discards its earlier answer effect before recovery", async () => {
@@ -502,7 +533,9 @@ describe("runProgram e2e", () => {
 
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ answer: "ok" });
-    expect(result.ledger.usage.storedBytes).toBe(1 + Buffer.byteLength(JSON.stringify({ answer: "ok" })));
+    expect(result.ledger.usage.storedBytes).toBe(
+      1 + Buffer.byteLength(JSON.stringify({})) + Buffer.byteLength(JSON.stringify({ answer: "ok" })),
+    );
     expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({ code: "BUDGET_BYTES" });
     const events = await journalEvents(dir);
     const cellsCommitted = events.filter((event) => event.type === "cell_committed");
@@ -511,7 +544,7 @@ describe("runProgram e2e", () => {
       message: "answer output exceeds remaining stored-byte budget",
     });
     expect(cellsCommitted[0]?.outputRef).toBeUndefined();
-    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
   });
 
   test("inherited output values do not satisfy the answer contract", async () => {
@@ -730,7 +763,7 @@ describe("runProgram e2e", () => {
       code: `
         const codes = [];
         for (let i = 0; i < 2; i++) {
-          try { await contexts.derive({ key: 'denied', value: 'x'.repeat(65) }); }
+          try { await contexts.derive({ key: 'denied', value: 'x'.repeat(67) }); }
           catch (error) { codes.push(error.code); }
         }
         try { await contexts.concat({ key: 'concat', refs: [input, input], separator: '' }); }
@@ -747,14 +780,14 @@ describe("runProgram e2e", () => {
       backend,
       dir,
       signal: new AbortController().signal,
-      profile: { ...DEFAULT_PROFILE, storedByteLimit: 164 },
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 166 },
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({
       answer: "BUDGET_BYTES,BUDGET_BYTES,BUDGET_BYTES,BUDGET_BYTES",
     });
-    expect(result.ledger.usage.storedBytes).toBe(164);
-    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
+    expect(result.ledger.usage.storedBytes).toBe(166);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
   });
 
   test("oversized initial sources fail before payload state or files commit", async () => {
@@ -780,7 +813,7 @@ describe("runProgram e2e", () => {
       code: `
         const denied = [];
         for (let i = 0; i < 2; i++) {
-          try { await artifacts.write({ key: 'denied', name: 'large', value: 'x'.repeat(25) }); }
+          try { await artifacts.write({ key: 'denied', name: 'large', value: 'x'.repeat(27) }); }
           catch (error) { denied.push(error.code); }
         }
         const [d1, d2] = await Promise.all([
@@ -797,11 +830,11 @@ describe("runProgram e2e", () => {
       program: program(), sources: { context: "s" }, controller,
       model: new MockModelClient(() => "unused"), backend, dir,
       signal: new AbortController().signal,
-      profile: { ...DEFAULT_PROFILE, storedByteLimit: 24 },
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 26 },
     });
     expect(result.answer).toEqual({ answer: "ok" });
-    expect(result.ledger.usage.storedBytes).toBe(24); // source 1 + context 4 + artifact 4 + answer 15
-    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);
+    expect(result.ledger.usage.storedBytes).toBe(26); // source 1 + context 4 + artifact 4 + workspace 2 + answer 15
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(4);
   });
 
   test("fallback answers use the same denied transaction without residue", async () => {
