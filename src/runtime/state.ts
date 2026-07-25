@@ -49,8 +49,6 @@ export interface RunState {
   readonly hasher: Hasher;
   readonly program: RlmProgram;
   readonly ledger: { current: Ledger };
-  /** @internal Test-only observation of successful controller-turn reservations. */
-  readonly onControllerTurnReserved?: (controllerTurns: number) => void;
   readonly store: ContextStore;
   readonly artifacts: Map<string, { descriptor: ArtifactDescriptor; text: string }>;
   readonly model: ModelClient;
@@ -63,4 +61,9 @@ export interface RunState {
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
   readonly frameSeq: { current: number };
+}
+
+/** Runtime-private state used only by the top-level and frame runners. */
+export interface InternalRunState extends RunState {
+  readonly controllerTurnObserver?: (controllerTurns: number) => void;
 }

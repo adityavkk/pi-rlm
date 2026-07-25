@@ -14,6 +14,7 @@ import { MockController } from "./mock-controller.ts";
 import { FunctionExtractor } from "./extractor.ts";
 import { DEFAULT_PROFILE } from "./profile.ts";
 import { runProgram } from "./run.ts";
+import { registerControllerTurnObserverForTest } from "./testing/controller-turn-observer.ts";
 
 let backend: QuickJsBackend;
 beforeAll(async () => {
@@ -195,35 +196,44 @@ describe("runProgram e2e", () => {
       () => child,
     );
     const dir = await tmp();
-    const result = await runProgram({
-      program: program({ objective: "cancel child" }),
-      sources: { context: "hello" },
-      controller,
-      model: new MockModelClient(() => "unused"),
-      backend: new CancellingBackend(),
-      dir,
-      signal: new AbortController().signal,
-      onControllerTurnReserved: (controllerTurns) => { observedControllerTurns.push(controllerTurns); },
+    const owner = new AbortController();
+    const unregisterObserver = registerControllerTurnObserverForTest(owner.signal, (controllerTurns) => {
+      observedControllerTurns.push(controllerTurns);
+      throw new Error("observer failure must be isolated");
     });
+    try {
+      const result = await runProgram({
+        program: program({ objective: "cancel child" }),
+        sources: { context: "hello" },
+        controller,
+        model: new MockModelClient(() => "unused"),
+        backend: new CancellingBackend(),
+        dir,
+        signal: owner.signal,
+      });
 
-    expect(result.status).toBe("failed");
-    expect(result.error?.code).toBe("CPU_LIMIT");
-    expect(child.aborted).toBe(true);
-    expect(child.calls).toBe(1);
-    expect(result.ledger.usage.controllerTurns).toBe(2);
-    const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
-    const observedCountAtFinalization = observedControllerTurns.length;
-    const observedTurnsAtFinalization = observedControllerTurns.at(-1);
-    expect(observedCountAtFinalization).toBe(2);
-    expect(observedTurnsAtFinalization).toBe(2);
+      expect(result.status).toBe("failed");
+      expect(result.error?.code).toBe("CPU_LIMIT");
+      expect(child.aborted).toBe(true);
+      expect(child.calls).toBe(1);
+      expect(result.ledger.usage.controllerTurns).toBe(2);
+      const eventsAtFinalization = await readFile(join(dir, "events.jsonl"), "utf8");
+      const observedCountAtFinalization = observedControllerTurns.length;
+      const observedTurnsAtFinalization = observedControllerTurns.at(-1);
+      expect(observedCountAtFinalization).toBe(2);
+      expect(observedTurnsAtFinalization).toBe(2);
 
-    releaseChild();
-    await childSettled;
-    await Promise.resolve();
-    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(eventsAtFinalization);
-    expect(observedControllerTurns).toHaveLength(observedCountAtFinalization);
-    expect(observedControllerTurns.at(-1)).toBe(observedTurnsAtFinalization);
-    expect(child.calls).toBe(1);
+      releaseChild();
+      await childSettled;
+      await Promise.resolve();
+      expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(eventsAtFinalization);
+      expect(observedControllerTurns).toHaveLength(observedCountAtFinalization);
+      expect(observedControllerTurns.at(-1)).toBe(observedTurnsAtFinalization);
+      expect(child.calls).toBe(1);
+    } finally {
+      releaseChild();
+      unregisterObserver();
+    }
   }, 5_000);
 
   test("duplicate llm keys coalesce to one model call (cache)", async () => {

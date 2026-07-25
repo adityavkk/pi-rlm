@@ -35,8 +35,9 @@ import { outputContractErrorMessage, validateOutputContract } from "./output-val
 import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
-import type { FrameRef, RunState } from "./state.ts";
+import type { FrameRef, InternalRunState } from "./state.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
+import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 
 export const RLM_DSL_VERSION = "0.1.0";
 
@@ -54,8 +55,6 @@ export interface RunInput {
   readonly extractor?: Extractor;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
-  /** @internal Test-only observation of successful controller-turn reservations. */
-  readonly onControllerTurnReserved?: (controllerTurns: number) => void;
 }
 
 export interface RunError {
@@ -399,7 +398,8 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     });
     throwIfAborted(scope.signal);
 
-    const state: RunState = {
+    const controllerTurnObserver = resolveControllerTurnObserver(input.signal);
+    const state: InternalRunState = {
       runId,
       startMs,
       profile,
@@ -407,7 +407,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       hasher: sha256,
       program: input.program,
       ledger: ledgerRef,
-      ...(input.onControllerTurnReserved ? { onControllerTurnReserved: input.onControllerTurnReserved } : {}),
+      ...(controllerTurnObserver ? { controllerTurnObserver } : {}),
       store,
       artifacts: new Map(),
       model: input.model,

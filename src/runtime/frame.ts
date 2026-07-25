@@ -28,7 +28,8 @@ import { persistAnswer, persistWorkspace } from "./answer-persistence.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
-import type { FrameRef, RunState } from "./state.ts";
+import type { FrameRef, InternalRunState } from "./state.ts";
+import { notifyControllerTurnReserved } from "./testing/controller-turn-observer.ts";
 
 export interface FrameResult {
   readonly answer?: JsonValue;
@@ -77,7 +78,7 @@ const hasErrorCode = (error: unknown, code: string): boolean =>
   typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
 
 export const runFrame = async (
-  state: RunState,
+  state: InternalRunState,
   frame: FrameRef,
   controller: ControllerDriver,
   signal: AbortSignal,
@@ -107,7 +108,7 @@ export const runFrame = async (
         ? { exhausted: false, deadline: true, workspace, entries }
         : { exhausted: true, workspace, entries };
     state.ledger.current = turn.value;
-    state.onControllerTurnReserved?.(turn.value.usage.controllerTurns);
+    notifyControllerTurnReserved(state.controllerTurnObserver, turn.value.usage.controllerTurns);
 
     const projection = projectTrajectory(entries, state.profile.trajectory);
     const controllerOperation = createModelOperation(state, frame, {
@@ -336,7 +337,7 @@ export const runFrame = async (
 };
 
 const runChild = async (
-  state: RunState,
+  state: InternalRunState,
   parentFrame: FrameRef,
   parentController: ControllerDriver,
   args: JsonValue,
