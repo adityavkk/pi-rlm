@@ -6,7 +6,7 @@
  * (guest-catchable); call failures return a typed CallResult.
  */
 
-import { releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
+import { releaseBytes, releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
 import { callError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
@@ -132,7 +132,7 @@ export const dispatchCall = async (
     }
     case "context.chunks": {
       const o = objOpts(args) as { targetTokens?: number; overlapTokens?: number; maxChunks?: number; boundary?: "line" | "none" };
-      return withBytes(state, () =>
+      return withContextMutation(state, () =>
         state.store.chunks(reqStr(asObject(args), "id"), {
           targetTokens: o.targetTokens === undefined ? 4000 : o.targetTokens,
           maxChunks: o.maxChunks === undefined ? 32 : o.maxChunks,
@@ -144,9 +144,11 @@ export const dispatchCall = async (
     case "context.provenance":
       return [] as unknown as JsonValue;
     case "contexts.derive":
-      return withBytes(state, () => state.store.derive(deriveSpec(asObject(args))), signal) as unknown as JsonValue;
+      return withContextMutation(state, () =>
+        state.store.derive(deriveSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
     case "contexts.concat":
-      return withBytes(state, () => state.store.concat(concatSpec(asObject(args))), signal) as unknown as JsonValue;
+      return withContextMutation(state, () =>
+        state.store.concat(concatSpec(asObject(args)), contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
     case "contexts.open": {
       const id = reqStr(asObject(args), "id");
       const desc = state.store.get(id);
@@ -166,7 +168,13 @@ export const dispatchCall = async (
       const id = isJsonObject(artifact) && typeof artifact["id"] === "string" ? artifact["id"] : "";
       const entry = state.artifacts.get(id);
       if (!entry) throw new DslError("INVALID_STATE", `artifact ${id} not found`);
-      return withBytes(state, () => state.store.ingestText(entry.descriptor.name, entry.text, entry.descriptor.mimeType), signal) as unknown as JsonValue;
+      return withContextMutation(state, () =>
+        state.store.ingestText(
+          entry.descriptor.name,
+          entry.text,
+          entry.descriptor.mimeType,
+          contextControl(state, deadlineMs, signal, true),
+        ), signal) as unknown as JsonValue;
     }
     default:
       throw new DslError("INVALID_SPEC", `unknown bridge call "${name}"`);
@@ -178,10 +186,10 @@ const objOpts = (args: JsonValue): Record<string, JsonValue> => {
   return isJsonObject(o) ? o : {};
 };
 
-const contextControl = (
+export const contextControl = (
   state: RunState,
   deadlineMs: number,
-  signal: AbortSignal,
+  signal?: AbortSignal,
   reserveOutput = false,
 ): ContextOperationControl => ({
   checkpoint: () => {
@@ -190,7 +198,22 @@ const contextControl = (
       throw new DslError("BUDGET_DEADLINE", "deadline reached during context operation");
   },
   ...(reserveOutput
-    ? { maxOutputBytes: Math.max(0, state.ledger.current.limits.storedByteLimit - state.ledger.current.usage.storedBytes) }
+    ? {
+        maxOutputBytes: Math.max(0, state.ledger.current.limits.storedByteLimit - state.ledger.current.usage.storedBytes),
+        reserveBytes: (bytes: number) => {
+          const reserved = reserveBytes(state.ledger.current, bytes);
+          if (!reserved.ok) throw new DslError(reserved.error.code, reserved.error.message);
+          state.ledger.current = reserved.value;
+          let active = true;
+          return {
+            rollback: () => {
+              if (!active) return;
+              active = false;
+              state.ledger.current = releaseBytes(state.ledger.current, bytes);
+            },
+          };
+        },
+      }
     : {}),
 });
 
@@ -206,21 +229,16 @@ const concatSpec = (spec: JsonObject): { key: string; refs: Array<{ id: string }
   return { key: reqStr(spec, "key"), refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) };
 };
 
-const withBytes = async <T>(state: RunState, op: () => Promise<T> | T, signal: AbortSignal): Promise<T> => {
-  throwIfAborted(signal);
+export const withContextMutation = async <T>(
+  state: RunState,
+  op: () => Promise<T> | T,
+  signal?: AbortSignal,
+): Promise<T> => {
+  if (signal) throwIfAborted(signal);
   const release = await state.contextSemaphore.acquire(signal);
-  if (!release) throwIfAborted(signal);
+  if (!release && signal) throwIfAborted(signal);
   try {
-    const before = state.store.totalBytes();
-    const result = await waitForAbort(Promise.resolve(op()), signal);
-    throwIfAborted(signal);
-    const delta = state.store.totalBytes() - before;
-    if (delta > 0) {
-      const reserved = reserveBytes(state.ledger.current, delta);
-      if (!reserved.ok) throw new DslError("INVALID_STATE", reserved.error.message);
-      state.ledger.current = reserved.value;
-    }
-    return result;
+    return await op();
   } finally {
     release?.();
   }

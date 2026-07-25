@@ -5,18 +5,24 @@
  * result returns.
  */
 
-import { createLedger, type Ledger, reserveBytes } from "../core/budget.ts";
+import { createLedger, type Ledger, releaseBytes, reserveBytes } from "../core/budget.ts";
 import { identityHash } from "../core/ids.ts";
 import type { JsonValue } from "../core/json.ts";
 import { programIdentity, type RlmProgram } from "../core/program.ts";
 import { projectTrajectory } from "../core/trajectory.ts";
-import { ContextStore, type ContextDescriptor } from "../shell/context-store.ts";
+import {
+  ContextBudgetError,
+  type ContextDescriptor,
+  type ContextOperationControl,
+  ContextStore,
+} from "../shell/context-store.ts";
 import { type Clock, systemClock } from "../shell/clock.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import type { ControllerDriver } from "./controller.ts";
+import { contextControl, withContextMutation } from "./broker.ts";
 import type { Extractor } from "./extractor.ts";
 import { runFrame } from "./frame.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
@@ -56,13 +62,26 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`).slice(0, 16)}`;
 
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
+  const sourceControl = (): ContextOperationControl => ({
+    maxOutputBytes: Math.max(0, ledgerRef.current.limits.storedByteLimit - ledgerRef.current.usage.storedBytes),
+    reserveBytes: (bytes) => {
+      const reserved = reserveBytes(ledgerRef.current, bytes);
+      if (!reserved.ok) throw new ContextBudgetError(reserved.error.message);
+      ledgerRef.current = reserved.value;
+      let active = true;
+      return {
+        rollback: () => {
+          if (!active) return;
+          active = false;
+          ledgerRef.current = releaseBytes(ledgerRef.current, bytes);
+        },
+      };
+    },
+  });
   const inputs: Record<string, ContextDescriptor> = {};
   for (const declared of input.program.inputs) {
     const text = input.sources[declared.name] ?? "";
-    const descriptor = await store.ingestText(declared.name, text);
-    const reserved = reserveBytes(ledgerRef.current, descriptor.bytes);
-    if (reserved.ok) ledgerRef.current = reserved.value;
-    inputs[declared.name] = descriptor;
+    inputs[declared.name] = await store.ingestText(declared.name, text, "text/plain", sourceControl());
   }
 
   const journal = new JournalStore(input.dir);
@@ -135,7 +154,11 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     };
     const extracted = await input.extractor.extract(evidence);
     if (extracted.ok) {
-      const ref = await store.derive({ key: `fallback:${rootFrameId}`, value: extracted.value });
+      const ref = await withContextMutation(state, () =>
+        store.derive(
+          { key: `fallback:${rootFrameId}`, value: extracted.value },
+          contextControl(state, state.ledger.current.limits.deadlineMs, undefined, true),
+        ));
       await journal.append({ type: "answer_committed", frameId: rootFrameId, completionMode: "fallback_extract", outputRef: ref.id });
       await journal.append({ type: "frame_closed", frameId: rootFrameId, state: "answered" });
       await journal.append({ type: "run_completed", runId, completionMode: "fallback_extract", outputRef: ref.id });

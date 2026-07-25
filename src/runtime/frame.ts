@@ -21,7 +21,7 @@ import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
-import { dispatchCall } from "./broker.ts";
+import { contextControl, dispatchCall, withContextMutation } from "./broker.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
@@ -203,7 +203,11 @@ export const runFrame = async (
       } else if (answered && candidate !== undefined) {
         const answerErrors = validateAnswer(candidate, frame);
         if (answerErrors.length === 0) {
-          const ref = await state.store.derive({ key: `answer:${frame.frameId}:${iteration}`, value: candidate });
+          const ref = await withContextMutation(state, () =>
+            state.store.derive(
+              { key: `answer:${frame.frameId}:${iteration}`, value: candidate as JsonValue },
+              contextControl(state, cellDeadline, signal, true),
+            ), signal);
           if (signal?.aborted) return cancelled();
           entries = appendEntry(entries, { iteration, reasoning: cell.reasoning, code: cell.code, hasResult: outcome.hasResult, outputPreview: preview, outputRef: ref.id });
           await state.journal.append({

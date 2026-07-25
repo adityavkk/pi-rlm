@@ -1,8 +1,9 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  ContextBudgetError,
   ContextChunkOverflowError,
   ContextSpecError,
   ContextStore,
@@ -218,7 +219,7 @@ describe("ContextStore", () => {
     expect(() => bounded.grep(d.id, { pattern: "needle", maxMatches: 1 })).toThrow(/maxLineBytes/);
   });
 
-  test("preflights chunk count, overlap progress, profile cap, and stored bytes", async () => {
+  test("preflights chunk count, overlap progress, and profile cap", async () => {
     const bounded = await limitedStore({
       maxReadBytes: 40,
       maxLineBytes: 40,
@@ -232,8 +233,90 @@ describe("ContextStore", () => {
     await expect(bounded.chunks(d.id, { targetTokens: 5, overlapTokens: 5, maxChunks: 3 })).rejects.toBeInstanceOf(ContextSpecError);
     await expect(bounded.chunks(d.id, { targetTokens: 5, overlapTokens: 0, maxChunks: 3 })).rejects.toBeInstanceOf(ContextSpecError);
     await expect(bounded.chunks(d.id, { targetTokens: 5, maxChunks: 4 })).rejects.toBeInstanceOf(ContextSpecError);
-    await expect(bounded.chunks(d.id, { targetTokens: 10, maxChunks: 3 }, { maxOutputBytes: 10 })).rejects.toThrow(/stored bytes/);
     expect(bounded.totalBytes()).toBe(before);
+  });
+
+  test("budget-denied producers leave entries, bytes, and files unchanged", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-budget-"));
+    const bounded = new ContextStore(dir);
+    const source = await bounded.ingestText("source", "abcdefgh");
+    const beforeBytes = bounded.totalBytes();
+    const beforeFiles = await readdir(join(dir, "contexts"));
+    const control = { maxOutputBytes: 0 };
+    const denied = [
+      () => bounded.derive({ key: "denied", value: "new" }, control),
+      () => bounded.derive({ key: "denied", value: "new" }, control),
+      () => bounded.concat({ key: "concat", refs: [source, source], separator: "" }, control),
+      () => bounded.chunks(source.id, { targetTokens: 1, maxChunks: 4 }, control),
+    ];
+    for (const operation of denied) await expect(operation()).rejects.toBeInstanceOf(ContextBudgetError);
+    expect(bounded.totalBytes()).toBe(beforeBytes);
+    expect(await readdir(join(dir, "contexts"))).toEqual(beforeFiles);
+  });
+
+  test("reserves the exact unique byte delta for duplicate chunks", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-unique-"));
+    const exact = new ContextStore(dir);
+    const source = await exact.ingestText("duplicates", "abcdabcd");
+    let reserved = 0;
+    const chunks = await exact.chunks(source.id, { targetTokens: 1, maxChunks: 2 }, {
+      maxOutputBytes: 4,
+      reserveBytes: (bytes) => {
+        reserved += bytes;
+        return { rollback: () => { reserved -= bytes; } };
+      },
+    });
+    expect(reserved).toBe(4);
+    expect(chunks[0]?.id).toBe(chunks[1]?.id);
+    expect(exact.totalBytes()).toBe(12);
+  });
+
+  test("zero-overlap chunks preserve 2, 3, and 4-byte UTF-8 boundary crossings", async () => {
+    const sources = ["abcéZ", "abc€Z", "ab😀Z"];
+    for (const source of sources) {
+      const descriptor = await store.ingestText(`utf8-${source}`, source);
+      const chunks = await store.chunks(descriptor.id, { targetTokens: 1, maxChunks: 10 });
+      const reconstructed = (await Promise.all(chunks.map((chunk) => store.load(chunk.id)))).join("");
+      expect(new TextEncoder().encode(reconstructed)).toEqual(new TextEncoder().encode(source));
+    }
+  });
+
+  test("overlapping UTF-8 chunks preserve coverage and make progress", async () => {
+    const source = "AéB€C😀DEFGHIJK";
+    const descriptor = await store.ingestText("utf8-overlap", source);
+    const chunks = await store.chunks(descriptor.id, {
+      targetTokens: 2,
+      overlapTokens: 1,
+      maxChunks: 10,
+    });
+    const texts = await Promise.all(chunks.map((chunk) => store.load(chunk.id)));
+    let reconstructed = texts[0] as string;
+    for (const text of texts.slice(1)) {
+      let overlap = Math.min(reconstructed.length, text.length);
+      while (overlap > 0 && !reconstructed.endsWith(text.slice(0, overlap))) overlap--;
+      expect(overlap).toBeGreaterThan(0);
+      expect(overlap).toBeLessThan(text.length);
+      reconstructed += text.slice(overlap);
+    }
+    expect(reconstructed).toBe(source);
+  });
+
+  test("rolls byte reservation and filesystem state back when persistence fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-failure-"));
+    const contentPath = join(dir, "contexts");
+    await writeFile(contentPath, "block writes");
+    const failing = new ContextStore(dir);
+    let reserved = 0;
+    await expect(failing.derive({ key: "failure", value: "new context" }, {
+      maxOutputBytes: 100,
+      reserveBytes: (bytes) => {
+        reserved += bytes;
+        return { rollback: () => { reserved -= bytes; } };
+      },
+    })).rejects.toBeInstanceOf(Error);
+    expect(reserved).toBe(0);
+    expect(failing.totalBytes()).toBe(0);
+    expect(await readFile(contentPath, "utf8")).toBe("block writes");
   });
 
   test("checks cancellation/deadline composition points while scanning", async () => {

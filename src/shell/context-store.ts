@@ -8,70 +8,56 @@
  * from the same sources on resume.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonValue } from "../core/json.ts";
 import { canonicalStringify } from "../core/json.ts";
 import { headTailPreview } from "../core/preview.ts";
-import { sha256 } from "./hash.ts";
+import {
+  ContextBudgetError,
+  type ContextByteReservation,
+  ContextChunkOverflowError,
+  type ContextDescriptor,
+  type ContextMatch,
+  type ContextOperationControl,
+  type ContextRead,
+  ContextSpecError,
+  type ContextStoreLimits,
+  ContextUnavailableError,
+  DEFAULT_CONTEXT_STORE_LIMITS,
+} from "./context-store-contract.ts";
+import { sha256, sha256Bytes, sha256Parts } from "./hash.ts";
+
+export {
+  ContextBudgetError,
+  ContextChunkOverflowError,
+  ContextSpecError,
+  ContextUnavailableError,
+  DEFAULT_CONTEXT_STORE_LIMITS,
+} from "./context-store-contract.ts";
+export type {
+  ContextByteReservation,
+  ContextDescriptor,
+  ContextMatch,
+  ContextOperationControl,
+  ContextRead,
+  ContextStoreLimits,
+} from "./context-store-contract.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: false });
 const TOKEN_ESTIMATOR = "utf8-bytes/4";
 const estimateTokens = (bytes: number): number => Math.ceil(bytes / 4);
 
-export interface ContextDescriptor {
-  readonly id: string;
-  readonly label: string;
-  readonly bytes: number;
-  readonly estimatedTokens: number;
-  readonly tokenEstimator: string;
-  readonly mimeType: string;
-  readonly sha256: string;
-}
-
-export interface ContextRead {
-  readonly text: string;
-  readonly startByte: number;
-  readonly endByte: number;
-  readonly truncated: boolean;
-}
-
-export interface ContextMatch {
-  readonly text: string;
-  readonly line: number;
-  readonly startByte: number;
-  readonly contextId: string;
-}
-
-export interface ContextStoreLimits {
-  readonly maxReadBytes: number;
-  readonly maxLines: number;
-  readonly maxLineBytes: number;
-  readonly maxMatches: number;
-  readonly maxChunks: number;
-  readonly maxPatternBytes: number;
-}
-
-export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
-  maxReadBytes: 1024 * 1024,
-  maxLines: 10_000,
-  maxLineBytes: 64 * 1024,
-  maxMatches: 1_000,
-  maxChunks: 256,
-  maxPatternBytes: 4 * 1024,
-};
-
-/** Optional composition points for broker deadlines and storage preflights. */
-export interface ContextOperationControl {
-  readonly checkpoint?: () => void;
-  readonly maxOutputBytes?: number;
-}
-
 interface Entry {
   readonly descriptor: ContextDescriptor;
   readonly bytesArray: Uint8Array;
+}
+
+interface PreparedEntry {
+  readonly descriptor: ContextDescriptor;
+  readonly materialize: () => Uint8Array;
 }
 
 const isContinuation = (byte: number): boolean => (byte & 0xc0) === 0x80;
@@ -147,35 +133,116 @@ export class ContextStore {
     return `ctx_${sha.slice(0, 16)}`;
   }
 
-  private async persist(sha: string, bytes: Uint8Array): Promise<void> {
-    if (!existsSync(this.contentDir)) await mkdir(this.contentDir, { recursive: true });
-    const path = join(this.contentDir, `${sha}.bin`);
-    if (!existsSync(path)) await writeFile(path, bytes);
-  }
-
-  private async intern(label: string, text: string, mimeType: string): Promise<ContextDescriptor> {
-    const bytesArray = encoder.encode(text);
-    const sha = sha256(text);
-    const id = this.makeId(sha);
-    const existing = this.entries.get(id);
-    if (existing) return existing.descriptor;
-    const descriptor: ContextDescriptor = {
-      id,
+  private makeDescriptor(label: string, mimeType: string, sha: string, bytes: number): ContextDescriptor {
+    return {
+      id: this.makeId(sha),
       label,
-      bytes: bytesArray.length,
-      estimatedTokens: estimateTokens(bytesArray.length),
+      bytes,
+      estimatedTokens: estimateTokens(bytes),
       tokenEstimator: TOKEN_ESTIMATOR,
       mimeType,
       sha256: sha,
     };
-    this.entries.set(id, { descriptor, bytesArray });
-    this.uniqueBytes += bytesArray.length;
-    await this.persist(sha, bytesArray);
-    return descriptor;
   }
 
-  async ingestText(label: string, text: string, mimeType = "text/plain"): Promise<ContextDescriptor> {
-    return this.intern(label, text, mimeType);
+  private prepareText(label: string, text: string, mimeType: string): PreparedEntry {
+    const sha = sha256(text);
+    const descriptor = this.makeDescriptor(label, mimeType, sha, Buffer.byteLength(text, "utf8"));
+    return { descriptor, materialize: () => encoder.encode(text) };
+  }
+
+  private prepareBytes(label: string, bytes: Uint8Array, mimeType: string): PreparedEntry {
+    const descriptor = this.makeDescriptor(label, mimeType, sha256Bytes(bytes), bytes.length);
+    return { descriptor, materialize: () => bytes.slice() };
+  }
+
+  private async commitPrepared(
+    prepared: readonly PreparedEntry[],
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor[]> {
+    const canonical = new Map<string, ContextDescriptor>();
+    for (const [id, entry] of this.entries) canonical.set(id, entry.descriptor);
+    const additions: PreparedEntry[] = [];
+    const descriptors = prepared.map((candidate) => {
+      const existing = canonical.get(candidate.descriptor.id);
+      if (existing) return existing;
+      canonical.set(candidate.descriptor.id, candidate.descriptor);
+      additions.push(candidate);
+      return candidate.descriptor;
+    });
+    const delta = additions.reduce((sum, candidate) => sum + candidate.descriptor.bytes, 0);
+    const maxOutputBytes = control?.maxOutputBytes === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
+    if (delta > maxOutputBytes)
+      throw new ContextBudgetError(`context output requires ${delta} bytes; ${maxOutputBytes} bytes remain`);
+
+    let reservation: ContextByteReservation | undefined;
+    let createdDir = false;
+    let bytesCommitted = false;
+    const createdPaths: string[] = [];
+    const insertedIds: string[] = [];
+    try {
+      if (delta > 0) reservation = control?.reserveBytes?.(delta);
+      if (additions.length > 0 && !existsSync(this.contentDir)) {
+        await mkdir(this.contentDir, { recursive: true });
+        createdDir = true;
+      }
+      for (const candidate of additions) {
+        control?.checkpoint?.();
+        const { descriptor } = candidate;
+        const path = join(this.contentDir, `${descriptor.sha256}.bin`);
+        if (existsSync(path)) continue;
+        const bytes = candidate.materialize();
+        if (bytes.length !== descriptor.bytes || sha256Bytes(bytes) !== descriptor.sha256)
+          throw new Error(`prepared context ${descriptor.id} changed before commit`);
+        try {
+          await writeFile(path, bytes, { flag: "wx" });
+          createdPaths.push(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            await unlink(path).catch(() => undefined);
+            throw error;
+          }
+        }
+      }
+      for (const candidate of additions) {
+        this.entries.set(candidate.descriptor.id, {
+          descriptor: candidate.descriptor,
+          bytesArray: candidate.materialize(),
+        });
+        insertedIds.push(candidate.descriptor.id);
+      }
+      this.uniqueBytes += delta;
+      bytesCommitted = true;
+      control?.checkpoint?.();
+      return descriptors;
+    } catch (error) {
+      for (const id of insertedIds) this.entries.delete(id);
+      if (bytesCommitted) this.uniqueBytes -= delta;
+      reservation?.rollback();
+      await Promise.allSettled(createdPaths.map((path) => unlink(path)));
+      if (createdDir) await rmdir(this.contentDir).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async intern(
+    label: string,
+    text: string,
+    mimeType: string,
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor> {
+    return (await this.commitPrepared([this.prepareText(label, text, mimeType)], control))[0] as ContextDescriptor;
+  }
+
+  async ingestText(
+    label: string,
+    text: string,
+    mimeType = "text/plain",
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor> {
+    return this.intern(label, text, mimeType, control);
   }
 
   get(id: string): ContextDescriptor | undefined {
@@ -319,19 +386,15 @@ export class ContextStore {
     const maxChunks = boundedInteger(options.maxChunks, "maxChunks", 1, this.limits.maxChunks);
     if (options.boundary !== undefined && options.boundary !== "line" && options.boundary !== "none")
       throw new ContextSpecError('boundary must be "line" or "none"');
-    const maxOutputBytes = control?.maxOutputBytes === undefined
-      ? Number.MAX_SAFE_INTEGER
-      : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
     const targetBytes = targetTokens * 4;
-    const stepBytes = targetBytes - overlapTokens * 4;
+    const overlapBytes = overlapTokens * 4;
     const ranges: Array<{ start: number; end: number }> = [];
-    let outputBytes = 0;
 
-    // Preflight count and output bytes without decoding or materializing chunks.
-    for (let rawStart = 0; rawStart < bytesArray.length; rawStart += stepBytes) {
+    // Every range starts at the prior range's valid boundary. Zero-overlap
+    // ranges are adjacent; overlapping ranges move backward without gaps.
+    for (let start = 0; start < bytesArray.length;) {
       if (ranges.length >= maxChunks) throw new ContextChunkOverflowError(maxChunks + 1, maxChunks);
-      const start = forwardBoundary(bytesArray, rawStart);
-      let end = backwardBoundary(bytesArray, Math.min(bytesArray.length, rawStart + targetBytes));
+      let end = backwardBoundary(bytesArray, Math.min(bytesArray.length, start + targetBytes));
       if (options.boundary === "line" && end < bytesArray.length) {
         const newline = findByte(
           bytesArray,
@@ -343,38 +406,84 @@ export class ContextStore {
         if (newline !== -1) end = newline + 1;
       }
       if (end <= start) throw new ContextSpecError("chunk options do not make forward progress");
-      const pieceBytes = end - start;
-      if (pieceBytes > this.limits.maxReadBytes)
+      if (end - start > this.limits.maxReadBytes)
         throw new ContextSpecError(`chunk exceeds maxReadBytes ${this.limits.maxReadBytes}`);
-      if (outputBytes > maxOutputBytes - pieceBytes)
-        throw new ContextSpecError(`chunk output exceeds available stored bytes ${maxOutputBytes}`);
-      outputBytes += pieceBytes;
       ranges.push({ start, end });
       if (end >= bytesArray.length) break;
+      let nextStart = overlapBytes === 0 ? end : backwardBoundary(bytesArray, end - overlapBytes);
+      if (nextStart <= start) nextStart = forwardBoundary(bytesArray, start + 1);
+      if (nextStart <= start || nextStart > end)
+        throw new ContextSpecError("chunk options do not make forward progress");
+      start = nextStart;
       control?.checkpoint?.();
     }
 
-    const out: ContextDescriptor[] = [];
-    for (let i = 0; i < ranges.length; i++) {
-      control?.checkpoint?.();
-      const range = ranges[i] as { start: number; end: number };
-      const piece = decoder.decode(bytesArray.subarray(range.start, range.end));
-      out.push(await this.intern(`${descriptor.label}#chunk${i + 1}`, piece, descriptor.mimeType));
-    }
-    control?.checkpoint?.();
-    return out;
+    const prepared = ranges.map((range, index) =>
+      this.prepareBytes(
+        `${descriptor.label}#chunk${index + 1}`,
+        bytesArray.subarray(range.start, range.end),
+        descriptor.mimeType,
+      ));
+    return this.commitPrepared(prepared, control);
   }
 
-  async derive(spec: { key: string; value: string | JsonValue; label?: string }): Promise<ContextDescriptor> {
+  async derive(
+    spec: { key: string; value: string | JsonValue; label?: string },
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor> {
     const text = typeof spec.value === "string" ? spec.value : canonicalStringify(spec.value);
     const mime = typeof spec.value === "string" ? "text/plain" : "application/json";
-    return this.intern(spec.label ?? `derived:${spec.key}`, text, mime);
+    return this.intern(spec.label ?? `derived:${spec.key}`, text, mime, control);
   }
 
-  async concat(spec: { key: string; refs: Array<{ id: string }>; separator?: string; label?: string }): Promise<ContextDescriptor> {
+  async concat(
+    spec: { key: string; refs: Array<{ id: string }>; separator?: string; label?: string },
+    control?: ContextOperationControl,
+  ): Promise<ContextDescriptor> {
     const separator = spec.separator ?? "\n";
-    const parts = spec.refs.map((ref) => decoder.decode(this.entryOrThrow(ref.id).bytesArray));
-    return this.intern(spec.label ?? `concat:${spec.key}`, parts.join(separator), "text/plain");
+    const parts = spec.refs.map((ref) => this.entryOrThrow(ref.id).bytesArray);
+    const separatorBytes = Buffer.byteLength(separator, "utf8");
+    let bytes = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const added = (parts[i] as Uint8Array).length + (i > 0 ? separatorBytes : 0);
+      if (bytes > Number.MAX_SAFE_INTEGER - added) throw new ContextSpecError("concat output is too large");
+      bytes += added;
+      control?.checkpoint?.();
+    }
+    const maxOutputBytes = control?.maxOutputBytes ?? Number.MAX_SAFE_INTEGER;
+    if (bytes > maxOutputBytes && ![...this.entries.values()].some((entry) => entry.descriptor.bytes === bytes))
+      throw new ContextBudgetError(`context output requires ${bytes} bytes; ${maxOutputBytes} bytes remain`);
+    const values = function* (): Generator<string | Uint8Array> {
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) yield separator;
+        yield parts[i] as Uint8Array;
+      }
+    };
+    const descriptor = this.makeDescriptor(
+      spec.label ?? `concat:${spec.key}`,
+      "text/plain",
+      sha256Parts(values()),
+      bytes,
+    );
+    const prepared: PreparedEntry = {
+      descriptor,
+      materialize: () => {
+        const out = new Uint8Array(bytes);
+        const encodedSeparator = parts.length > 1 ? encoder.encode(separator) : new Uint8Array();
+        let offset = 0;
+        for (let i = 0; i < parts.length; i++) {
+          if (i > 0) {
+            out.set(encodedSeparator, offset);
+            offset += encodedSeparator.length;
+          }
+          const part = parts[i] as Uint8Array;
+          out.set(part, offset);
+          offset += part.length;
+        }
+        return out;
+      },
+    };
+    return (await this.commitPrepared([prepared], control))[0] as ContextDescriptor;
   }
 
   preview(id: string, headBytes = 512, tailBytes = 256): string {
@@ -391,28 +500,5 @@ export class ContextStore {
 
   async loadFromDisk(sha: string): Promise<Uint8Array> {
     return new Uint8Array(await readFile(join(this.contentDir, `${sha}.bin`)));
-  }
-}
-
-export class ContextUnavailableError extends Error {
-  readonly code = "UNAVAILABLE_CONTEXT";
-  constructor(id: string) {
-    super(`context ${id} is unavailable`);
-    this.name = "ContextUnavailableError";
-  }
-}
-
-export class ContextSpecError extends Error {
-  readonly code = "INVALID_SPEC";
-  constructor(message: string) {
-    super(message);
-    this.name = "ContextSpecError";
-  }
-}
-
-export class ContextChunkOverflowError extends ContextSpecError {
-  constructor(produced: number, max: number) {
-    super(`chunking requires at least ${produced} chunks which exceeds maxChunks ${max}`);
-    this.name = "ContextChunkOverflowError";
   }
 }

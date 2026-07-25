@@ -5,6 +5,7 @@ import {
   createLedger,
   type BudgetLimits,
   openFrame,
+  releaseBytes,
   releaseLeaf,
   reserveAttempt,
   reserveBytes,
@@ -76,11 +77,14 @@ describe("budget ledger", () => {
     if (!r.ok) expect(r.error.code).toBe("BUDGET_DEADLINE");
   });
 
-  test("byte reservation", () => {
+  test("byte reservation and rollback", () => {
     const l = createLedger({ ...limits, storedByteLimit: 100 });
     const r = reserveBytes(l, 60);
     expect(r.ok).toBe(true);
-    if (r.ok) expect(reserveBytes(r.value, 60).ok).toBe(false);
+    if (r.ok) {
+      expect(reserveBytes(r.value, 60).ok).toBe(false);
+      expect(releaseBytes(r.value, 60).usage.storedBytes).toBe(0);
+    }
   });
 
   test("controller turns exhaust", () => {
