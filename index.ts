@@ -202,8 +202,17 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
   let inputCorrelation: InputCorrelation | undefined;
   let grantStore = emptyGrantStore();
+  let authorizationGeneration = 0;
   const pendingToolCalls = new Set<string>();
   const consumedToolCalls = new Set<string>();
+
+  const invalidateAuthorization = (): void => {
+    authorizationGeneration += 1;
+    inputCorrelation = undefined;
+    grantStore = emptyGrantStore();
+    pendingToolCalls.clear();
+    consumedToolCalls.clear();
+  };
 
   const bindingFor = (ctx: ExtensionContext): LaunchBinding | undefined => {
     if (!inputCorrelation) return undefined;
@@ -296,12 +305,12 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   pi.on("agent_end", () => {
     inputCorrelation = undefined;
   });
-  pi.on("session_shutdown", () => {
-    inputCorrelation = undefined;
-    grantStore = emptyGrantStore();
-    pendingToolCalls.clear();
-    consumedToolCalls.clear();
+  pi.on("session_before_switch", invalidateAuthorization);
+  pi.on("session_before_fork", invalidateAuthorization);
+  pi.on("session_start", (event) => {
+    if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") invalidateAuthorization();
   });
+  pi.on("session_shutdown", invalidateAuthorization);
 
   pi.registerCommand("rlm", {
     description: "Start a host-authorized pi-rlm run from an objective.",
@@ -385,12 +394,15 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           return denied("RLM_GRANT_REPLAY: this user input is already reserved by another rlm_run call.");
         inputCorrelation.reservation = { toolCallId, requestSha256: expectedHash };
         reservedCorrelation = inputCorrelation;
+        const confirmationGeneration = authorizationGeneration;
 
         const approved = await ctx.ui.confirm(
           "Approve exact pi-rlm request?",
           confirmationMessage(built.value, expectedHash),
         );
         if (!approved) return denied("RLM_OPT_IN_REQUIRED: pi-rlm launch was not approved.");
+        if (confirmationGeneration !== authorizationGeneration)
+          return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before authorization consumption.");
 
         const current = buildRequest(params as LaunchParams);
         const actualHash = current.ok ? requestSha256(current.value) : "invalid-after-approval";

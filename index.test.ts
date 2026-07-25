@@ -223,6 +223,60 @@ describe("pi-rlm extension wiring", () => {
     expect(h.runs).toHaveLength(1);
   });
 
+  test("normal same-session confirmation authorizes one run", async () => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    const result = await rlmTool(h).execute("call-same-session", { objective: "Review" }, undefined, undefined, h.ctx);
+
+    expect(result.details?.status).toBe("failed");
+    expect(h.runs).toHaveLength(1);
+    expect(h.audits).toHaveLength(1);
+  });
+
+  test.each([
+    ["session_before_switch", { reason: "resume", targetSessionFile: "/tmp/session-2.jsonl" }],
+    ["session_before_fork", { entryId: "entry-1", position: "at" }],
+  ])("%s invalidates pending confirmation even when the original session ID is restored", async (eventName, event) => {
+    const h = harness();
+    await h.startTurn("Analyze this normally");
+    let resolveConfirmation!: (approved: boolean) => void;
+    h.setConfirm(() => new Promise<boolean>((resolve) => (resolveConfirmation = resolve)));
+    const pending = rlmTool(h).execute("call-transition", { objective: "Review" }, undefined, undefined, h.ctx);
+    await Promise.resolve();
+
+    await h.emit(eventName, event);
+    h.setSessionId("session-2");
+    h.setSessionId("session-1");
+    resolveConfirmation(true);
+    const result = await pending;
+
+    expect(result.content[0]?.text).toContain("RLM_GRANT_GENERATION_MISMATCH");
+    expect(h.runs).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+  });
+
+  test.each(["new", "resume", "fork"])(
+    "session_start reason %s invalidates pending confirmation even when the original session ID is restored",
+    async (reason) => {
+      const h = harness();
+      await h.startTurn("Analyze this normally");
+      let resolveConfirmation!: (approved: boolean) => void;
+      h.setConfirm(() => new Promise<boolean>((resolve) => (resolveConfirmation = resolve)));
+      const pending = rlmTool(h).execute("call-session-start", { objective: "Review" }, undefined, undefined, h.ctx);
+      await Promise.resolve();
+
+      h.setSessionId("session-2");
+      await h.emit("session_start", { reason, previousSessionFile: "/tmp/session-1.jsonl" });
+      h.setSessionId("session-1");
+      resolveConfirmation(true);
+      const result = await pending;
+
+      expect(result.content[0]?.text).toContain("RLM_GRANT_GENERATION_MISMATCH");
+      expect(h.runs).toHaveLength(0);
+      expect(h.audits).toHaveLength(0);
+    },
+  );
+
   test("session mismatch after confirmation fails before initialization", async () => {
     const h = harness();
     await h.startTurn("Analyze this normally");
