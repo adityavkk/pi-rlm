@@ -236,7 +236,7 @@ export const runFrame = async (
         error = callError("INVALID_RESULT", `cell submitted ${answerEffectCount} answer effects; exactly one is allowed`);
       } else if (answerEffectCount === 1) {
         if (!capturedAnswer?.ok) {
-          error = callError("INVALID_RESULT", "answer value must be defined");
+          error = callError("INVALID_RESULT", "answer value must be strict JSON");
         } else {
           const candidate = capturedAnswer.value;
           const answerErrors = validateAnswer(candidate, frame);

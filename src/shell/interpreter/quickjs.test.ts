@@ -130,6 +130,36 @@ describe("QuickJsBackend", () => {
     expect(effects[3]!.args).toEqual({ value: { done: true } });
   });
 
+  test("snapshots effects with captured intrinsics and rejects unsafe payload traversal", async () => {
+    const effects: Array<{ name: string; args: JsonValue }> = [];
+    const out = await run(`
+      const nativeStringify = JSON.stringify;
+      JSON.stringify = () => '{"value":{"forged":true}}';
+      JSON.parse = () => ({ value: { forged: true } });
+      answer(undefined);
+      answer({ actual: true });
+      const cycle = {}; cycle.self = cycle; answer(cycle);
+      const accessor = {};
+      Object.defineProperty(accessor, "secret", { enumerable: true, get() { while (true) {} } });
+      answer(accessor);
+      let proxyTrapRan = false;
+      const proxy = new Proxy({}, { ownKeys() { proxyTrapRan = true; while (true) {} } });
+      answer(proxy);
+      workspace.proxyTrapRan = proxyTrapRan;
+      nativeStringify(proxyTrapRan);
+    `, { effect: (name, args) => effects.push({ name, args }) });
+
+    expect(out.kind).toBe("value");
+    expect(effects).toEqual([
+      { name: "answer", args: null },
+      { name: "answer", args: { value: { actual: true } } },
+      { name: "answer", args: null },
+      { name: "answer", args: null },
+      { name: "answer", args: null },
+    ]);
+    if (out.kind === "value") expect(out.workspace).toEqual({ proxyTrapRan: false });
+  });
+
   test("flags non-serializable workspace values", async () => {
     const out = await run("workspace.fn = () => 1;\n1");
     expect(out.kind).toBe("value");

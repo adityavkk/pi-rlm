@@ -23,10 +23,93 @@ export const buildPreamble = (globals: CellGlobals): string => {
   const EFFECT = globalThis.__rlm_effect;
   delete globalThis.__rlm_host;
   delete globalThis.__rlm_effect;
+
+  // Capture every intrinsic used by bridge serialization before guest code can
+  // replace globals or prototypes. Snapshot through data descriptors so getters
+  // never run, and track guest-created Proxies so their traps never run either.
+  const SAFE_STRINGIFY = JSON.stringify;
+  const SAFE_PARSE = JSON.parse;
+  const ARRAY_IS_ARRAY = Array.isArray;
+  const NUMBER_IS_FINITE = Number.isFinite;
+  const NUMBER_FROM = Number;
+  const IS_ARRAY_INDEX = Function.prototype.call.bind(RegExp.prototype.test, /^(0|[1-9][0-9]*)$/);
+  const GET_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+  const OWN_KEYS = Reflect.ownKeys;
+  const OBJECT_CREATE = Object.create;
+  const OBJECT_DEFINE = Object.defineProperty;
+  const OBJECT_FREEZE = Object.freeze;
+  const OBJECT_SET_PROTOTYPE = Object.setPrototypeOf;
+  const NativeProxy = globalThis.Proxy;
+  const ProxySet = new WeakSet();
+  const StackSet = new WeakSet();
+  const WEAK_ADD = Function.prototype.call.bind(WeakSet.prototype.add);
+  const WEAK_HAS = Function.prototype.call.bind(WeakSet.prototype.has);
+  const WEAK_DELETE = Function.prototype.call.bind(WeakSet.prototype.delete);
+  const GuestProxy = function(target, handler) {
+    const proxy = new NativeProxy(target, handler);
+    WEAK_ADD(ProxySet, proxy);
+    return proxy;
+  };
+  GuestProxy.revocable = (target, handler) => {
+    const pair = NativeProxy.revocable(target, handler);
+    WEAK_ADD(ProxySet, pair.proxy);
+    return pair;
+  };
+  OBJECT_FREEZE(GuestProxy);
+  OBJECT_DEFINE(globalThis, "Proxy", { value: GuestProxy, writable: false, configurable: false });
+
+  const invalidJson = () => { throw "invalid JSON payload"; };
+  const cloneJson = (value) => {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number") return NUMBER_IS_FINITE(value) ? value : invalidJson();
+    if (typeof value !== "object") return invalidJson();
+    if (WEAK_HAS(ProxySet, value) || WEAK_HAS(StackSet, value)) return invalidJson();
+    WEAK_ADD(StackSet, value);
+    try {
+      const descriptors = GET_DESCRIPTORS(value);
+      const keys = OWN_KEYS(descriptors);
+      if (ARRAY_IS_ARRAY(value)) {
+        const lengthDescriptor = descriptors.length;
+        if (!lengthDescriptor || !("value" in lengthDescriptor)) return invalidJson();
+        const length = lengthDescriptor.value;
+        const clone = [];
+        OBJECT_SET_PROTOTYPE(clone, null);
+        for (const key of keys) {
+          if (key === "length") continue;
+          if (typeof key !== "string" || !IS_ARRAY_INDEX(key) || NUMBER_FROM(key) >= length) return invalidJson();
+          const descriptor = descriptors[key];
+          if (!descriptor || !("value" in descriptor)) return invalidJson();
+        }
+        for (let index = 0; index < length; index++) {
+          const descriptor = descriptors[String(index)];
+          if (!descriptor || !("value" in descriptor)) return invalidJson();
+          clone[index] = cloneJson(descriptor.value);
+        }
+        return clone;
+      }
+      const clone = OBJECT_CREATE(null);
+      for (const key of keys) {
+        if (typeof key !== "string") return invalidJson();
+        const descriptor = descriptors[key];
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalidJson();
+        OBJECT_DEFINE(clone, key, { value: cloneJson(descriptor.value), enumerable: true });
+      }
+      return clone;
+    } finally {
+      WEAK_DELETE(StackSet, value);
+    }
+  };
+  const snapshotJson = (value) => {
+    const json = SAFE_STRINGIFY(cloneJson(value));
+    if (json === undefined) return invalidJson();
+    SAFE_PARSE(json);
+    return json;
+  };
+
   const DATA = ${data};
   const call = (name, args) =>
-    HOST(name, JSON.stringify(args === undefined ? null : args)).then((s) => {
-      const r = JSON.parse(s);
+    HOST(name, SAFE_STRINGIFY(args === undefined ? null : args)).then((s) => {
+      const r = SAFE_PARSE(s);
       if (r.ok) return r.value;
       const e = new Error((r.error && r.error.message) || "host error");
       if (r.error) {
@@ -38,7 +121,14 @@ export const buildPreamble = (globals: CellGlobals): string => {
       throw e;
     });
   const effect = (name, args) => {
-    EFFECT(name, JSON.stringify(args === undefined ? null : args));
+    let payload = "";
+    try {
+      payload = snapshotJson(args === undefined ? null : args);
+    } catch {
+      // Still report invalid answer attempts so exactly-one counting cannot be
+      // bypassed. The host parses the impossible empty payload as invalid.
+    }
+    EFFECT(name, payload);
   };
   const makeContextRef = (d) => {
     if (!d || typeof d !== "object" || typeof d.id !== "string") return d;

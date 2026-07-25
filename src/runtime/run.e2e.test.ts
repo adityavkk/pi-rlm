@@ -320,7 +320,7 @@ describe("runProgram e2e", () => {
       {
         name: "undefined",
         code: "answer(undefined); 'missing'",
-        message: "answer value must be defined",
+        message: "answer value must be strict JSON",
       },
     ];
 
@@ -354,6 +354,58 @@ describe("runProgram e2e", () => {
       expect(committedCells[0]?.error).toEqual({ code: "INVALID_RESULT", message: entry.message });
       expect(committedCells[0]?.outputRef).toBeUndefined();
       expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+    }
+  });
+
+  test("forged and unsafe answer snapshots persist nothing and recover on the next cell", async () => {
+    const cases = [
+      {
+        name: "forged-undefined",
+        code: `JSON.stringify = () => '{"value":{"answer":"forged"}}'; JSON.parse = () => ({ value: { answer: "forged" } }); answer(undefined); 'invalid'`,
+      },
+      {
+        name: "cycle",
+        code: "const value = { answer: 'cycle' }; value.self = value; answer(value); 'invalid'",
+      },
+      {
+        name: "accessor",
+        code: `const value = {}; Object.defineProperty(value, "answer", { enumerable: true, get() { while (true) {} } }); answer(value); 'invalid'`,
+      },
+      {
+        name: "proxy",
+        code: `const value = new Proxy({}, { ownKeys() { while (true) {} } }); answer(value); 'invalid'`,
+      },
+    ];
+
+    for (const entry of cases) {
+      const seen: FrameState[] = [];
+      const cells: Cell[] = [
+        { reasoning: entry.name, code: entry.code },
+        { reasoning: "recover", code: `answer({ answer: '${entry.name}:fixed' }); 'recovered'` },
+      ];
+      let index = 0;
+      const controller: ControllerDriver = {
+        async next(state) { seen.push(state); return cells[index++] as Cell; },
+        fork() { return this; },
+      };
+      const dir = await tmp();
+      const result = await runProgram({
+        program: program(), sources: { context: "c" }, controller,
+        model: new MockModelClient(() => "unused"), backend, dir,
+        signal: new AbortController().signal,
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.answer).toEqual({ answer: `${entry.name}:fixed` });
+      expect(seen[1]?.trajectory.entries.at(-1)?.error).toMatchObject({
+        code: "INVALID_RESULT",
+        message: "answer value must be strict JSON",
+      });
+      const events = await journalEvents(dir);
+      const committedCells = events.filter((event) => event.type === "cell_committed");
+      expect(committedCells[0]?.outputRef).toBeUndefined();
+      expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
+      expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
     }
   });
 
