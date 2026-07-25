@@ -8,6 +8,7 @@ import {
   buildInlineRequest,
   captureCommandRequest,
   INLINE_SOURCE_MAX_BYTES,
+  SESSION_SOURCE_MAX_BYTES,
   SESSION_SOURCE_MAX_ENTRIES,
   SESSION_SOURCE_MAX_NODES,
 } from "./source.ts";
@@ -162,6 +163,34 @@ describe("strict source forms", () => {
     const result = await captureCommandRequest("--session -- Review", commandContext(process.cwd(), entries));
     expect(result).toMatchObject({ ok: false, error: { code: "RLM_SOURCE_LIMIT" } });
     expect(SESSION_SOURCE_MAX_NODES).toBe(50_000);
+  });
+
+  test("rejects the first of 10k repeated huge included blocks before visiting the second", async () => {
+    const huge = "x".repeat(SESSION_SOURCE_MAX_BYTES + 1);
+    const block = { type: "text", text: huge };
+    const blocks = Array(SESSION_SOURCE_MAX_ENTRIES).fill(block);
+    let secondVisited = false;
+    Object.defineProperty(blocks, 1, { get() { secondVisited = true; return block; } });
+    const result = await captureCommandRequest("--session -- Review", commandContext(process.cwd(), [
+      { type: "message", message: { role: "user", content: blocks } },
+    ]));
+    expect(result).toMatchObject({ ok: false, error: { code: "RLM_SOURCE_LIMIT" } });
+    expect(secondVisited).toBe(false);
+  });
+
+  test("enforces the shared UTF-8 budget at a multibyte boundary", async () => {
+    const labelBytes = Buffer.byteLength("[user]\n", "utf8");
+    const exact = `${"x".repeat(SESSION_SOURCE_MAX_BYTES - labelBytes - 2)}é`;
+    const accepted = await captureCommandRequest("--session -- Review", commandContext(process.cwd(), [
+      { type: "message", message: { role: "user", content: exact } },
+    ]));
+    expect(accepted.ok && Buffer.byteLength(accepted.value.sources["context"]!, "utf8"))
+      .toBe(SESSION_SOURCE_MAX_BYTES);
+
+    const over = `${"x".repeat(SESSION_SOURCE_MAX_BYTES - labelBytes - 1)}é`;
+    expect(await captureCommandRequest("--session -- Review", commandContext(process.cwd(), [
+      { type: "message", message: { role: "user", content: over } },
+    ]))).toMatchObject({ ok: false, error: { code: "RLM_SOURCE_LIMIT" } });
   });
 });
 

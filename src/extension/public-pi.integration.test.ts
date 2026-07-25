@@ -1,25 +1,15 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  createAgentSession,
-  DefaultResourceLoader,
-  SessionManager,
-  SettingsManager,
+  type AgentSessionEvent,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { createLedger } from "../core/budget.ts";
-import { DEFAULT_PROFILE, resolveLimits, type RunResult } from "../runtime/index.ts";
-import { createRlmExtension } from "../../index.ts";
-import type { LaunchRequest } from "./source.ts";
-
-const result: RunResult = {
-  runId: `run_${"1".repeat(64)}`,
-  status: "failed",
-  error: { code: "OFFLINE_FIXTURE", message: "credential-free public Pi fixture completed" },
-  ledger: createLedger(resolveLimits(DEFAULT_PROFILE, 0)),
-};
+import {
+  createPublicRuntimeFixture,
+  PUBLIC_FIXTURE_COMMAND,
+} from "./testing/public-runtime.ts";
 
 const ui = {
   setStatus() {},
@@ -27,57 +17,208 @@ const ui = {
   confirm: async () => true,
 } as unknown as ExtensionUIContext;
 
-/** Public AgentSession/ExtensionRunner acceptance, not a hand-built ExtensionContext. */
+type BoundMode = "tui" | "rpc" | "json" | "print";
+interface ObservedMessageEvent {
+  readonly type: "message_start" | "message_end";
+  readonly message: {
+    readonly role: string;
+    readonly customType?: string;
+    readonly content?: unknown;
+  };
+}
+const observedMessage = (event: AgentSessionEvent): ObservedMessageEvent | undefined =>
+  event.type === "message_start" || event.type === "message_end"
+    ? event as unknown as ObservedMessageEvent
+    : undefined;
+const isRlmMessageEvent = (
+  event: AgentSessionEvent,
+  type: "message_start" | "message_end",
+): boolean => {
+  const observed = observedMessage(event);
+  return observed?.type === type
+    && observed.message.role === "custom"
+    && observed.message.customType === "pi-rlm-result";
+};
+const messageContent = (event: AgentSessionEvent): unknown => observedMessage(event)?.message.content;
+
+const isolatedEnv = (root: string): Record<string, string> => ({
+  HOME: join(root, "home"),
+  XDG_CONFIG_HOME: join(root, "config"),
+  XDG_STATE_HOME: join(root, "state"),
+  XDG_CACHE_HOME: join(root, "cache"),
+  PATH: process.env["PATH"] ?? "",
+  NO_COLOR: "1",
+});
+
+const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
+
+const runPrintFixture = async (mode: "text" | "json") => {
+  const root = await mkdtemp(join(tmpdir(), `pi-rlm-${mode}-mode-`));
+  const statePath = join(root, "entries.json");
+  try {
+    const process = Bun.spawn(["bun", fixturePath, mode, root, statePath], {
+      cwd: root,
+      env: isolatedEnv(root),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(process.stdout).text(),
+      new Response(process.stderr).text(),
+      process.exited,
+    ]);
+    const entries = JSON.parse(await readFile(statePath, "utf8")) as Array<Record<string, unknown>>;
+    return { stdout, stderr, exitCode, entries };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+};
+
+/** Public AgentSession/ExtensionRunner acceptance. No hand-built ExtensionContext. */
 describe("public Pi SDK extension integration", () => {
   test.each(["tui", "rpc", "json", "print"] as const)(
-    "%s recognizes /rlm, captures source, and appends one custom result message",
-    async (mode) => {
+    "%s emits one observable custom result lifecycle and one session entry",
+    async (mode: BoundMode) => {
       const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-${mode}-`));
-      const settingsManager = SettingsManager.inMemory();
-      const sessionManager = SessionManager.inMemory(root);
-      const captured: LaunchRequest[] = [];
-      const loader = new DefaultResourceLoader({
-        cwd: root,
-        agentDir: join(root, "agent"),
-        settingsManager,
-        extensionFactories: [{
-          name: `pi-rlm-${mode}`,
-          factory: createRlmExtension({
-            executeRun: async (request) => {
-              captured.push(request);
-              return result;
-            },
-            createId: () => `public-${mode}`,
-          }),
-        }],
-      });
-      await loader.reload();
-      const { session } = await createAgentSession({
-        cwd: root,
-        agentDir: join(root, "agent"),
-        resourceLoader: loader,
-        sessionManager,
-        settingsManager,
-        noTools: "all",
+      const { runtime, sessionManager, captured } = await createPublicRuntimeFixture(root);
+      const events: AgentSessionEvent[] = [];
+      let resolveEnd!: () => void;
+      const ended = new Promise<void>((resolve) => { resolveEnd = resolve; });
+      const unsubscribe = runtime.session.subscribe((event) => {
+        events.push(event);
+        if (isRlmMessageEvent(event, "message_end")) resolveEnd();
       });
       try {
-        await session.bindExtensions({ mode, uiContext: ui });
-        await session.prompt('/rlm {"objective":"Public adapter","context":"exact public source"}', {
+        await runtime.session.bindExtensions({ mode, uiContext: ui });
+        await runtime.session.prompt(PUBLIC_FIXTURE_COMMAND, {
           source: mode === "rpc" ? "rpc" : "interactive",
         });
-        for (let attempt = 0; attempt < 20 && sessionManager.getEntries()
-          .filter((entry) => entry.type === "custom_message" && entry.customType === "pi-rlm-result").length === 0; attempt++)
-          await Promise.resolve();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            ended,
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(() => reject(new Error("custom message_end timeout")), 1_000);
+            }),
+          ]);
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
 
         expect(captured).toHaveLength(1);
         expect(captured[0]?.sources).toEqual({ context: "exact public source" });
-        const messages = sessionManager.getEntries().filter((entry) =>
+        const starts = events.filter((event) => isRlmMessageEvent(event, "message_start"));
+        const ends = events.filter((event) => isRlmMessageEvent(event, "message_end"));
+        expect(starts).toHaveLength(1);
+        expect(ends).toHaveLength(1);
+        expect(messageContent(starts[0]!)).toBe(messageContent(ends[0]!));
+        expect(messageContent(starts[0]!)).toContain("OFFLINE_FIXTURE");
+        const entries = sessionManager.getEntries().filter((entry) =>
           entry.type === "custom_message" && entry.customType === "pi-rlm-result");
-        expect(messages).toHaveLength(1);
-        expect(messages[0]?.type === "custom_message" && messages[0].content).toContain("OFFLINE_FIXTURE");
+        expect(entries).toHaveLength(1);
+        expect(messageContent(starts[0]!)).toBe(entries[0]?.type === "custom_message" && entries[0].content);
       } finally {
-        session.dispose();
+        unsubscribe();
+        // InteractiveMode owns terminal teardown; this headless binding owns only
+        // the public AgentSession/ExtensionRunner lifecycle.
+        if (mode === "tui") runtime.session.dispose();
+        else await runtime.dispose();
+        await rm(root, { recursive: true, force: true });
       }
     },
   );
+
+  test.each(["text", "json"] as const)("actual runPrintMode %s adapter output is captured", async (mode) => {
+    const result = await runPrintFixture(mode);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const entries = result.entries.filter((entry) =>
+      entry["type"] === "custom_message" && entry["customType"] === "pi-rlm-result");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.["content"]).toContain("OFFLINE_FIXTURE");
+    if (mode === "text") {
+      // Pi's text adapter prints only a final assistant message, not custom command messages.
+      expect(result.stdout).toBe("");
+    } else {
+      const output = result.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as AgentSessionEvent);
+      const starts = output.filter((event) => isRlmMessageEvent(event, "message_start"));
+      const ends = output.filter((event) => isRlmMessageEvent(event, "message_end"));
+      expect(starts).toHaveLength(1);
+      expect(ends).toHaveLength(1);
+      expect(messageContent(starts[0]!)).toBe(messageContent(ends[0]!));
+    }
+  });
+
+  test("actual runRpcMode uses public JSON stdin/stdout and shuts down on stdin end", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-rpc-mode-"));
+    const process = Bun.spawn(["bun", fixturePath, "rpc", root], {
+      cwd: root,
+      env: isolatedEnv(root),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const events: Array<Record<string, any>> = [];
+    const stderr = new Response(process.stderr).text();
+    const reader = process.stdout.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let requestedEntries = false;
+    let receivedEntries = false;
+    const send = async (value: unknown): Promise<void> => {
+      process.stdin.write(`${JSON.stringify(value)}\n`);
+      await process.stdin.flush();
+    };
+    await send({ id: "prompt", type: "prompt", message: PUBLIC_FIXTURE_COMMAND });
+    const readOutput = async (): Promise<void> => {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        let newline: number;
+        while ((newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline);
+          pending = pending.slice(newline + 1);
+          if (!line) continue;
+          const event = JSON.parse(line) as Record<string, any>;
+          events.push(event);
+          if (!requestedEntries && event["type"] === "message_end"
+            && event["message"]?.role === "custom"
+            && event["message"]?.customType === "pi-rlm-result") {
+            requestedEntries = true;
+            await send({ id: "entries", type: "get_entries" });
+          }
+          if (event["type"] === "response" && event["id"] === "entries") {
+            receivedEntries = true;
+            process.stdin.end();
+          }
+        }
+      }
+    };
+    try {
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => {
+        process.kill();
+        reject(new Error("runRpcMode shutdown timeout"));
+      }, 3_000));
+      await Promise.race([Promise.all([readOutput(), process.exited]), timeout]);
+      expect(await stderr).toBe("");
+      expect(process.exitCode).toBe(0);
+      expect(requestedEntries).toBe(true);
+      expect(receivedEntries).toBe(true);
+      const starts = events.filter((event) => event["type"] === "message_start"
+        && event["message"]?.role === "custom" && event["message"]?.customType === "pi-rlm-result");
+      const ends = events.filter((event) => event["type"] === "message_end"
+        && event["message"]?.role === "custom" && event["message"]?.customType === "pi-rlm-result");
+      expect(starts).toHaveLength(1);
+      expect(ends).toHaveLength(1);
+      expect(starts[0]?.["message"]?.content).toBe(ends[0]?.["message"]?.content);
+      const response = events.find((event) => event["type"] === "response" && event["id"] === "entries");
+      const entries = response?.["data"]?.entries.filter((entry: Record<string, unknown>) =>
+        entry["type"] === "custom_message" && entry["customType"] === "pi-rlm-result");
+      expect(entries).toHaveLength(1);
+    } finally {
+      if (process.exitCode === null) process.kill();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -52,3 +52,45 @@ test ! -e "$fixture/node_modules/pi-rlm/node_modules/@earendil-works/pi-coding-a
     console.log("packed install/import smoke passed");
   '
 )
+
+# Resolve the installed extension through its public Pi package manifest, then
+# ask Pi's public JSON adapter to execute a provider-free missing-source command.
+manifest="$fixture/node_modules/pi-rlm/package.json"
+extension_path=$(node - "$manifest" <<'NODE'
+const path = require("node:path");
+const manifestPath = process.argv[2];
+const manifest = require(manifestPath);
+const extensions = manifest.pi?.extensions;
+if (!Array.isArray(extensions) || extensions.length !== 1 || typeof extensions[0] !== "string")
+  throw new Error("installed pi.extensions manifest is invalid");
+process.stdout.write(path.resolve(path.dirname(manifestPath), extensions[0]));
+NODE
+)
+smoke_home="$tmp_dir/home"
+smoke_output="$tmp_dir/pi-output.jsonl"
+mkdir -p "$smoke_home" "$tmp_dir/config" "$tmp_dir/state" "$tmp_dir/cache"
+(
+  cd "$fixture"
+  HOME="$smoke_home" \
+  XDG_CONFIG_HOME="$tmp_dir/config" \
+  XDG_STATE_HOME="$tmp_dir/state" \
+  XDG_CACHE_HOME="$tmp_dir/cache" \
+  NO_COLOR=1 \
+    "$fixture/node_modules/.bin/pi" --mode json -e "$extension_path" "/rlm" > "$smoke_output"
+)
+node - "$smoke_output" <<'NODE'
+const fs = require("node:fs");
+const path = process.argv[2];
+const raw = fs.readFileSync(path, "utf8");
+if (Buffer.byteLength(raw, "utf8") > 128 * 1024) throw new Error("packed Pi output was not bounded");
+const records = raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+const messages = records.filter((record) =>
+  (record.type === "message_start" || record.type === "message_end")
+  && record.message?.role === "custom"
+  && record.message?.customType === "pi-rlm-result");
+if (messages.length !== 2) throw new Error("packed Pi command did not emit one custom-message lifecycle");
+if (!messages.every((record) => typeof record.message.content === "string"
+  && record.message.content.includes("RLM_SOURCE_REQUIRED")))
+  throw new Error("packed Pi command did not expose RLM_SOURCE_REQUIRED");
+console.log("packed Pi discovery/command smoke passed");
+NODE

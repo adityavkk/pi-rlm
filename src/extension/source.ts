@@ -282,41 +282,74 @@ class SessionTraversal {
   }
 }
 
-const textualContent = (content: unknown, traversal: SessionTraversal): string => {
-  if (typeof content === "string") return content;
-  const text: string[] = [];
+class SessionTextProjection {
+  private context = "";
+  private bytes = 0;
+
+  constructor(private readonly signal?: AbortSignal) {}
+
+  private measure(value: string, remaining: number): number {
+    throwIfAborted(this.signal);
+    // UTF-8 bytes are never fewer than UTF-16 code units. Reject oversized
+    // references without asking Buffer to scan them.
+    if (value.length > remaining) throw new SessionSourceLimitError("session byte limit");
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes > remaining) throw new SessionSourceLimitError("session byte limit");
+    return bytes;
+  }
+
+  appendText(label: readonly string[], value: string, continued = false): boolean {
+    const remaining = SESSION_SOURCE_MAX_BYTES - this.bytes;
+    // Measure source text before trim, label creation, or concatenation. A huge
+    // first block therefore fails without visiting later repeated references.
+    const valueBytes = this.measure(value, remaining);
+    if (!value.trim()) return false;
+    const prefix = continued
+      ? ["\n"]
+      : [...(this.context ? ["\n\n"] : []), ...label, "\n"];
+    let prefixBytes = 0;
+    for (const part of prefix)
+      prefixBytes += this.measure(part, remaining - valueBytes - prefixBytes);
+    // One global counter is charged before any included string is retained.
+    this.bytes += prefixBytes + valueBytes;
+    for (const part of prefix) this.context += part;
+    this.context += value;
+    return true;
+  }
+
+  value(): string {
+    return this.context;
+  }
+}
+
+const appendTextualContent = (
+  content: unknown,
+  traversal: SessionTraversal,
+  projection: SessionTextProjection,
+  label: readonly string[],
+): void => {
+  if (typeof content === "string") {
+    projection.appendText(label, content);
+    return;
+  }
+  let continued = false;
   traversal.array(content, SESSION_SOURCE_MAX_ENTRIES, (block) => {
     // array() charged this content block even when it is excluded below.
     if (!traversal.record(block)) return;
     const type = traversal.own(block, "type");
     if (type !== "text") return;
     const value = traversal.own(block, "text");
-    if (typeof value === "string") text.push(value);
+    if (typeof value === "string" && projection.appendText(label, value, continued)) continued = true;
   });
-  return text.join("\n");
 };
 
 const projectSession = (ctx: ExtensionContext, signal?: AbortSignal): SourceResult => {
   try {
     throwIfAborted(signal);
     const traversal = new SessionTraversal(signal);
+    const projection = new SessionTextProjection(signal);
     const rawEntries = ctx.sessionManager.buildContextEntries();
     traversal.touch(rawEntries); // Reject a root Proxy before Array.isArray or descriptor access.
-    const parts: string[] = [];
-    let bytes = 0;
-    const add = (label: string, text: string): void => {
-      throwIfAborted(signal);
-      if (!text.trim()) return;
-      const separatorBytes = parts.length === 0 ? 0 : 2;
-      if (label.length + text.length > SESSION_SOURCE_MAX_BYTES - bytes - separatorBytes)
-        throw new SessionSourceLimitError("session byte limit");
-      const part = `${label}\n${text}`;
-      const partBytes = Buffer.byteLength(part, "utf8");
-      if (partBytes > SESSION_SOURCE_MAX_BYTES - bytes - separatorBytes)
-        throw new SessionSourceLimitError("session byte limit");
-      parts.push(part);
-      bytes += separatorBytes + partBytes;
-    };
     traversal.array(rawEntries, SESSION_SOURCE_MAX_ENTRIES, (entry) => {
       // array() charged this entry before any descriptor access, including excluded entries.
       const type = traversal.own(entry, "type");
@@ -324,21 +357,26 @@ const projectSession = (ctx: ExtensionContext, signal?: AbortSignal): SourceResu
         const message = traversal.own(entry, "message");
         const role = traversal.own(message, "role");
         if (role !== "user" && role !== "assistant") return;
-        add(`[${role}]`, textualContent(traversal.own(message, "content"), traversal));
+        appendTextualContent(traversal.own(message, "content"), traversal, projection, [`[${role}]`]);
       } else if (type === "compaction") {
         const summary = traversal.own(entry, "summary");
-        if (typeof summary === "string") add("[compaction]", summary);
+        if (typeof summary === "string") projection.appendText(["[compaction]"], summary);
       } else if (type === "branch_summary") {
         const summary = traversal.own(entry, "summary");
-        if (typeof summary === "string") add("[branch-summary]", summary);
+        if (typeof summary === "string") projection.appendText(["[branch-summary]"], summary);
       } else if (type === "custom_message") {
         const customType = traversal.own(entry, "customType");
         if (typeof customType !== "string") throw new SessionSourceInvalidError("invalid custom type");
-        add(`[custom:${customType}]`, textualContent(traversal.own(entry, "content"), traversal));
+        appendTextualContent(
+          traversal.own(entry, "content"),
+          traversal,
+          projection,
+          ["[custom:", customType, "]"],
+        );
       }
     });
-    const context = parts.join("\n\n");
-    if (!context.trim()) return failure("RLM_SOURCE_REQUIRED", "The active session branch has no eligible text source.");
+    const context = projection.value();
+    if (!context) return failure("RLM_SOURCE_REQUIRED", "The active session branch has no eligible text source.");
     const compiled = compileShorthand({ objective: "placeholder" });
     if (!compiled.ok) throw new Error("shorthand invariant");
     return { ok: true, value: { program: compiled.value, sources: Object.freeze({ context }) } };
