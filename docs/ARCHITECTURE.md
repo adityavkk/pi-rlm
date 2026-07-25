@@ -44,8 +44,9 @@ Core (`src/core`, pure):
 Shell (`src/shell`, effects):
 
 - `hash.ts`, `clock.ts` sha256 and an injectable clock.
-- `context-store.ts` content-addressed snapshots with read, lines, grep, chunk,
-  derive, and concat.
+- `context-store.ts` content-addressed snapshots with profile-bounded read, lines,
+  literal grep, and chunk operations, plus derive and concat. Regex/RE2 syntax is
+  deferred in v1 rather than emulated with host `RegExp`.
 - `interpreter/backend.ts` the backend protocol.
 - `interpreter/preamble.ts` the guest globals and DSL shims.
 - `interpreter/quickjs.ts` the QuickJS backend (bun-safe async bridge).

@@ -44,5 +44,6 @@ export interface RunState {
   readonly callCache: Map<string, GuestCallResult>;
   readonly inflight: Map<string, Promise<GuestCallResult>>;
   readonly semaphore: Semaphore;
+  readonly contextSemaphore: Semaphore;
   readonly frameSeq: { current: number };
 }

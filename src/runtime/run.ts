@@ -19,7 +19,7 @@ import type { ModelClient } from "../shell/model/client.ts";
 import type { ControllerDriver } from "./controller.ts";
 import type { Extractor } from "./extractor.ts";
 import { runFrame } from "./frame.ts";
-import { DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
+import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, RunState } from "./state.ts";
 
@@ -55,7 +55,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
 
   const runId = `run_${sha256(`${startMs}:${input.program.objective}:${identityHash(sha256, programIdentity(input.program))}`).slice(0, 16)}`;
 
-  const store = new ContextStore(input.dir);
+  const store = new ContextStore(input.dir, contextStoreLimits(profile));
   const inputs: Record<string, ContextDescriptor> = {};
   for (const declared of input.program.inputs) {
     const text = input.sources[declared.name] ?? "";
@@ -95,6 +95,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     callCache: new Map(),
     inflight: new Map(),
     semaphore: new Semaphore(profile.maxConcurrency),
+    contextSemaphore: new Semaphore(1),
     frameSeq: { current: 1 },
   };
 

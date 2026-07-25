@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonValue } from "../core/json.ts";
 import { canonicalStringify } from "../core/json.ts";
-import { byteLength, headTailPreview } from "../core/preview.ts";
+import { headTailPreview } from "../core/preview.ts";
 import { sha256 } from "./hash.ts";
 
 const encoder = new TextEncoder();
@@ -45,6 +45,30 @@ export interface ContextMatch {
   readonly contextId: string;
 }
 
+export interface ContextStoreLimits {
+  readonly maxReadBytes: number;
+  readonly maxLines: number;
+  readonly maxLineBytes: number;
+  readonly maxMatches: number;
+  readonly maxChunks: number;
+  readonly maxPatternBytes: number;
+}
+
+export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
+  maxReadBytes: 1024 * 1024,
+  maxLines: 10_000,
+  maxLineBytes: 64 * 1024,
+  maxMatches: 1_000,
+  maxChunks: 256,
+  maxPatternBytes: 4 * 1024,
+};
+
+/** Optional composition points for broker deadlines and storage preflights. */
+export interface ContextOperationControl {
+  readonly checkpoint?: () => void;
+  readonly maxOutputBytes?: number;
+}
+
 interface Entry {
   readonly descriptor: ContextDescriptor;
   readonly bytesArray: Uint8Array;
@@ -66,31 +90,57 @@ const backwardBoundary = (bytes: Uint8Array, index: number): number => {
   return i;
 };
 
-interface ByteLine {
-  readonly start: number;
-  readonly end: number;
-}
+const CHECKPOINT_INTERVAL_BYTES = 16 * 1024;
 
-const byteLines = (bytes: Uint8Array): ByteLine[] => {
-  const lines: ByteLine[] = [];
-  let start = 0;
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] !== 0x0a) continue;
-    const end = i > start && bytes[i - 1] === 0x0d ? i - 1 : i;
-    lines.push({ start, end });
-    start = i + 1;
+const boundedInteger = (value: unknown, name: string, min: number, max: number): number => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max)
+    throw new ContextSpecError(`${name} must be an integer between ${min} and ${max}`);
+  return value;
+};
+
+const validateLimits = (limits: ContextStoreLimits): ContextStoreLimits => {
+  const validated = {
+    maxReadBytes: boundedInteger(limits.maxReadBytes, "maxReadBytes", 4, Number.MAX_SAFE_INTEGER),
+    maxLines: boundedInteger(limits.maxLines, "maxLines", 1, Number.MAX_SAFE_INTEGER),
+    maxLineBytes: boundedInteger(limits.maxLineBytes, "maxLineBytes", 1, Number.MAX_SAFE_INTEGER),
+    maxMatches: boundedInteger(limits.maxMatches, "maxMatches", 1, Number.MAX_SAFE_INTEGER),
+    maxChunks: boundedInteger(limits.maxChunks, "maxChunks", 1, Number.MAX_SAFE_INTEGER),
+    maxPatternBytes: boundedInteger(limits.maxPatternBytes, "maxPatternBytes", 1, Number.MAX_SAFE_INTEGER),
+  };
+  if (validated.maxLineBytes > validated.maxReadBytes)
+    throw new ContextSpecError("maxLineBytes must not exceed maxReadBytes");
+  if (validated.maxPatternBytes > validated.maxReadBytes)
+    throw new ContextSpecError("maxPatternBytes must not exceed maxReadBytes");
+  return validated;
+};
+
+const checkpoint = (control: ContextOperationControl | undefined, offset = 0): void => {
+  if (offset % CHECKPOINT_INTERVAL_BYTES === 0) control?.checkpoint?.();
+};
+
+const findByte = (
+  bytes: Uint8Array,
+  value: number,
+  start: number,
+  end: number,
+  control?: ContextOperationControl,
+): number => {
+  for (let i = start; i < end; i++) {
+    checkpoint(control, i);
+    if (bytes[i] === value) return i;
   }
-  lines.push({ start, end: bytes.length });
-  return lines;
+  return -1;
 };
 
 export class ContextStore {
   private readonly entries = new Map<string, Entry>();
   private readonly contentDir: string;
+  private readonly limits: ContextStoreLimits;
   private uniqueBytes = 0;
 
-  constructor(private readonly dir: string) {
+  constructor(private readonly dir: string, limits: ContextStoreLimits = DEFAULT_CONTEXT_STORE_LIMITS) {
     this.contentDir = join(dir, "contexts");
+    this.limits = validateLimits(limits);
   }
 
   private makeId(sha: string): string {
@@ -142,90 +192,176 @@ export class ContextStore {
     return entry;
   }
 
-  read(id: string, options: { offsetBytes?: number; lengthBytes?: number } = {}): ContextRead {
+  read(
+    id: string,
+    options: { offsetBytes?: number; lengthBytes?: number } = {},
+    control?: ContextOperationControl,
+  ): ContextRead {
     const { bytesArray } = this.entryOrThrow(id);
-    const start = forwardBoundary(bytesArray, Math.max(0, options.offsetBytes ?? 0));
-    const rawEnd = options.lengthBytes === undefined ? bytesArray.length : start + options.lengthBytes;
-    const end = Math.max(start, backwardBoundary(bytesArray, Math.min(rawEnd, bytesArray.length)));
-    return {
-      text: decoder.decode(bytesArray.subarray(start, end)),
-      startByte: start,
-      endByte: end,
-      truncated: end < bytesArray.length,
-    };
+    const offset = options.offsetBytes === undefined
+      ? 0
+      : boundedInteger(options.offsetBytes, "offsetBytes", 0, Number.MAX_SAFE_INTEGER);
+    const length = options.lengthBytes === undefined
+      ? this.limits.maxReadBytes
+      : boundedInteger(options.lengthBytes, "lengthBytes", 0, this.limits.maxReadBytes);
+    control?.checkpoint?.();
+    const start = forwardBoundary(bytesArray, offset);
+    const end = Math.max(start, backwardBoundary(bytesArray, Math.min(bytesArray.length, start + length)));
+    const text = decoder.decode(bytesArray.subarray(start, end));
+    control?.checkpoint?.();
+    return { text, startByte: start, endByte: end, truncated: end < bytesArray.length };
   }
 
   /**
    * Return a 1-based line window with half-open UTF-8 byte offsets. LF and CRLF
    * delimiters are excluded from the last selected line; delimiters between
    * selected lines retain their original bytes. A trailing delimiter creates a
-   * final empty line. Requests below line 1 clamp to it; requests past the last
-   * line return an empty slice at EOF.
+   * final empty line. Invalid bounds are rejected; requests past the last line
+   * return an empty slice at EOF.
    */
-  lines(id: string, options: { startLine: number; count: number }): ContextRead {
+  lines(
+    id: string,
+    options: { startLine: number; count: number },
+    control?: ContextOperationControl,
+  ): ContextRead {
     const { bytesArray } = this.entryOrThrow(id);
-    const lines = byteLines(bytesArray);
-    const requestedStart = Math.trunc(options.startLine) || 1;
-    const startIndex = Math.min(lines.length, Math.max(0, requestedStart - 1));
-    const count = Math.max(0, Math.trunc(options.count) || 0);
-    const endIndex = Math.min(lines.length, startIndex + count);
-    const startByte = lines[startIndex]?.start ?? bytesArray.length;
-    const endByte = count > 0 ? (lines[endIndex - 1]?.end ?? startByte) : startByte;
-    return {
-      text: decoder.decode(bytesArray.subarray(startByte, endByte)),
-      startByte,
-      endByte,
-      truncated: endIndex < lines.length,
-    };
+    const startLine = boundedInteger(options.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER);
+    const count = boundedInteger(options.count, "count", 1, this.limits.maxLines);
+
+    let currentLine = 1;
+    let startByte = 0;
+    while (currentLine < startLine) {
+      const newline = findByte(bytesArray, 0x0a, startByte, bytesArray.length, control);
+      if (newline === -1)
+        return { text: "", startByte: bytesArray.length, endByte: bytesArray.length, truncated: false };
+      startByte = newline + 1;
+      currentLine++;
+    }
+
+    let lineStart = startByte;
+    let endByte = startByte;
+    for (let selected = 0; selected < count; selected++) {
+      const newline = findByte(bytesArray, 0x0a, lineStart, bytesArray.length, control);
+      const rawEnd = newline === -1 ? bytesArray.length : newline;
+      const lineEnd = rawEnd > lineStart && bytesArray[rawEnd - 1] === 0x0d ? rawEnd - 1 : rawEnd;
+      const lineBytes = lineEnd - lineStart;
+      if (lineBytes > this.limits.maxLineBytes)
+        throw new ContextSpecError(`line ${currentLine + selected} exceeds maxLineBytes ${this.limits.maxLineBytes}`);
+      endByte = lineEnd;
+      if (endByte - startByte > this.limits.maxReadBytes)
+        throw new ContextSpecError(`line window exceeds maxReadBytes ${this.limits.maxReadBytes}`);
+      if (newline === -1 || selected + 1 === count) {
+        const text = decoder.decode(bytesArray.subarray(startByte, endByte));
+        control?.checkpoint?.();
+        return { text, startByte, endByte, truncated: newline !== -1 };
+      }
+      lineStart = newline + 1;
+    }
+
+    throw new ContextSpecError("invalid line window");
   }
 
   grep(
     id: string,
-    options: { pattern: string; caseSensitive?: boolean; maxMatches: number; syntax?: "literal" | "re2" },
+    options: { pattern: string; caseSensitive?: boolean; maxMatches: number; syntax?: "literal" },
+    control?: ContextOperationControl,
   ): ContextMatch[] {
     const { bytesArray } = this.entryOrThrow(id);
-    const full = decoder.decode(bytesArray);
-    const lines = full.split("\n");
-    const matcher =
-      options.syntax === "re2"
-        ? new RegExp(options.pattern, options.caseSensitive ? "" : "i")
-        : undefined;
-    const needle = options.caseSensitive ? options.pattern : options.pattern.toLowerCase();
+    if (typeof options.pattern !== "string") throw new ContextSpecError("pattern must be a string");
+    const patternBytes = encoder.encode(options.pattern).length;
+    if (patternBytes > this.limits.maxPatternBytes)
+      throw new ContextSpecError(`pattern exceeds maxPatternBytes ${this.limits.maxPatternBytes}`);
+    if (options.caseSensitive !== undefined && typeof options.caseSensitive !== "boolean")
+      throw new ContextSpecError("caseSensitive must be a boolean");
+    if (options.syntax !== undefined && options.syntax !== "literal")
+      throw new ContextSpecError(`grep syntax ${JSON.stringify(options.syntax)} is unsupported in v1; use literal syntax`);
+    const maxMatches = boundedInteger(options.maxMatches, "maxMatches", 1, this.limits.maxMatches);
+    const caseSensitive = options.caseSensitive === true;
+    const needle = caseSensitive ? options.pattern : options.pattern.toLowerCase();
     const matches: ContextMatch[] = [];
-    let byteCursor = 0;
-    for (let i = 0; i < lines.length && matches.length < options.maxMatches; i++) {
-      const line = lines[i] as string;
-      const hit = matcher ? matcher.test(line) : (options.caseSensitive ? line : line.toLowerCase()).includes(needle);
-      if (hit) matches.push({ text: line, line: i + 1, startByte: byteCursor, contextId: id });
-      byteCursor += byteLength(line) + 1;
+    let returnedBytes = 0;
+    let lineStart = 0;
+    let lineNumber = 1;
+
+    while (lineStart <= bytesArray.length && matches.length < maxMatches) {
+      const newline = findByte(bytesArray, 0x0a, lineStart, bytesArray.length, control);
+      const lineEnd = newline === -1 ? bytesArray.length : newline;
+      const lineBytes = lineEnd - lineStart;
+      if (lineBytes > this.limits.maxLineBytes)
+        throw new ContextSpecError(`line ${lineNumber} exceeds maxLineBytes ${this.limits.maxLineBytes}`);
+      const text = decoder.decode(bytesArray.subarray(lineStart, lineEnd));
+      const hit = (caseSensitive ? text : text.toLowerCase()).includes(needle);
+      if (hit) {
+        returnedBytes += lineBytes;
+        if (returnedBytes > this.limits.maxReadBytes)
+          throw new ContextSpecError(`grep results exceed maxReadBytes ${this.limits.maxReadBytes}`);
+        matches.push({ text, line: lineNumber, startByte: lineStart, contextId: id });
+      }
+      if (newline === -1) break;
+      lineStart = newline + 1;
+      lineNumber++;
     }
+    control?.checkpoint?.();
     return matches;
   }
 
   async chunks(
     id: string,
     options: { targetTokens: number; overlapTokens?: number; maxChunks: number; boundary?: "line" | "none" },
+    control?: ContextOperationControl,
   ): Promise<ContextDescriptor[]> {
     const { bytesArray, descriptor } = this.entryOrThrow(id);
-    const full = decoder.decode(bytesArray);
-    const targetChars = Math.max(1, options.targetTokens * 4);
-    const overlapChars = Math.max(0, (options.overlapTokens ?? 0) * 4);
-    const step = Math.max(1, targetChars - overlapChars);
-    const pieces: string[] = [];
-    for (let start = 0; start < full.length; start += step) {
-      let end = Math.min(full.length, start + targetChars);
-      if (options.boundary === "line" && end < full.length) {
-        const nextNewline = full.indexOf("\n", end);
-        if (nextNewline !== -1 && nextNewline - end < targetChars) end = nextNewline + 1;
+    const maxTargetTokens = Math.floor(this.limits.maxReadBytes / 4);
+    const targetTokens = boundedInteger(options.targetTokens, "targetTokens", 1, maxTargetTokens);
+    const overlapTokens = options.overlapTokens === undefined
+      ? 0
+      : boundedInteger(options.overlapTokens, "overlapTokens", 1, targetTokens - 1);
+    const maxChunks = boundedInteger(options.maxChunks, "maxChunks", 1, this.limits.maxChunks);
+    if (options.boundary !== undefined && options.boundary !== "line" && options.boundary !== "none")
+      throw new ContextSpecError('boundary must be "line" or "none"');
+    const maxOutputBytes = control?.maxOutputBytes === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
+    const targetBytes = targetTokens * 4;
+    const stepBytes = targetBytes - overlapTokens * 4;
+    const ranges: Array<{ start: number; end: number }> = [];
+    let outputBytes = 0;
+
+    // Preflight count and output bytes without decoding or materializing chunks.
+    for (let rawStart = 0; rawStart < bytesArray.length; rawStart += stepBytes) {
+      if (ranges.length >= maxChunks) throw new ContextChunkOverflowError(maxChunks + 1, maxChunks);
+      const start = forwardBoundary(bytesArray, rawStart);
+      let end = backwardBoundary(bytesArray, Math.min(bytesArray.length, rawStart + targetBytes));
+      if (options.boundary === "line" && end < bytesArray.length) {
+        const newline = findByte(
+          bytesArray,
+          0x0a,
+          end,
+          Math.min(bytesArray.length, end + targetBytes),
+          control,
+        );
+        if (newline !== -1) end = newline + 1;
       }
-      pieces.push(full.slice(start, end));
-      if (end >= full.length) break;
+      if (end <= start) throw new ContextSpecError("chunk options do not make forward progress");
+      const pieceBytes = end - start;
+      if (pieceBytes > this.limits.maxReadBytes)
+        throw new ContextSpecError(`chunk exceeds maxReadBytes ${this.limits.maxReadBytes}`);
+      if (outputBytes > maxOutputBytes - pieceBytes)
+        throw new ContextSpecError(`chunk output exceeds available stored bytes ${maxOutputBytes}`);
+      outputBytes += pieceBytes;
+      ranges.push({ start, end });
+      if (end >= bytesArray.length) break;
+      control?.checkpoint?.();
     }
-    if (pieces.length > options.maxChunks)
-      throw new ContextChunkOverflowError(pieces.length, options.maxChunks);
+
     const out: ContextDescriptor[] = [];
-    for (let i = 0; i < pieces.length; i++)
-      out.push(await this.intern(`${descriptor.label}#chunk${i + 1}`, pieces[i] as string, descriptor.mimeType));
+    for (let i = 0; i < ranges.length; i++) {
+      control?.checkpoint?.();
+      const range = ranges[i] as { start: number; end: number };
+      const piece = decoder.decode(bytesArray.subarray(range.start, range.end));
+      out.push(await this.intern(`${descriptor.label}#chunk${i + 1}`, piece, descriptor.mimeType));
+    }
+    control?.checkpoint?.();
     return out;
   }
 
@@ -266,10 +402,17 @@ export class ContextUnavailableError extends Error {
   }
 }
 
-export class ContextChunkOverflowError extends Error {
+export class ContextSpecError extends Error {
   readonly code = "INVALID_SPEC";
+  constructor(message: string) {
+    super(message);
+    this.name = "ContextSpecError";
+  }
+}
+
+export class ContextChunkOverflowError extends ContextSpecError {
   constructor(produced: number, max: number) {
-    super(`chunking produced ${produced} chunks which exceeds maxChunks ${max}`);
+    super(`chunking requires at least ${produced} chunks which exceeds maxChunks ${max}`);
     this.name = "ContextChunkOverflowError";
   }
 }

@@ -278,4 +278,28 @@ describe("runProgram e2e", () => {
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ toString: "fixed" });
   });
+
+  test("context limit and unsupported syntax errors are typed and guest-catchable", async () => {
+    const model = new MockModelClient(() => "ok");
+    const controller = new MockController([{
+      reasoning: "recover from invalid context options",
+      code: `
+        const codes = [];
+        try { await input.grep({ pattern: '(a+)+$', syntax: 're2', maxMatches: 1 }); }
+        catch (error) { codes.push(error.code); }
+        try { await input.grep({ pattern: 'a', maxMatches: Infinity }); }
+        catch (error) { codes.push(error.code); }
+        answer({ answer: codes.join(',') });`,
+    }]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: `${"a".repeat(100_000)}!` },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+    });
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "INVALID_SPEC,INVALID_SPEC" });
+  });
 });

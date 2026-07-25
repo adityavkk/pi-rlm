@@ -14,6 +14,7 @@ import { isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
+import type { ContextOperationControl } from "../shell/context-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
@@ -105,30 +106,39 @@ export const dispatchCall = async (
     }
     case "checkpoint":
       return "denied";
-    case "context.read":
-      return state.store.read(reqStr(asObject(args), "id"), objOpts(args)) as unknown as JsonValue;
+    case "context.read": {
+      const o = objOpts(args) as { offsetBytes?: number; lengthBytes?: number };
+      return state.store.read(reqStr(asObject(args), "id"), o, contextControl(state, deadlineMs, signal)) as unknown as JsonValue;
+    }
     case "context.lines": {
       const o = objOpts(args) as { startLine?: number; count?: number };
-      return state.store.lines(reqStr(asObject(args), "id"), { startLine: o.startLine ?? 1, count: o.count ?? 100 }) as unknown as JsonValue;
+      return state.store.lines(
+        reqStr(asObject(args), "id"),
+        {
+          startLine: o.startLine === undefined ? 1 : o.startLine,
+          count: o.count === undefined ? 100 : o.count,
+        },
+        contextControl(state, deadlineMs, signal),
+      ) as unknown as JsonValue;
     }
     case "context.grep": {
-      const o = objOpts(args) as { pattern?: string; maxMatches?: number; caseSensitive?: boolean; syntax?: "literal" | "re2" };
+      const o = objOpts(args) as { pattern?: string; maxMatches?: number; caseSensitive?: boolean; syntax?: "literal" };
       return state.store.grep(reqStr(asObject(args), "id"), {
-        pattern: o.pattern ?? "",
-        maxMatches: o.maxMatches ?? 50,
+        pattern: o.pattern === undefined ? "" : o.pattern,
+        maxMatches: o.maxMatches === undefined ? 50 : o.maxMatches,
         ...(o.caseSensitive !== undefined ? { caseSensitive: o.caseSensitive } : {}),
-        ...(o.syntax ? { syntax: o.syntax } : {}),
-      }) as unknown as JsonValue;
+        ...(o.syntax !== undefined ? { syntax: o.syntax } : {}),
+      }, contextControl(state, deadlineMs, signal)) as unknown as JsonValue;
     }
     case "context.chunks": {
       const o = objOpts(args) as { targetTokens?: number; overlapTokens?: number; maxChunks?: number; boundary?: "line" | "none" };
       return withBytes(state, () =>
         state.store.chunks(reqStr(asObject(args), "id"), {
-          targetTokens: o.targetTokens ?? 4000,
-          maxChunks: o.maxChunks ?? 32,
+          targetTokens: o.targetTokens === undefined ? 4000 : o.targetTokens,
+          maxChunks: o.maxChunks === undefined ? 32 : o.maxChunks,
           ...(o.overlapTokens !== undefined ? { overlapTokens: o.overlapTokens } : {}),
-          ...(o.boundary ? { boundary: o.boundary } : {}),
-        }), signal,
+          ...(o.boundary !== undefined ? { boundary: o.boundary } : {}),
+        }, contextControl(state, deadlineMs, signal, true)), signal,
       ) as unknown as JsonValue;
     }
     case "context.provenance":
@@ -168,6 +178,22 @@ const objOpts = (args: JsonValue): Record<string, JsonValue> => {
   return isJsonObject(o) ? o : {};
 };
 
+const contextControl = (
+  state: RunState,
+  deadlineMs: number,
+  signal: AbortSignal,
+  reserveOutput = false,
+): ContextOperationControl => ({
+  checkpoint: () => {
+    throwIfAborted(signal);
+    if (state.clock.now() >= deadlineMs)
+      throw new DslError("BUDGET_DEADLINE", "deadline reached during context operation");
+  },
+  ...(reserveOutput
+    ? { maxOutputBytes: Math.max(0, state.ledger.current.limits.storedByteLimit - state.ledger.current.usage.storedBytes) }
+    : {}),
+});
+
 const deriveSpec = (spec: JsonObject): { key: string; value: string | JsonValue; label?: string } => {
   const label = spec["label"];
   return { key: reqStr(spec, "key"), value: spec["value"] as JsonValue, ...(typeof label === "string" ? { label } : {}) };
@@ -182,16 +208,22 @@ const concatSpec = (spec: JsonObject): { key: string; refs: Array<{ id: string }
 
 const withBytes = async <T>(state: RunState, op: () => Promise<T> | T, signal: AbortSignal): Promise<T> => {
   throwIfAborted(signal);
-  const before = state.store.totalBytes();
-  const result = await waitForAbort(Promise.resolve(op()), signal);
-  throwIfAborted(signal);
-  const delta = state.store.totalBytes() - before;
-  if (delta > 0) {
-    const reserved = reserveBytes(state.ledger.current, delta);
-    if (!reserved.ok) throw new DslError("INVALID_STATE", reserved.error.message);
-    state.ledger.current = reserved.value;
+  const release = await state.contextSemaphore.acquire(signal);
+  if (!release) throwIfAborted(signal);
+  try {
+    const before = state.store.totalBytes();
+    const result = await waitForAbort(Promise.resolve(op()), signal);
+    throwIfAborted(signal);
+    const delta = state.store.totalBytes() - before;
+    if (delta > 0) {
+      const reserved = reserveBytes(state.ledger.current, delta);
+      if (!reserved.ok) throw new DslError("INVALID_STATE", reserved.error.message);
+      state.ledger.current = reserved.value;
+    }
+    return result;
+  } finally {
+    release?.();
   }
-  return result;
 };
 
 const writeArtifact = async (state: RunState, spec: JsonObject) => {
