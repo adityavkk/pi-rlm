@@ -6,8 +6,11 @@ import { canonicalStringify } from "../core/json.ts";
 import { normalizeProgram } from "../core/program.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { CellEvalOptions, InterpreterBackend } from "../shell/interpreter/backend.ts";
+import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import type { ModelClient, ModelResponse } from "../shell/model/client.ts";
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
+import { FunctionExtractor } from "./extractor.ts";
+import { ModelController } from "./model-controller.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
 import {
   buildRunManifest,
@@ -38,12 +41,17 @@ const backend: InterpreterBackend = {
   async evalCell(_options: CellEvalOptions) { throw new Error("interpreter must not run"); },
   async dispose() {},
 };
+const TEST_MODEL_IDENTITY: RuntimeComponentIdentity = {
+  id: "test/model-client", version: "1", configuration: { route: "test/model" },
+};
 const controller: ControllerDriver = {
+  identity: { id: "test/controller", version: "1", configuration: { route: "test/model", maxOutputTokens: 64 } },
   async next(_state: FrameState): Promise<Cell> { throw new Error("controller must not run"); },
   fork() { return this; },
 };
 const model: ModelClient = {
   id: "test-model",
+  identity: TEST_MODEL_IDENTITY,
   async complete(): Promise<ModelResponse> { throw new Error("model must not run"); },
 };
 const manifest = (source: string, nonce: string, overrides: Partial<Parameters<typeof buildRunManifest>[0]> = {}) => buildRunManifest({
@@ -57,6 +65,7 @@ const manifest = (source: string, nonce: string, overrides: Partial<Parameters<t
   createRunNonce: () => nonce,
   dslVersion: RLM_DSL_VERSION,
   ...overrides,
+  model: overrides.model ?? model,
 });
 const runInput = (dir: string, source: string, nonce: string): RunInput => ({
   program,
@@ -111,13 +120,12 @@ describe("source-bound run identity and manifest", () => {
       staticVersion: "2",
       turnVersion: "2",
       staticRenderedSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-      turnInputsSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-      turnRenderedSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      bindingInputsSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(document.manifest.prompts.extractor).toMatchObject({
       enabled: false,
       version: "2",
-      promptRenderedSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      configuration: { contract: "provenance-envelope-v1" },
     });
     expect(JSON.stringify(document)).not.toContain(secretSource);
     expect(JSON.stringify(document)).not.toContain("grantId");
@@ -139,11 +147,63 @@ describe("source-bound run identity and manifest", () => {
     });
     for (const changed of [programDocument, sourceDocument, profileDocument]) {
       expect(changed.manifestHash).not.toBe(base.manifestHash);
-      expect(changed.manifest.prompts.controller.turnInputsSha256)
-        .not.toBe(base.manifest.prompts.controller.turnInputsSha256);
-      expect(changed.manifest.prompts.extractor.promptInputsSha256)
-        .not.toBe(base.manifest.prompts.extractor.promptInputsSha256);
+      expect(changed.manifest.prompts.controller.bindingInputsSha256)
+        .not.toBe(base.manifest.prompts.controller.bindingInputsSha256);
+      expect(changed.manifest.prompts.extractor.bindingInputsSha256)
+        .not.toBe(base.manifest.prompts.extractor.bindingInputsSha256);
     }
+  });
+
+  test("binds canonical model, controller, and extractor instance configuration", () => {
+    const client = (route: string): ModelClient => ({
+      id: "configured-model",
+      identity: { id: "test/configured-model", version: "1", configuration: { route } },
+      async complete(): Promise<ModelResponse> { throw new Error("unused"); },
+    });
+    const modelA = client("provider/model-a");
+    const modelB = client("provider/model-b");
+    const controllerA = new ModelController(modelA, { model: "provider/controller", maxOutputTokens: 64 });
+    const controllerB = new ModelController(modelA, { model: "provider/controller", maxOutputTokens: 65 });
+    const extractorA = new FunctionExtractor(async () => ({ ok: false, code: "FAILED", message: "unused" }), "external", {
+      closure: { id: "host/extractor-closure", version: "1", configuration: {} },
+      configuration: { temperature: 0 },
+      modelRoute: null,
+      providerPrompt: null,
+    });
+    const extractorB = new FunctionExtractor(async () => ({ ok: false, code: "FAILED", message: "unused" }), "external", {
+      closure: { id: "host/extractor-closure", version: "1", configuration: {} },
+      configuration: { temperature: 1 },
+      modelRoute: null,
+      providerPrompt: null,
+    });
+    const base = manifest("alpha", "configured", { model: modelA, controller: controllerA, extractor: extractorA });
+    for (const changed of [
+      manifest("alpha", "configured", { model: modelB, controller: controllerA, extractor: extractorA }),
+      manifest("alpha", "configured", { model: modelA, controller: controllerB, extractor: extractorA }),
+      manifest("alpha", "configured", { model: modelA, controller: controllerA, extractor: extractorB }),
+    ]) expect(changed.manifestHash).not.toBe(base.manifestHash);
+    expect(base.manifest.components).toMatchObject({
+      model: { configuration: { route: "provider/model-a" } },
+      controller: { configuration: { modelRoute: "provider/controller", maxOutputTokens: 64 } },
+      extractor: { configuration: { mode: "external", configuration: { temperature: 0 } } },
+    });
+  });
+
+  test("missing opaque component identity fails before nonce or run effects", () => {
+    let nonceCalls = 0;
+    const noIdentityModel = { id: "opaque", async complete() { throw new Error("unused"); } } as unknown as ModelClient;
+    const noIdentityController = {
+      async next() { throw new Error("unused"); },
+      fork() { return this; },
+    } as unknown as ControllerDriver;
+    const noIdentityExtractor = { async extract() { return { ok: false as const, code: "FAILED" as const, message: "unused" }; } };
+    expect(() => manifest("alpha", "missing", { model: noIdentityModel, createRunNonce: () => { nonceCalls++; return "never"; } }))
+      .toThrow("model.identity");
+    expect(() => manifest("alpha", "missing", { controller: noIdentityController, createRunNonce: () => { nonceCalls++; return "never"; } }))
+      .toThrow("controller.identity");
+    expect(() => manifest("alpha", "missing", { extractor: noIdentityExtractor as unknown as import("./extractor.ts").Extractor, createRunNonce: () => { nonceCalls++; return "never"; } }))
+      .toThrow("extractor.identity");
+    expect(nonceCalls).toBe(0);
   });
 
   test("absolute deadline changes identity and backend version is mandatory", () => {
@@ -185,6 +245,56 @@ describe("source-bound run identity and manifest", () => {
     const inherited = structuredClone(original);
     Object.setPrototypeOf(inherited.manifest, { injected: true });
     expect(validateRunManifest(original, inherited)).toMatchObject({ ok: false, error: { code: "MANIFEST_INVALID" } });
+  });
+
+  test("rejects rehashed unsupported or non-derivable prompt metadata", () => {
+    const original = manifest("alpha", "prompt-strict");
+    const mutations: Array<(document: typeof original) => void> = [
+      (document) => { (document.manifest.prompts.controller as { staticVersion: string }).staticVersion = "999"; },
+      (document) => { (document.manifest.prompts.controller as { staticRenderedSha256: string }).staticRenderedSha256 = sha256("arbitrary"); },
+      (document) => { (document.manifest.prompts.controller as { turnConfiguration: unknown }).turnConfiguration = { projection: "invented" }; },
+      (document) => { (document.manifest.prompts.extractor as { bindingInputsSha256: string }).bindingInputsSha256 = sha256("arbitrary"); },
+    ];
+    for (const mutate of mutations) {
+      const changed = structuredClone(original);
+      mutate(changed);
+      rehash(changed);
+      expect(validateRunManifest(original, changed)).toMatchObject({ ok: false, error: { code: "MANIFEST_INVALID" } });
+    }
+  });
+
+  test("runtime-dynamic provider prompts are journaled by hash, not predicted in the manifest", async () => {
+    const dir = await tmp();
+    const prompt = "runtime-only prompt with private evidence";
+    const dynamicProfile = { ...profile, maxControllerTurns: 1 };
+    const dynamicModel: ModelClient = {
+      id: "dynamic-model",
+      identity: { id: "test/dynamic-model", version: "1", configuration: { route: "provider/dynamic" } },
+      async complete(): Promise<ModelResponse> { return { text: "unused", usage: { attempts: 1, durationMs: 0 } }; },
+    };
+    const dynamicController: ControllerDriver = {
+      identity: {
+        id: "test/dynamic-controller", version: "1",
+        configuration: { renderer: { id: "host/dynamic-prompt", version: "7", configuration: { template: "bounded-v1" } } },
+      },
+      async next(_state, _signal, operation): Promise<Cell> {
+        await operation.complete(dynamicModel, { prompt });
+        throw new Error("stop after observed provider request");
+      },
+      fork() { return this; },
+    };
+    await runProgram({
+      ...runInput(dir, "alpha", "dynamic-prompt"),
+      profile: dynamicProfile,
+      model: dynamicModel,
+      controller: dynamicController,
+    });
+    const storedManifest = await readFile(join(dir, RUN_MANIFEST_FILE), "utf8");
+    expect(storedManifest).not.toContain(prompt);
+    expect(storedManifest).not.toContain("turnRenderedSha256");
+    const events = (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const attempted = events.find((event) => event.type === "provider_attempted");
+    expect(attempted).toMatchObject({ promptSha256: sha256(prompt), outcome: "ok" });
   });
 
   test("readRunManifest applies strict compatibility and canonical hash checks", async () => {
@@ -241,78 +351,152 @@ describe("source-bound run identity and manifest", () => {
 });
 
 type FaultPoint =
-  | "lock-open" | "lock-write" | "lock-sync" | "lock-close"
-  | "pre-dir-sync" | "temp-open" | "temp-write" | "temp-sync" | "temp-close"
-  | "rename" | "post-dir-sync";
+  | "lock-open" | "readdir" | "lock-write" | "lock-sync" | "lock-close" | "lock-write-close"
+  | "pre-dir-open" | "pre-dir-sync" | "pre-dir-close"
+  | "temp-open" | "temp-write" | "temp-sync" | "temp-close" | "rename"
+  | "post-dir-open" | "post-dir-sync" | "post-dir-close"
+  | "lock-cleanup-unlink" | "temp-cleanup-unlink";
 
 const faultFileSystem = (dir: string, point: FaultPoint): RunDirectoryFileSystem => {
-  let directorySync = 0;
-  const fault = (): never => { throw Object.assign(new Error(`injected ${point}`), { code: "EIO" }); };
+  let directoryOpen = 0;
+  const fault = (at: string): never => { throw Object.assign(new Error(`injected ${point} at ${at}`), { code: "EIO" }); };
   return {
     ...nodeRunDirectoryFileSystem,
     async open(path, flags) {
       const name = basename(path);
       const lock = name === RUN_LOCK_FILE;
       const temp = name.endsWith(".tmp");
-      if ((point === "lock-open" && lock) || (point === "temp-open" && temp)) fault();
+      let directoryPhase: "pre" | "post" | undefined;
+      if (path === dir) {
+        directoryOpen++;
+        directoryPhase = directoryOpen === 1 ? "pre" : "post";
+      }
+      if ((point === "lock-open" && lock)
+        || (point === "temp-open" && temp)
+        || (point === "pre-dir-open" && directoryPhase === "pre")
+        || (point === "post-dir-open" && directoryPhase === "post")) fault("open");
       const handle = await nodeRunDirectoryFileSystem.open(path, flags);
-      if (path === dir) directorySync++;
       return {
         async writeFile(data, encoding) {
-          if ((point === "lock-write" && lock) || (point === "temp-write" && temp)) fault();
+          if ((point === "lock-write" || point === "lock-write-close") && lock) fault("write");
+          if ((point === "temp-write" || point === "temp-cleanup-unlink") && temp) fault("write");
           await handle.writeFile(data, encoding);
         },
         async sync() {
           if ((point === "lock-sync" && lock)
             || (point === "temp-sync" && temp)
-            || (point === "pre-dir-sync" && path === dir && directorySync === 1)
-            || (point === "post-dir-sync" && path === dir && directorySync === 2)) fault();
+            || (point === "pre-dir-sync" && directoryPhase === "pre")
+            || (point === "post-dir-sync" && directoryPhase === "post")) fault("sync");
           await handle.sync();
         },
         async close() {
           await handle.close();
-          if ((point === "lock-close" && lock) || (point === "temp-close" && temp)) fault();
+          if ((point === "lock-close" || point === "lock-write-close") && lock) fault("close");
+          if ((point === "temp-close" && temp)
+            || (point === "pre-dir-close" && directoryPhase === "pre")
+            || (point === "post-dir-close" && directoryPhase === "post")) fault("close");
         },
       };
     },
+    async readdir(path) {
+      if ((point === "readdir" || point === "lock-cleanup-unlink") && path === dir) fault("readdir");
+      return nodeRunDirectoryFileSystem.readdir(path);
+    },
     async rename(oldPath, newPath) {
-      if (point === "rename") fault();
+      if (point === "rename") fault("rename");
       await nodeRunDirectoryFileSystem.rename(oldPath, newPath);
+    },
+    async unlink(path) {
+      const name = basename(path);
+      if ((point === "lock-cleanup-unlink" && name === RUN_LOCK_FILE)
+        || (point === "temp-cleanup-unlink" && name.endsWith(".tmp"))) fault("unlink");
+      await nodeRunDirectoryFileSystem.unlink(path);
     },
   };
 };
 
+const earlyClaimFaults: readonly FaultPoint[] = [
+  "lock-open", "readdir", "lock-write", "lock-sync", "lock-close", "lock-write-close",
+];
+const publicationFaults: readonly FaultPoint[] = [
+  "pre-dir-open", "pre-dir-sync", "pre-dir-close", "temp-open", "temp-write", "temp-sync", "temp-close",
+  "rename", "post-dir-open", "post-dir-sync", "post-dir-close",
+];
+
 describe("durable publication failure boundaries", () => {
-  for (const point of [
-    "lock-open", "lock-write", "lock-sync", "lock-close", "pre-dir-sync", "temp-open",
-    "temp-write", "temp-sync", "temp-close", "rename", "post-dir-sync",
-  ] as const) {
-    test(`${point} has an unambiguous reopen/cleanup outcome`, async () => {
+  for (const point of earlyClaimFaults) {
+    test(`${point} cleans the incomplete lock and permits an unambiguous retry`, async () => {
+      const dir = await tmp();
+      const document = manifest("fault-source", `fault-${point}`);
+      let thrown: unknown;
+      try { await claimRunDirectory(dir, document, faultFileSystem(dir, point)); } catch (error) { thrown = error; }
+      expect(thrown).toMatchObject({
+        code: point === "lock-close" || point === "lock-write-close" ? "MANIFEST_CLEANUP_FAILED" : "MANIFEST_WRITE_FAILED",
+      });
+      if (point === "lock-write-close") {
+        const cause = (thrown as { cause?: unknown }).cause;
+        expect(cause).toBeInstanceOf(AggregateError);
+        expect((cause as AggregateError).errors).toHaveLength(2);
+      }
+      expect(await readdir(dir)).toEqual([]);
+      await claimRunDirectory(dir, document);
+      expect(await readRunManifest(dir)).toEqual(document);
+    });
+  }
+
+  for (const point of publicationFaults) {
+    test(`${point} leaves a claimed directory with no temporary ambiguity`, async () => {
       const dir = await tmp();
       const document = manifest("fault-source", `fault-${point}`);
       await expect(claimRunDirectory(dir, document, faultFileSystem(dir, point)))
-        .rejects.toMatchObject({ code: "MANIFEST_WRITE_FAILED" });
+        .rejects.toMatchObject({ code: point.endsWith("-close") ? "MANIFEST_CLEANUP_FAILED" : "MANIFEST_WRITE_FAILED" });
       const entries = await readdir(dir);
-      expect(entries.some((entry) => entry.endsWith(".tmp"))).toBe(false);
-
-      if (point === "lock-open") {
-        expect(entries).not.toContain(RUN_LOCK_FILE);
-        await claimRunDirectory(dir, document);
-        expect(await readRunManifest(dir)).toEqual(document);
-        return;
-      }
-
       expect(entries).toContain(RUN_LOCK_FILE);
+      expect(entries.some((entry) => entry.endsWith(".tmp"))).toBe(false);
       await expect(claimRunDirectory(dir, document)).rejects.toMatchObject({ code: "RUN_DIRECTORY_IN_USE" });
-      if (point === "post-dir-sync") {
-        // Rename followed a synced/closed temp, so the exact manifest is safe to reopen.
-        expect(await readRunManifest(dir)).toEqual(document);
-      } else {
+      if (point.startsWith("post-dir-")) expect(await readRunManifest(dir)).toEqual(document);
+      else {
         expect(entries).not.toContain(RUN_MANIFEST_FILE);
         await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
       }
     });
   }
+
+  test("lock cleanup unlink failure is typed, compounded, and permanently fail-closed", async () => {
+    const dir = await tmp();
+    const document = manifest("fault-source", "lock-cleanup");
+    let thrown: unknown;
+    try { await claimRunDirectory(dir, document, faultFileSystem(dir, "lock-cleanup-unlink")); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ code: "MANIFEST_CLEANUP_FAILED" });
+    expect((thrown as { cause: AggregateError }).cause).toBeInstanceOf(AggregateError);
+    expect((thrown as { cause: AggregateError }).cause.errors).toHaveLength(2);
+    expect(await readdir(dir)).toEqual([RUN_LOCK_FILE]);
+    await expect(claimRunDirectory(dir, document)).rejects.toMatchObject({ code: "RUN_DIRECTORY_IN_USE" });
+    await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
+  });
+
+  test("temp cleanup unlink failure is typed, compounded, and leaves one non-valid temp", async () => {
+    const dir = await tmp();
+    const document = manifest("fault-source", "temp-cleanup");
+    let thrown: unknown;
+    try { await claimRunDirectory(dir, document, faultFileSystem(dir, "temp-cleanup-unlink")); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ code: "MANIFEST_CLEANUP_FAILED" });
+    expect((thrown as { cause: AggregateError }).cause.errors).toHaveLength(2);
+    const entries = await readdir(dir);
+    expect(entries).toContain(RUN_LOCK_FILE);
+    expect(entries.filter((entry) => entry.endsWith(".tmp"))).toHaveLength(1);
+    expect(entries).not.toContain(RUN_MANIFEST_FILE);
+    await expect(claimRunDirectory(dir, document)).rejects.toMatchObject({ code: "RUN_DIRECTORY_IN_USE" });
+    await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
+  });
+
+  test("nonempty-directory rejection cleans its provisional lock", async () => {
+    const dir = await tmp();
+    await writeFile(join(dir, "owner-state"), "existing");
+    await expect(claimRunDirectory(dir, manifest("fault-source", "nonempty")))
+      .rejects.toMatchObject({ code: "RUN_DIRECTORY_NOT_EMPTY" });
+    expect(await readdir(dir)).toEqual(["owner-state"]);
+  });
 
   test("manifest publication fault happens before journal or source effects", async () => {
     const dir = await tmp();

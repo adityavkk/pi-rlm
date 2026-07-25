@@ -141,6 +141,7 @@ const pendingOfflineRuntime = (dir: string): {
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
   const lateCell = new Promise<Cell>((resolve) => { resolveLate = resolve; });
   const controller: ControllerDriver = {
+    identity: { id: "test/controller", version: "1", configuration: { fixture: "index.test.ts:143" } },
     async next(_state: FrameState): Promise<Cell> {
       markStarted();
       return lateCell;
@@ -156,6 +157,7 @@ const pendingOfflineRuntime = (dir: string): {
     async dispose() {},
   };
   const model: ModelClient = {
+    identity: { id: "test/model-client", version: "1", configuration: { fixture: "index.test.ts:158" } },
     id: "offline-extension-test",
     async complete(): Promise<ModelResponse> {
       throw new Error("offline extension test made a provider call");

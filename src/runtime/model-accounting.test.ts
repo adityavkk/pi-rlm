@@ -19,6 +19,14 @@ import { DEFAULT_PROFILE } from "./profile.ts";
 import { ModelInvocationError } from "./provider.ts";
 import { runProgram } from "./run.ts";
 
+const modelIdentity = (fixture: string) => ({ id: "test/mock-model-handler", version: "1", configuration: { fixture } } as const);
+const extractorIdentity = (fixture: string) => ({
+  closure: { id: "test/extractor-closure", version: "1", configuration: { fixture } },
+  configuration: { fixture },
+  modelRoute: "test/model",
+  providerPrompt: { id: "test/extractor-prompt", version: "1", configuration: { fixture } },
+} as const);
+
 let backend: QuickJsBackend;
 beforeAll(async () => {
   backend = await QuickJsBackend.create();
@@ -64,7 +72,7 @@ const usageResponse = (
 
 describe("tree-wide model accounting", () => {
   test("maxAttempts:0 blocks controller and provider invocation", async () => {
-    const model = new MockModelClient(() => "must not run");
+    const model = new MockModelClient(() => "must not run", modelIdentity("src/runtime/model-accounting.test.ts:67"));
     const result = await runProgram({
       program: program(),
       sources: {},
@@ -89,7 +97,7 @@ describe("tree-wide model accounting", () => {
       usageResponse("not-json", 5, 2, 0.1, 4),
       usageResponse(JSON.stringify({ reasoning: "fixed", code: "answer({ answer: 'ok' })" }), 7, 8, 0.2, 6),
     ];
-    const model = new MockModelClient(() => outputs.shift()!);
+    const model = new MockModelClient(() => outputs.shift()!, modelIdentity("src/runtime/model-accounting.test.ts:92"));
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: {}, controller: new ModelController(model), model, backend, dir,
@@ -126,7 +134,7 @@ describe("tree-wide model accounting", () => {
       }),
       JSON.stringify({ reasoning: "child", code: "answer('nested')" }),
     ];
-    const model = new MockModelClient(() => outputs.shift()!);
+    const model = new MockModelClient(() => outputs.shift()!, modelIdentity("src/runtime/model-accounting.test.ts:129"));
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: {}, controller: new ModelController(model), model, backend, dir,
@@ -144,7 +152,7 @@ describe("tree-wide model accounting", () => {
 
   test("leaf structured repair uses the same operation and counts both attempts", async () => {
     const outputs = ["not-json", JSON.stringify({ value: "fixed" })];
-    const model = new MockModelClient(() => outputs.shift()!);
+    const model = new MockModelClient(() => outputs.shift()!, modelIdentity("src/runtime/model-accounting.test.ts:147"));
     const dir = await tmp();
     const controller = new MockController([{
       reasoning: "repair leaf",
@@ -170,7 +178,7 @@ describe("tree-wide model accounting", () => {
 
   test("external fallback has an explicit logical-operation and attempt contract", async () => {
     const dir = await tmp();
-    const model = new MockModelClient(() => "unused");
+    const model = new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:173"));
     const result = await runProgram({
       program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir,
       signal: new AbortController().signal,
@@ -179,7 +187,7 @@ describe("tree-wide model accounting", () => {
         ok: true,
         value: { answer: "external" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
-      })),
+      }), "external", extractorIdentity("src/runtime/model-accounting.test.ts:178")),
     });
 
     expect(result.answer).toEqual({ answer: "external" });
@@ -198,7 +206,7 @@ describe("tree-wide model accounting", () => {
       return usageResponse(JSON.stringify({
         value: { answer: "provider" }, evidenceRefs: [evidenceId],
       }), 3, 4, 0.05, 9);
-    });
+    }, modelIdentity("src/runtime/model-accounting.test.ts:194"));
     const result = await runProgram({
       program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
@@ -207,7 +215,7 @@ describe("tree-wide model accounting", () => {
         const response = await operation.complete({ prompt: "extract", system: "strict", maxOutputTokens: 32 });
         const envelope = JSON.parse(response.text) as { value: { answer: string }; evidenceRefs: string[] };
         return { ok: true, ...envelope };
-      }, "provider"),
+      }, "provider", extractorIdentity("src/runtime/model-accounting.test.ts:206")),
     });
 
     expect(result.answer).toEqual({ answer: "provider" });
@@ -228,7 +236,7 @@ describe("tree-wide model accounting", () => {
   });
 
   test("provider extractor that skips its boundary fails instead of becoming free work", async () => {
-    const model = new MockModelClient(() => "unused");
+    const model = new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:231"));
     const result = await runProgram({
       program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
@@ -237,14 +245,14 @@ describe("tree-wide model accounting", () => {
         ok: true,
         value: { answer: "hidden" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
-      }), "provider"),
+      }), "provider", extractorIdentity("src/runtime/model-accounting.test.ts:236")),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_REQUEST" } });
     expect(model.callCount).toBe(0);
   });
 
   test("invalid leaf token and batch concurrency values fail before provider spend", async () => {
-    const model = new MockModelClient(() => "must not run");
+    const model = new MockModelClient(() => "must not run", modelIdentity("src/runtime/model-accounting.test.ts:247"));
     const controller = new MockController([{
       reasoning: "validate first",
       code: `
@@ -274,11 +282,12 @@ describe("tree-wide model accounting", () => {
       const dir = await tmp();
       let controllerCalls = 0;
       const controller = {
+        identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/model-accounting.test.ts:276" } },
         async next() { controllerCalls += 1; return { reasoning: "bad", code: "1" }; },
         fork() { return this; },
       };
       const work = runProgram({
-        program: program(), sources: {}, controller, model: new MockModelClient(() => "unused"), backend, dir,
+        program: program(), sources: {}, controller, model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:281")), backend, dir,
         signal: new AbortController().signal,
         profile: { ...DEFAULT_PROFILE, maxConcurrency },
       });
@@ -322,14 +331,14 @@ describe("reviewed accounting boundaries", () => {
       }
     }
     const result = await runProgram({
-      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+      program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:325")), backend, dir,
       signal: new AbortController().signal,
       profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
       extractor: new FunctionExtractor((evidence) => ({
         ok: true,
         value: { answer: "external" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
-      })),
+      }), "external", extractorIdentity("src/runtime/model-accounting.test.ts:328")),
       journal: new CacheFailJournal(dir),
     });
 
@@ -343,7 +352,7 @@ describe("reviewed accounting boundaries", () => {
 
   test("external extractor receives no nested completion capability at maxConcurrency one", async () => {
     let argumentCount = 0;
-    const model = new MockModelClient(() => "must not run");
+    const model = new MockModelClient(() => "must not run", modelIdentity("src/runtime/model-accounting.test.ts:346"));
     const extractor = new FunctionExtractor((...args) => {
       argumentCount = args.length;
       return {
@@ -351,7 +360,7 @@ describe("reviewed accounting boundaries", () => {
         value: { answer: "external" },
         evidenceRefs: [args[0].handles[0]!.evidenceId!],
       };
-    });
+    }, "external", extractorIdentity("src/runtime/model-accounting.test.ts:347"));
     const result = await runProgram({
       program: program(true), sources: { context: "represented evidence" }, controller: new MockController([]), model, backend, dir: await tmp(),
       signal: new AbortController().signal,
@@ -367,6 +376,7 @@ describe("reviewed accounting boundaries", () => {
 
   test("same recurse key under two parent lineages runs isolated child frames", async () => {
     const controller = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/model-accounting.test.ts:369" } },
       async next(state: { objective: string }) {
         if (state.objective === "account every model effect") return {
           reasoning: "open siblings",
@@ -387,7 +397,7 @@ describe("reviewed accounting boundaries", () => {
     };
     const dir = await tmp();
     const result = await runProgram({
-      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused"), backend, dir,
+      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:390")), backend, dir,
       signal: new AbortController().signal,
     });
 
@@ -402,6 +412,7 @@ describe("reviewed accounting boundaries", () => {
   test("failed recurse result is not cached and identical retry keeps its binding", async () => {
     let childRuns = 0;
     const controller = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/model-accounting.test.ts:404" } },
       async next(state: { objective: string }) {
         if (state.objective === "account every model effect") return {
           reasoning: "retry child",
@@ -419,7 +430,7 @@ describe("reviewed accounting boundaries", () => {
     };
     const dir = await tmp();
     const result = await runProgram({
-      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused"), backend, dir,
+      program: program(), sources: {}, controller, model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:422")), backend, dir,
       signal: new AbortController().signal,
     });
 
@@ -439,7 +450,7 @@ describe("reviewed accounting boundaries", () => {
       for (const value of invalid) {
         const dir = await tmp();
         const work = runProgram({
-          program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+          program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:442")), backend, dir,
           signal: new AbortController().signal,
           profile: { ...DEFAULT_PROFILE, trajectory: { ...DEFAULT_PROFILE.trajectory, [field]: value } },
         });
@@ -456,7 +467,7 @@ describe("reviewed accounting boundaries", () => {
     ]) {
       const dir = await tmp();
       const work = runProgram({
-        program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused"), backend, dir,
+        program: program(), sources: {}, controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/model-accounting.test.ts:459")), backend, dir,
         signal: new AbortController().signal,
         profile: { ...DEFAULT_PROFILE, trajectory },
       });

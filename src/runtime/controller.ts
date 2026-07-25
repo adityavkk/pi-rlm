@@ -4,6 +4,7 @@
  * mock driver replays a script. */
 
 import type { BudgetView } from "../core/budget.ts";
+import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import type { JsonValue } from "../core/json.ts";
 import type { RlmOutputField } from "../core/program.ts";
 import type { TrajectoryProjection } from "../core/trajectory.ts";
@@ -35,6 +36,8 @@ export interface ControllerModelOperation {
 }
 
 export interface ControllerDriver {
+  /** Required before run effects. Includes implementation and all behavior-affecting instance options. */
+  readonly identity: RuntimeComponentIdentity;
   /** Drivers must perform provider work only through `operation.complete`. */
   next(state: FrameState, signal: AbortSignal, operation: ControllerModelOperation): Promise<Cell>;
   fork(childObjective: string, childFrameId: string): ControllerDriver;

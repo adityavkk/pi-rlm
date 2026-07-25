@@ -329,6 +329,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     profile,
     limits,
     backend: input.backend,
+    model: input.model,
     controller: input.controller,
     extractor: input.extractor,
     authorizationMode: input.authorizationMode,

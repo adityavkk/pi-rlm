@@ -28,6 +28,7 @@ import {
   normalizeCallUsage,
   ZERO_CALL_USAGE,
 } from "../core/usage.ts";
+import { sha256 } from "../shell/hash.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
@@ -236,6 +237,7 @@ export const createModelOperation = (
     outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"],
     usage: CallUsage,
     errorCode?: string,
+    promptSha256?: string,
   ): Promise<void> => {
     const appended = await state.journal.append({
       type: "provider_attempted",
@@ -246,6 +248,7 @@ export const createModelOperation = (
       attempt: attemptOrdinal,
       outcome,
       usage,
+      ...(promptSha256 ? { promptSha256 } : {}),
       ...(errorCode ? { errorCode } : {}),
     });
     if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
@@ -259,6 +262,7 @@ export const createModelOperation = (
       maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
       signal: options.signal,
     };
+    const promptSha256 = sha256(normalizedRequest.prompt);
     const reservedTokens = tokenReservation(normalizedRequest);
     if (reservedTokens === undefined)
       throw new ModelInvocationError(callError("INVALID_REQUEST", "call token reservation exceeds per-call maximum"), aggregate);
@@ -308,7 +312,7 @@ export const createModelOperation = (
           : wasAborted(error, options.signal)
             ? callError("CANCELLED", "model completion cancelled")
             : callError("FAILED", "model completion failed"));
-        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code);
+        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code, promptSha256);
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -323,7 +327,7 @@ export const createModelOperation = (
         }
         pendingTokens = 0;
         const failure = addAccounting(usage) ?? callError("INVALID_RESULT", "model returned invalid usage");
-        await journal("invalid_result", usage, failure.code);
+        await journal("invalid_result", usage, failure.code, promptSha256);
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -338,7 +342,7 @@ export const createModelOperation = (
       pendingTokens = 0;
       const accountingError = addAccounting(response.usage);
       if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-      await journal("ok", response.usage);
+      await journal("ok", response.usage, undefined, promptSha256);
       return response;
     } finally {
       if (pendingTokens > 0) {

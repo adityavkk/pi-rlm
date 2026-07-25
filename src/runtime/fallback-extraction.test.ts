@@ -14,6 +14,14 @@ import { MockController } from "./mock-controller.ts";
 import { DEFAULT_PROFILE, type Profile } from "./profile.ts";
 import { runProgram } from "./run.ts";
 
+const modelIdentity = (fixture: string) => ({ id: "test/mock-model-handler", version: "1", configuration: { fixture } } as const);
+const extractorIdentity = (fixture: string) => ({
+  closure: { id: "test/extractor-closure", version: "1", configuration: { fixture } },
+  configuration: { fixture },
+  modelRoute: "test/model",
+  providerPrompt: { id: "test/extractor-prompt", version: "1", configuration: { fixture } },
+} as const);
+
 let backend: QuickJsBackend;
 beforeAll(async () => { backend = await QuickJsBackend.create(); });
 
@@ -57,7 +65,7 @@ describe("bounded fallback extraction", () => {
     const result = await runProgram({
       program: program(), sources: { context: "source" }, backend, dir,
       controller: new MockController([{ reasoning: "invalid direct", code: "answer({ answer: 7 })" }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:60")), signal: new AbortController().signal,
       profile: boundedProfile(),
       extractor: new FunctionExtractor((evidence) => {
         expect(evidence.answerCandidates[0]?.value).toEqual({ answer: 7 });
@@ -66,7 +74,7 @@ describe("bounded fallback extraction", () => {
           value: { answer: 7 },
           evidenceRefs: [evidence.answerCandidates[0]!.evidenceId!],
         };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:62")),
     });
 
     expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" } });
@@ -81,12 +89,12 @@ describe("bounded fallback extraction", () => {
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "represented" }, backend, dir,
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:84")),
       signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
       extractor: new FunctionExtractor((() => ({
         ok: true,
         value: { answer: "fabricated" },
-      })) as never),
+      })) as never, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:86")),
     });
 
     expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" } });
@@ -100,7 +108,7 @@ describe("bounded fallback extraction", () => {
       const dir = await tmp();
       const result = await runProgram({
         program: program(), sources: { context: "represented" }, backend, dir,
-        controller: new MockController([]), model: new MockModelClient(() => "unused"),
+        controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:103")),
         signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
         extractor: new FunctionExtractor((evidence) => {
           const represented = evidence.handles[0]!.evidenceId!;
@@ -110,7 +118,7 @@ describe("bounded fallback extraction", () => {
               ? [represented, represented]
               : [`ev_${"0".repeat(64)}`];
           return { ok: true, value: { answer: "fabricated" }, evidenceRefs };
-        }),
+        }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:105")),
       });
       expect(result).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" } });
       expect((await events(dir)).some((event) => event.type === "answer_committed")).toBe(false);
@@ -126,7 +134,7 @@ describe("bounded fallback extraction", () => {
         reasoning: "leave exact recoverable evidence",
         code: "workspace.recovery = 'represented-workspace'; answer({ answer: 42, padding: 'p'.repeat(2000) })",
       }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:129")), signal: new AbortController().signal,
       profile: boundedProfile({ extractorValueMaxBytes: 128 }),
       extractor: new FunctionExtractor((evidence) => {
         seen = evidence;
@@ -137,7 +145,7 @@ describe("bounded fallback extraction", () => {
           value: { answer: String(recovery.value) },
           evidenceRefs: [recovery.evidenceId!],
         };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:131")),
     });
 
     expect(result).toMatchObject({
@@ -162,12 +170,12 @@ describe("bounded fallback extraction", () => {
         reasoning: "mark the output handle required",
         code: "workspace.answer = { contextId: variables.context.id }",
       }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:165")), signal: new AbortController().signal,
       profile: boundedProfile(),
       extractor: new FunctionExtractor(() => {
         calls++;
         return { ok: false, code: "FAILED", message: "must not run" };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:167")),
     });
 
     expect(result).toMatchObject({
@@ -182,12 +190,12 @@ describe("bounded fallback extraction", () => {
     let calls = 0;
     const result = await runProgram({
       program: program(false), sources: {}, backend, dir: await tmp(), controller: new MockController([]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:185")), signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0 }),
       extractor: new FunctionExtractor(() => {
         calls++;
         return { ok: false, code: "FAILED", message: "must not run" };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:187")),
     });
     expect(result).toMatchObject({
       status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
@@ -198,7 +206,7 @@ describe("bounded fallback extraction", () => {
 
   test("an empty input handle fails before extractor or provider work", async () => {
     let extractorCalls = 0;
-    const model = new MockModelClient(() => "must not run");
+    const model = new MockModelClient(() => "must not run", modelIdentity("src/runtime/fallback-extraction.test.ts:201"));
     const result = await runProgram({
       program: program(), sources: { context: "" }, backend, dir: await tmp(),
       controller: new MockController([]), model, signal: new AbortController().signal,
@@ -206,7 +214,7 @@ describe("bounded fallback extraction", () => {
       extractor: new FunctionExtractor(() => {
         extractorCalls++;
         return { ok: false, code: "FAILED", message: "must not run" };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:206")),
     });
     expect(result).toMatchObject({
       status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
@@ -231,14 +239,14 @@ describe("bounded fallback extraction", () => {
         reasoning: "",
         code: "workspace.empty = ''; workspace.whitespace = '   '; workspace.object = {}; workspace.array = []; workspace.nil = null; answer(null)",
       }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:234")), signal: new AbortController().signal,
       profile: boundedProfile({
         trajectory: { ...DEFAULT_PROFILE.trajectory, headEntries: 0, tailEntries: 0 },
       }),
       extractor: new FunctionExtractor(() => {
         extractorCalls++;
         return { ok: false, code: "FAILED", message: "must not run" };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:238")),
     });
     expect(result).toMatchObject({
       status: "failed", error: { code: "FALLBACK_EVIDENCE_TRUNCATED" },
@@ -254,7 +262,7 @@ describe("bounded fallback extraction", () => {
         reasoning: "",
         code: "workspace.falseValue = false; workspace.zeroValue = 0",
       }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:257")), signal: new AbortController().signal,
       profile: boundedProfile({
         trajectory: { ...DEFAULT_PROFILE.trajectory, headEntries: 0, tailEntries: 0 },
       }),
@@ -270,7 +278,7 @@ describe("bounded fallback extraction", () => {
           value: { answer: "false and zero" },
           evidenceRefs: [falseItem.evidenceId, zeroItem.evidenceId],
         };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:261")),
     });
     expect(result).toMatchObject({
       status: "completed", completionMode: "fallback_extract", answer: { answer: "false and zero" },
@@ -293,7 +301,7 @@ describe("bounded fallback extraction", () => {
         value: { answer: represented },
         evidenceRefs: [projected.handles[0]!.evidenceId],
       }));
-    });
+    }, modelIdentity("src/runtime/fallback-extraction.test.ts:285"));
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: source }, backend, dir,
@@ -306,7 +314,7 @@ describe("bounded fallback extraction", () => {
         });
         const envelope = JSON.parse(completed.text) as { value: { answer: string }; evidenceRefs: string[] };
         return { ok: true, ...envelope };
-      }, "provider"),
+      }, "provider", extractorIdentity("src/runtime/fallback-extraction.test.ts:302")),
     });
 
     expect(result).toMatchObject({ status: "completed", answer: { answer: "HEAD::TAIL" } });
@@ -342,14 +350,14 @@ describe("bounded fallback extraction", () => {
         code: `const artifact = await artifacts.write({ key: 'large', name: 'large.txt', value: 'A'.repeat(4000) });
           workspace.answerArtifact = { artifactId: artifact.id };`,
       }]),
-      model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+      model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:345")), signal: new AbortController().signal,
       profile: boundedProfile(),
       extractor: new FunctionExtractor((evidence) => {
         seen = evidence;
         const handle = evidence.handles.find((item) => item.kind === "artifact");
         if (!handle?.evidenceId) throw new Error("missing artifact evidence");
         return { ok: true, value: { answer: "artifact" }, evidenceRefs: [handle.evidenceId] };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:347")),
     });
     expect(result.status).toBe("completed");
     expect(seen?.handles.find((handle) => handle.kind === "artifact")).toMatchObject({
@@ -370,7 +378,7 @@ describe("bounded fallback extraction", () => {
           reasoning: "stable",
           code: "workspace['😀'] = 5; workspace['中'] = 4; workspace['é'] = 3; workspace.z = 2; workspace.a = 1",
         }]),
-        model: new MockModelClient(() => "unused"), signal: new AbortController().signal,
+        model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:373")), signal: new AbortController().signal,
         profile: boundedProfile(),
         extractor: new FunctionExtractor((evidence) => {
           expect(evidence.workspaceValues.map((item) => item.key)).toEqual(["a", "z", "é", "中", "😀"]);
@@ -383,7 +391,7 @@ describe("bounded fallback extraction", () => {
             value: { answer: "stable" },
             evidenceRefs: [evidence.workspaceValues[0]!.evidenceId!],
           };
-        }),
+        }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:375")),
       });
       expect(result.status).toBe("completed");
       const journalText = await readFile(join(dir, "events.jsonl"), "utf8");
@@ -405,9 +413,9 @@ describe("bounded fallback extraction", () => {
     const thrownDir = await tmp();
     const thrown = await runProgram({
       program: program(), sources: { context: "represented source" }, backend, dir: thrownDir,
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:408")),
       signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
-      extractor: new FunctionExtractor(() => { throw new Error("private extractor detail"); }),
+      extractor: new FunctionExtractor(() => { throw new Error("private extractor detail"); }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:410")),
     });
     expect(thrown).toMatchObject({ status: "failed", error: { code: "EXTRACTOR_FAILED" }, ledger: { usage: { attempts: 1 } } });
     expect(terminals(await events(thrownDir))).toHaveLength(1);
@@ -415,13 +423,13 @@ describe("bounded fallback extraction", () => {
     let getterCalls = 0;
     const invalid = await runProgram({
       program: program(), sources: { context: "represented source" }, backend, dir: await tmp(),
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:418")),
       signal: new AbortController().signal, profile: boundedProfile({ maxControllerTurns: 0 }),
       extractor: new FunctionExtractor(() => {
         const value = Object.create(null) as Record<string, unknown>;
         Object.defineProperty(value, "ok", { enumerable: true, get() { getterCalls++; return true; } });
         return value as never;
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:420")),
     });
     expect(invalid).toMatchObject({ status: "failed", error: { code: "INVALID_RESULT" }, ledger: { usage: { attempts: 1 } } });
     expect(getterCalls).toBe(0);
@@ -432,12 +440,12 @@ describe("bounded fallback extraction", () => {
     const cancelledDir = await tmp();
     const work = runProgram({
       program: program(), sources: { context: "represented source" }, backend, dir: cancelledDir,
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:435")),
       signal: owner.signal, profile: boundedProfile({ maxControllerTurns: 0 }),
       extractor: new FunctionExtractor(() => {
         started();
         return new Promise<never>(() => {});
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:437")),
     });
     await extractorStarted;
     owner.abort(new Error("owner cancelled"));
@@ -451,13 +459,13 @@ describe("bounded fallback extraction", () => {
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "represented source" }, backend, dir,
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:454")),
       signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0, maxAttempts: 0 }),
       extractor: new FunctionExtractor(() => {
         calls++;
         return { ok: false, code: "FAILED", message: "must not run" };
-      }),
+      }, "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:457")),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "BUDGET_ATTEMPTS" }, ledger: { usage: { attempts: 0 } } });
     expect(calls).toBe(0);
@@ -530,14 +538,14 @@ describe("bounded fallback extraction", () => {
     const dir = await tmp();
     const result = await runProgram({
       program: program(), sources: { context: "represented source" }, backend, dir,
-      controller: new MockController([]), model: new MockModelClient(() => "unused"),
+      controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:533")),
       signal: new AbortController().signal,
       profile: boundedProfile({ maxControllerTurns: 0, storedByteLimit: 1 }),
       extractor: new FunctionExtractor((evidence) => ({
         ok: true,
         value: { answer: "too large" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
-      })),
+      }), "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:536")),
     });
     expect(result).toMatchObject({ status: "failed", error: { code: "BUDGET_BYTES" }, ledger: { usage: { storedBytes: 0 } } });
     const journal = await events(dir);

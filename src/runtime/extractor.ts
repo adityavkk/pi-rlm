@@ -1,5 +1,6 @@
 /** Accounted fallback extractor contract over one bounded evidence projection. */
 
+import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
 import type { ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import {
@@ -25,6 +26,8 @@ export interface ExtractorModelOperation {
 }
 
 export interface Extractor {
+  /** Required before run effects. Opaque closures must provide a stable, non-secret identity/version. */
+  readonly identity: RuntimeComponentIdentity;
   /** External work is opaque but still consumes one logical operation/attempt. */
   readonly accountingMode?: "external" | "provider";
   extract(
@@ -135,6 +138,9 @@ export const buildExtractorModelRequest = (
   };
 };
 
+export const EXTRACTOR_PROMPT_VERSION = "2";
+export const EXTRACTOR_PROMPT_CONFIGURATION = Object.freeze({ contract: "provenance-envelope-v1" });
+
 /** Stable rendered prompt contract shared by execution and manifest binding. */
 export const buildExtractorPromptContract = (evidenceIds: readonly string[]): string => [
   "Fallback extraction provenance contract:",
@@ -144,18 +150,43 @@ export const buildExtractorPromptContract = (evidenceIds: readonly string[]): st
   `Available substantive evidenceIds, in projection order: ${JSON.stringify(evidenceIds)}`,
 ].join("\n");
 
+export interface FunctionExtractorIdentity {
+  /** Identity of the host closure. Never derived from source text. */
+  readonly closure: RuntimeComponentIdentity;
+  /** All behavior-affecting extractor options not otherwise represented here. */
+  readonly configuration: JsonValue;
+  /** Provider/model route selected by the closure, or null for a provider-independent extractor. */
+  readonly modelRoute: string | null;
+  /** Dynamic provider prompt renderer identity/configuration, or null when no provider prompt is used. */
+  readonly providerPrompt: RuntimeComponentIdentity | null;
+}
+
 export class FunctionExtractor implements Extractor {
   private readonly fn: ExternalExtractorFn | ProviderExtractorFn;
   readonly accountingMode: "external" | "provider";
+  readonly identity: RuntimeComponentIdentity;
 
-  constructor(fn: ExternalExtractorFn, accountingMode?: "external");
-  constructor(fn: ProviderExtractorFn, accountingMode: "provider");
+  constructor(fn: ExternalExtractorFn, accountingMode: "external", identity: FunctionExtractorIdentity);
+  constructor(fn: ProviderExtractorFn, accountingMode: "provider", identity: FunctionExtractorIdentity);
   constructor(
     fn: ExternalExtractorFn | ProviderExtractorFn,
     accountingMode: "external" | "provider" = "external",
+    identity?: FunctionExtractorIdentity,
   ) {
     this.fn = fn;
     this.accountingMode = accountingMode;
+    if (!identity) throw new TypeError("FunctionExtractor requires stable non-secret closure identity and configuration");
+    this.identity = {
+      id: "pi-rlm/function-extractor",
+      version: "1",
+      configuration: {
+        mode: accountingMode,
+        closure: identity.closure,
+        configuration: identity.configuration,
+        modelRoute: identity.modelRoute,
+        providerPrompt: identity.providerPrompt,
+      } as unknown as JsonValue,
+    };
   }
 
   async extract(

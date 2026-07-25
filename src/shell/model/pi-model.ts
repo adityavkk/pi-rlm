@@ -8,6 +8,7 @@
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Context, StopReason } from "@earendil-works/pi-ai";
+import type { RuntimeComponentIdentity } from "../../core/identity.ts";
 import { MAX_CALL_DURATION_MS, type CallUsage } from "../../core/usage.ts";
 import { monotonicClock, type Clock } from "../clock.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "./client.ts";
@@ -83,12 +84,19 @@ const mapMessage = (message: AssistantMessage, provider: string, model: string, 
 
 export class PiModelClient implements ModelClient {
   readonly id = "pi-model-runtime";
+  readonly identity: RuntimeComponentIdentity;
 
   constructor(
     private readonly runtime: ModelRuntime,
     private readonly defaultModel: string,
     private readonly clock: Clock = monotonicClock,
-  ) {}
+  ) {
+    this.identity = {
+      id: "pi-rlm/pi-model-client",
+      version: "1",
+      configuration: { defaultModel, routingPolicy: "request-model-or-default-v1", transportRetries: 0 },
+    };
+  }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const { provider, model } = splitModel(request.model ?? this.defaultModel);

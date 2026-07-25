@@ -7,12 +7,19 @@
  * turn and the run can still make progress or exhaust cleanly.
  */
 
+import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import { isJsonObject } from "../core/json.ts";
 import { validateAgainstSchema } from "../core/schema.ts";
 import { MAX_CALL_TOKENS } from "../core/usage.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { throwIfAborted } from "./abort.ts";
-import { buildBasePrompt, buildTurnMessage, CELL_SCHEMA } from "./controller-prompt.ts";
+import {
+  buildBasePrompt,
+  buildTurnMessage,
+  CELL_SCHEMA,
+  CONTROLLER_PROMPT_VERSION,
+  CONTROLLER_TURN_VERSION,
+} from "./controller-prompt.ts";
 import type { Cell, ControllerDriver, ControllerModelOperation, FrameState } from "./controller.ts";
 
 export interface ModelControllerOptions {
@@ -35,6 +42,7 @@ const parseCell = (text: string): Cell | undefined => {
 
 export class ModelController implements ControllerDriver {
   private readonly system = buildBasePrompt();
+  readonly identity: RuntimeComponentIdentity;
 
   constructor(
     private readonly model: ModelClient,
@@ -43,6 +51,21 @@ export class ModelController implements ControllerDriver {
     if (options.maxOutputTokens !== undefined
       && (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens <= 0 || options.maxOutputTokens > MAX_CALL_TOKENS))
       throw new TypeError(`maxOutputTokens must be a positive safe integer at most ${MAX_CALL_TOKENS}`);
+    if (!model.identity) throw new TypeError("ModelController requires a ModelClient identity");
+    this.identity = {
+      id: "pi-rlm/model-controller",
+      version: "1",
+      configuration: {
+        model: model.identity,
+        modelRoute: options.model ?? null,
+        maxOutputTokens: options.maxOutputTokens ?? null,
+        staticPromptPolicy: {
+          renderer: "pi-rlm/controller",
+          staticVersion: CONTROLLER_PROMPT_VERSION,
+          turnVersion: CONTROLLER_TURN_VERSION,
+        },
+      } as unknown as RuntimeComponentIdentity["configuration"],
+    };
   }
 
   async next(state: FrameState, signal: AbortSignal, operation: ControllerModelOperation): Promise<Cell> {

@@ -22,6 +22,8 @@ import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, RunState } from "./state.ts";
 import { retainedJsonBytes } from "./stored-bytes.ts";
 
+const modelIdentity = (fixture: string) => ({ id: "test/mock-model-handler", version: "1", configuration: { fixture } } as const);
+
 const within = async <T>(promise: Promise<T>, timeoutMs = 250): Promise<T> => {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -92,6 +94,7 @@ describe("dispatchCall cancellation ownership", () => {
     const started = new Promise<void>((resolve) => { markStarted = resolve; });
     const prompts: string[] = [];
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:94" } },
       id: "abort-ignoring-model",
       complete(request: ModelRequest): Promise<ModelResponse> {
         prompts.push(request.prompt);
@@ -208,6 +211,7 @@ describe("dispatchCall cancellation ownership", () => {
   test("preserves bounded Pi failure metadata and reported usage", async () => {
     const usage = { attempts: 1, inputTokens: 8, outputTokens: 3, totalTokens: 11, costUsd: 0.04, durationMs: 75 };
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:210" } },
       id: "typed-failure",
       async complete(): Promise<ModelResponse> {
         throw new PiModelError("PROVIDER_ERROR", "error", "test-provider", "test-model", usage, "sensitive provider message");
@@ -315,6 +319,7 @@ describe("dispatchCall cancellation ownership", () => {
       { attempts: 1, totalTokens: 1, durationMs: 86_400_001 },
     ];
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:317" } },
       id: "hostile-usage",
       async complete(): Promise<ModelResponse> {
         return { text: "unsafe", usage: usages.shift() as never };
@@ -342,6 +347,7 @@ describe("dispatchCall cancellation ownership", () => {
   test("accounts token overshoot and blocks later calls while enforcing the output default", async () => {
     const requests: ModelRequest[] = [];
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:344" } },
       id: "overshoot",
       async complete(request): Promise<ModelResponse> {
         requests.push(request);
@@ -420,6 +426,7 @@ describe("dispatchCall cancellation ownership", () => {
     );
     const failures = [topAccessor, nestedAccessor, cyclic, oversized];
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:422" } },
       id: "hostile-errors",
       async complete(): Promise<ModelResponse> { throw failures.shift(); },
     };
@@ -455,7 +462,7 @@ describe("dispatchCall cancellation ownership", () => {
   });
 
   test("denied call-cache snapshots never insert and remain denied on retry", async () => {
-    const model = new MockModelClient(() => "oversized model result");
+    const model = new MockModelClient(() => "oversized model result", modelIdentity("src/runtime/broker.test.ts:458"));
     const state = await brokerState(model, "run_cache_bytes");
     state.ledger.current = createLedger({ ...state.ledger.current.limits, storedByteLimit: 1 });
     const results: GuestCallResult[] = [];
@@ -479,7 +486,7 @@ describe("dispatchCall cancellation ownership", () => {
   });
 
   test("cancellation while waiting for retention ownership leaves no cache reservation", async () => {
-    const state = await brokerState(new MockModelClient(() => "unused"), "run_retention_wait_abort");
+    const state = await brokerState(new MockModelClient(() => "unused", modelIdentity("src/runtime/broker.test.ts:482")), "run_retention_wait_abort");
     const held = await state.contextSemaphore.acquire();
     if (!held) throw new Error("expected held semaphore");
     const abort = new AbortController();
@@ -503,7 +510,7 @@ describe("dispatchCall cancellation ownership", () => {
   });
 
   test("cancellation during journal append cannot commit late cache bytes", async () => {
-    const base = await brokerState(new MockModelClient(() => "unused"), "run_retention_append_abort");
+    const base = await brokerState(new MockModelClient(() => "unused", modelIdentity("src/runtime/broker.test.ts:506")), "run_retention_append_abort");
     let started!: () => void;
     let resolveAppend!: (outcome: Awaited<ReturnType<JournalStore["append"]>>) => void;
     const appendStarted = new Promise<void>((resolve) => { started = resolve; });
@@ -538,7 +545,7 @@ describe("dispatchCall cancellation ownership", () => {
   });
 
   test("durable status refresh failure retains one cache charge and propagates once", async () => {
-    const base = await brokerState(new MockModelClient(() => "unused"), "run_retention_durable_failure");
+    const base = await brokerState(new MockModelClient(() => "unused", modelIdentity("src/runtime/broker.test.ts:539")), "run_retention_durable_failure");
     const injected = new JournalAppendError("status_cache", true, new Error("injected refresh failure"));
     let appends = 0;
     const state: RunState = {

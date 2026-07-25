@@ -94,6 +94,8 @@ export type RlmEvent =
       readonly attempt: number;
       readonly outcome: "ok" | "error" | "cancelled" | "invalid_result";
       readonly usage: CallUsage;
+      /** Present for every provider request; omitted only for opaque external operations. */
+      readonly promptSha256?: string;
       readonly errorCode?: string;
     }
   | {

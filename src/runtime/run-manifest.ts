@@ -4,21 +4,31 @@ import { randomUUID } from "node:crypto";
 import { open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { BudgetLimits } from "../core/budget.ts";
+import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import { canonicalStringify, parseJsonValue, type JsonValue } from "../core/json.ts";
 import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
-import type { ControllerDriver, FrameState } from "./controller.ts";
-import { buildBasePrompt, buildTurnMessage, CELL_SCHEMA } from "./controller-prompt.ts";
-import { buildExtractorPromptContract, type Extractor } from "./extractor.ts";
+import type { ModelClient } from "../shell/model/client.ts";
+import type { ControllerDriver } from "./controller.ts";
+import {
+  buildBasePrompt,
+  CELL_SCHEMA,
+  CONTROLLER_PROMPT_VERSION,
+  CONTROLLER_TURN_CONFIGURATION,
+  CONTROLLER_TURN_VERSION,
+} from "./controller-prompt.ts";
+import {
+  EXTRACTOR_PROMPT_CONFIGURATION,
+  EXTRACTOR_PROMPT_VERSION,
+  type Extractor,
+} from "./extractor.ts";
 import { validateProfile, type Profile } from "./profile.ts";
 
 export const RUN_MANIFEST_SCHEMA_VERSION = 1;
 export const RLM_RUNTIME_VERSION = "0.0.1";
 export const RLM_DSL_VERSION = "0.1.0";
-export const CONTROLLER_PROMPT_VERSION = "2";
-export const CONTROLLER_TURN_VERSION = "2";
-export const EXTRACTOR_PROMPT_VERSION = "2";
+export { CONTROLLER_PROMPT_VERSION, CONTROLLER_TURN_VERSION, EXTRACTOR_PROMPT_VERSION };
 export const RUN_MANIFEST_FILE = "manifest.json";
 export const RUN_LOCK_FILE = ".pi-rlm-run.lock";
 
@@ -45,22 +55,25 @@ export interface RunManifest {
   /** Exact limits enforced by this run, including its absolute deadline. */
   readonly limits: BudgetLimits;
   readonly backend: { readonly id: string; readonly version: string };
+  readonly components: {
+    readonly model: RuntimeComponentIdentity;
+    readonly controller: RuntimeComponentIdentity;
+    readonly extractor: RuntimeComponentIdentity | null;
+  };
   readonly prompts: {
     readonly controller: {
       readonly staticVersion: string;
       readonly staticRenderedSha256: string;
       readonly turnVersion: string;
-      readonly turnInputsSha256: string;
-      readonly turnRenderedSha256: string;
+      readonly turnConfiguration: JsonValue;
+      readonly bindingInputsSha256: string;
       readonly responseSchemaSha256: string;
-      readonly implementationSha256: string;
     };
     readonly extractor: {
       readonly enabled: boolean;
       readonly version: string;
-      readonly promptRenderedSha256: string;
-      readonly promptInputsSha256: string;
-      readonly implementationSha256: string;
+      readonly configuration: JsonValue;
+      readonly bindingInputsSha256: string;
     };
   };
   readonly launchAuthorization: { readonly mode: LaunchAuthorizationMode };
@@ -77,6 +90,7 @@ export interface BuildRunManifestInput {
   readonly profile: Profile;
   readonly limits: BudgetLimits;
   readonly backend: InterpreterBackend;
+  readonly model: ModelClient;
   readonly controller: ControllerDriver;
   readonly extractor?: Extractor;
   readonly authorizationMode?: LaunchAuthorizationMode;
@@ -210,8 +224,21 @@ const validateLimits = (value: unknown, profile: Profile): BudgetLimits => {
   return limits as unknown as BudgetLimits;
 };
 
-const methodHash = (value: unknown): string =>
-  sha256(typeof value === "function" ? Function.prototype.toString.call(value) : "none");
+const runtimeIdentity = (value: unknown, path: string): RuntimeComponentIdentity => {
+  const component = record(value, path, ["id", "version", "configuration"]);
+  return {
+    id: string(component.id, `${path}.id`),
+    version: string(component.version, `${path}.version`),
+    configuration: plainJson(component.configuration, `${path}.configuration`),
+  };
+};
+
+const suppliedIdentity = (value: object, path: string): RuntimeComponentIdentity => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, "identity");
+  if (!descriptor || !("value" in descriptor) || descriptor.value === undefined)
+    throw new TypeError(`${path}.identity must be an own data property with stable non-secret identity/version/configuration`);
+  return runtimeIdentity(descriptor.value, `${path}.identity`);
+};
 
 const safeNonce = (nonce: string): string => {
   if (!NONCE.test(nonce)) throw new TypeError("run nonce must be 1-128 safe identifier characters");
@@ -223,67 +250,24 @@ const promptBindings = (
   inputs: RunManifest["inputs"],
   profile: Profile,
   limits: BudgetLimits,
-  controller: ControllerDriver,
-  extractor?: Extractor,
+  components: RunManifest["components"],
 ): RunManifest["prompts"] => {
-  const bindingInputs = plainJson({ program, inputs, profile, limits }, "prompt binding inputs");
-  const descriptors = Object.create(null) as Record<string, unknown>;
-  for (const input of inputs) descriptors[input.name] = {
-    id: `manifest_${input.sha256}`,
-    label: input.label,
-    mimeType: input.mimeType,
-    bytes: input.bytes,
-    estimatedTokens: Math.ceil(input.bytes / 4),
-    sha256: input.sha256,
-  };
-  const turn = buildTurnMessage({
-    frameId: "manifest:f0",
-    depth: 0,
-    objective: program.objective,
-    inputs: descriptors,
-    variables: {},
-    budget: {
-      depth: 0,
-      maxDepth: limits.maxDepth,
-      logicalCallsUsed: 0,
-      logicalCallsRemaining: limits.maxLogicalCalls,
-      attemptsUsed: 0,
-      attemptsRemaining: limits.maxAttempts,
-      activeLeafCalls: 0,
-      maxConcurrency: limits.maxConcurrency,
-      controllerTurnsUsed: 0,
-      controllerTurnsRemaining: limits.maxControllerTurns,
-      reportedTokensUsed: 0,
-      reportedInputTokensUsed: 0,
-      reportedOutputTokensUsed: 0,
-      reportedCostUsd: 0,
-      providerDurationMs: 0,
-      reportedTokensReserved: 0,
-      ...(limits.tokenLimit !== undefined ? { reportedTokenLimit: limits.tokenLimit } : {}),
-      storedBytesUsed: 0,
-      storedByteLimit: limits.storedByteLimit,
-      deadlineMs: limits.deadlineMs,
-    },
-    workspace: {},
-    outputs: program.outputs,
-    trajectory: { entries: [], omittedCount: 0 },
-  } as unknown as FrameState);
+  const bindingInputs = plainJson({ program, inputs, profile, limits, components }, "prompt binding inputs");
+  const bindingInputsSha256 = sha256(canonicalStringify(bindingInputs));
   return {
     controller: {
       staticVersion: CONTROLLER_PROMPT_VERSION,
       staticRenderedSha256: sha256(buildBasePrompt()),
       turnVersion: CONTROLLER_TURN_VERSION,
-      turnInputsSha256: sha256(canonicalStringify(bindingInputs)),
-      turnRenderedSha256: sha256(turn),
+      turnConfiguration: plainJson(CONTROLLER_TURN_CONFIGURATION, "controller turn configuration"),
+      bindingInputsSha256,
       responseSchemaSha256: sha256(canonicalStringify(CELL_SCHEMA)),
-      implementationSha256: methodHash(controller.next),
     },
     extractor: {
-      enabled: extractor !== undefined,
+      enabled: components.extractor !== null,
       version: EXTRACTOR_PROMPT_VERSION,
-      promptRenderedSha256: sha256(buildExtractorPromptContract([])),
-      promptInputsSha256: sha256(canonicalStringify(bindingInputs)),
-      implementationSha256: methodHash(extractor?.extract),
+      configuration: plainJson(EXTRACTOR_PROMPT_CONFIGURATION, "extractor prompt configuration"),
+      bindingInputsSha256,
     },
   };
 };
@@ -297,9 +281,14 @@ export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocum
   const program = validateProgram(input.program);
   const profile = validateProfileJson(plainJson(input.profile, "resolved profile"));
   const limits = validateLimits(plainJson(input.limits, "resolved limits"), profile);
-  const nonce = safeNonce((input.createRunNonce ?? randomUUID)());
   const backendId = string(input.backend.id, "backend.id");
   const backendVersion = string(input.backend.version, "backend.version");
+  const components: RunManifest["components"] = {
+    model: suppliedIdentity(input.model, "model"),
+    controller: suppliedIdentity(input.controller, "controller"),
+    extractor: input.extractor ? suppliedIdentity(input.extractor, "extractor") : null,
+  };
+  const nonce = safeNonce((input.createRunNonce ?? randomUUID)());
   const inputs = program.inputs.map((declared) => {
     const text = input.sources[declared.name] ?? "";
     return {
@@ -319,7 +308,8 @@ export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocum
     profile: plainJson(profile, "resolved profile"),
     limits,
     backend: { id: backendId, version: backendVersion },
-    prompts: promptBindings(program, inputs, profile, limits, input.controller, input.extractor),
+    components,
+    prompts: promptBindings(program, inputs, profile, limits, components),
     launchAuthorization: { mode: input.authorizationMode ?? "direct" },
   };
   return { manifest, manifestHash: computeManifestHash(manifest) };
@@ -351,6 +341,7 @@ export type RunDirectoryErrorCode =
   | "RUN_DIRECTORY_IN_USE"
   | "RUN_DIRECTORY_NOT_EMPTY"
   | "MANIFEST_WRITE_FAILED"
+  | "MANIFEST_CLEANUP_FAILED"
   | "MANIFEST_INVALID"
   | "MANIFEST_MISMATCH";
 
@@ -367,12 +358,23 @@ const errorCode = (error: unknown): string | undefined => {
   return descriptor && "value" in descriptor && typeof descriptor.value === "string" ? descriptor.value : undefined;
 };
 
+class HandleCleanupError extends Error {
+  override readonly name = "HandleCleanupError";
+  constructor(message: string, override readonly cause: unknown) { super(message); }
+}
+
 const closeAfter = async (handle: RunDirectoryFileHandle, operation: () => Promise<void>): Promise<void> => {
-  let failed = false;
-  let failure: unknown;
-  try { await operation(); } catch (error) { failed = true; failure = error; }
-  try { await handle.close(); } catch (error) { if (!failed) { failed = true; failure = error; } }
-  if (failed) throw failure;
+  let primary: unknown;
+  try { await operation(); } catch (error) { primary = error; }
+  try {
+    await handle.close();
+  } catch (cleanup) {
+    throw new HandleCleanupError(
+      "failed to close filesystem handle",
+      primary === undefined ? cleanup : new AggregateError([primary, cleanup], "operation and handle cleanup both failed"),
+    );
+  }
+  if (primary !== undefined) throw primary;
 };
 
 const syncDirectory = async (dir: string, fileSystem: RunDirectoryFileSystem): Promise<void> => {
@@ -380,9 +382,12 @@ const syncDirectory = async (dir: string, fileSystem: RunDirectoryFileSystem): P
   await closeAfter(handle, () => handle.sync());
 };
 
-const cleanupTemp = async (path: string, fileSystem: RunDirectoryFileSystem): Promise<void> => {
-  try { await fileSystem.unlink(path); } catch (error) { if (errorCode(error) !== "ENOENT") return; }
+const cleanupFile = async (path: string, fileSystem: RunDirectoryFileSystem): Promise<void> => {
+  try { await fileSystem.unlink(path); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
 };
+
+const combinedFailure = (primary: unknown, cleanup: readonly unknown[], message: string): unknown =>
+  cleanup.length === 0 ? primary : new AggregateError([primary, ...cleanup], message);
 
 /** Permanently claim an empty run directory and atomically publish its manifest. */
 export const claimRunDirectory = async (
@@ -407,42 +412,46 @@ export const claimRunDirectory = async (
       await lock.sync();
     });
   } catch (error) {
-    // The exclusive create is never rolled back. Persist its directory entry
-    // when possible so every later failure remains permanently fail-closed.
-    try { await syncDirectory(dir, fileSystem); } catch { /* Preserve the primary fault. */ }
+    const cleanup: unknown[] = [];
+    try { await cleanupFile(lockPath, fileSystem); } catch (cleanupError) { cleanup.push(cleanupError); }
+    try { await syncDirectory(dir, fileSystem); } catch (cleanupError) { cleanup.push(cleanupError); }
+    const handleCleanup = error instanceof HandleCleanupError;
+    const cause = combinedFailure(handleCleanup ? error.cause : error, cleanup, "run claim and lock cleanup both failed");
+    if (handleCleanup || cleanup.length > 0)
+      throw new RunDirectoryError("MANIFEST_CLEANUP_FAILED", "failed to clean an incomplete run directory claim", cause);
     if (error instanceof RunDirectoryError) throw error;
-    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to persist run directory claim", error);
+    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to persist run directory claim", cause);
   }
 
   const tempPath = join(dir, `.${RUN_MANIFEST_FILE}.${document.manifest.run.nonce}.tmp`);
   const manifestPath = join(dir, RUN_MANIFEST_FILE);
+  let tempCreated = false;
   let renamed = false;
   try {
     // Makes the exclusive lock directory entry durable before any valid manifest can appear.
     await syncDirectory(dir, fileSystem);
     const temp = await fileSystem.open(tempPath, "wx");
-    try {
-      await closeAfter(temp, async () => {
-        await temp.writeFile(`${canonicalStringify(plainJson(document, "run manifest document"))}\n`, "utf8");
-        await temp.sync();
-      });
-    } catch (error) {
-      await cleanupTemp(tempPath, fileSystem);
-      throw error;
-    }
-    try {
-      await fileSystem.rename(tempPath, manifestPath);
-      renamed = true;
-    } catch (error) {
-      await cleanupTemp(tempPath, fileSystem);
-      throw error;
-    }
+    tempCreated = true;
+    await closeAfter(temp, async () => {
+      await temp.writeFile(`${canonicalStringify(plainJson(document, "run manifest document"))}\n`, "utf8");
+      await temp.sync();
+    });
+    await fileSystem.rename(tempPath, manifestPath);
+    tempCreated = false;
+    renamed = true;
     // Once rename succeeds, the file is complete and synced. A sync/close fault is
     // reported, but reopen may safely accept this exact document; the lock remains permanent.
     await syncDirectory(dir, fileSystem);
   } catch (error) {
-    if (!renamed) await cleanupTemp(tempPath, fileSystem);
-    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to publish durable run manifest", error);
+    const cleanup: unknown[] = [];
+    if (tempCreated && !renamed) {
+      try { await cleanupFile(tempPath, fileSystem); } catch (cleanupError) { cleanup.push(cleanupError); }
+    }
+    const handleCleanup = error instanceof HandleCleanupError;
+    const cause = combinedFailure(handleCleanup ? error.cause : error, cleanup, "manifest publication and temporary-file cleanup both failed");
+    if (handleCleanup || cleanup.length > 0)
+      throw new RunDirectoryError("MANIFEST_CLEANUP_FAILED", "failed to clean an incomplete run manifest", cause);
+    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to publish durable run manifest", cause);
   }
 };
 
@@ -451,7 +460,7 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const document = record(snapshot, "manifest document", ["manifest", "manifestHash"]);
   hash(document.manifestHash, "manifestHash");
   const manifest = record(document.manifest, "manifest", [
-    "schemaVersion", "runtime", "run", "program", "inputs", "profile", "limits", "backend", "prompts", "launchAuthorization",
+    "schemaVersion", "runtime", "run", "program", "inputs", "profile", "limits", "backend", "components", "prompts", "launchAuthorization",
   ]);
   if (manifest.schemaVersion !== RUN_MANIFEST_SCHEMA_VERSION) throw new TypeError("unsupported manifest schema version");
   const runtime = record(manifest.runtime, "manifest.runtime", ["package", "packageVersion", "dslVersion"]);
@@ -461,36 +470,52 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const nonce = string(run.nonce, "manifest.run.nonce");
   if (!NONCE.test(nonce) || run.id !== `run_${nonce}`) throw new TypeError("manifest run identity is invalid");
   const program = validateProgram(manifest.program);
-  const inputs = array(manifest.inputs, "manifest.inputs");
-  if (inputs.length !== program.inputs.length) throw new TypeError("manifest inputs do not match program");
-  inputs.forEach((entry, index) => {
+  const rawInputs = array(manifest.inputs, "manifest.inputs");
+  if (rawInputs.length !== program.inputs.length) throw new TypeError("manifest inputs do not match program");
+  const inputs = rawInputs.map((entry, index) => {
     const value = record(entry, `manifest.inputs[${index}]`, ["name", "label", "mimeType", "bytes", "sha256"]);
     if (value.name !== program.inputs[index]?.name || value.label !== value.name || value.mimeType !== "text/plain")
       throw new TypeError(`manifest.inputs[${index}] does not match program`);
-    string(value.name, `manifest.inputs[${index}].name`);
-    integer(value.bytes, `manifest.inputs[${index}].bytes`);
-    hash(value.sha256, `manifest.inputs[${index}].sha256`);
+    return {
+      name: string(value.name, `manifest.inputs[${index}].name`),
+      label: string(value.label, `manifest.inputs[${index}].label`),
+      mimeType: string(value.mimeType, `manifest.inputs[${index}].mimeType`),
+      bytes: integer(value.bytes, `manifest.inputs[${index}].bytes`),
+      sha256: hash(value.sha256, `manifest.inputs[${index}].sha256`),
+    };
   });
   const profile = validateProfileJson(manifest.profile);
-  validateLimits(manifest.limits, profile);
+  const limits = validateLimits(manifest.limits, profile);
   const backend = record(manifest.backend, "manifest.backend", ["id", "version"]);
   string(backend.id, "manifest.backend.id");
   string(backend.version, "manifest.backend.version");
+  const rawComponents = record(manifest.components, "manifest.components", ["model", "controller", "extractor"]);
+  const components: RunManifest["components"] = {
+    model: runtimeIdentity(rawComponents.model, "manifest.components.model"),
+    controller: runtimeIdentity(rawComponents.controller, "manifest.components.controller"),
+    extractor: rawComponents.extractor === null
+      ? null
+      : runtimeIdentity(rawComponents.extractor, "manifest.components.extractor"),
+  };
   const prompts = record(manifest.prompts, "manifest.prompts", ["controller", "extractor"]);
   const controller = record(prompts.controller, "manifest.prompts.controller", [
-    "staticVersion", "staticRenderedSha256", "turnVersion", "turnInputsSha256", "turnRenderedSha256", "responseSchemaSha256", "implementationSha256",
+    "staticVersion", "staticRenderedSha256", "turnVersion", "turnConfiguration", "bindingInputsSha256", "responseSchemaSha256",
   ]);
-  string(controller.staticVersion, "manifest.prompts.controller.staticVersion");
-  string(controller.turnVersion, "manifest.prompts.controller.turnVersion");
-  for (const field of ["staticRenderedSha256", "turnInputsSha256", "turnRenderedSha256", "responseSchemaSha256", "implementationSha256"] as const)
+  if (controller.staticVersion !== CONTROLLER_PROMPT_VERSION || controller.turnVersion !== CONTROLLER_TURN_VERSION)
+    throw new TypeError("manifest controller prompt version is unsupported");
+  plainJson(controller.turnConfiguration, "manifest.prompts.controller.turnConfiguration");
+  for (const field of ["staticRenderedSha256", "bindingInputsSha256", "responseSchemaSha256"] as const)
     hash(controller[field], `manifest.prompts.controller.${field}`);
   const extractor = record(prompts.extractor, "manifest.prompts.extractor", [
-    "enabled", "version", "promptRenderedSha256", "promptInputsSha256", "implementationSha256",
+    "enabled", "version", "configuration", "bindingInputsSha256",
   ]);
   if (typeof extractor.enabled !== "boolean") throw new TypeError("manifest.prompts.extractor.enabled must be boolean");
-  string(extractor.version, "manifest.prompts.extractor.version");
-  for (const field of ["promptRenderedSha256", "promptInputsSha256", "implementationSha256"] as const)
-    hash(extractor[field], `manifest.prompts.extractor.${field}`);
+  if (extractor.version !== EXTRACTOR_PROMPT_VERSION) throw new TypeError("manifest extractor prompt version is unsupported");
+  plainJson(extractor.configuration, "manifest.prompts.extractor.configuration");
+  hash(extractor.bindingInputsSha256, "manifest.prompts.extractor.bindingInputsSha256");
+  const expectedPrompts = promptBindings(program, inputs, profile, limits, components);
+  if (canonicalStringify(plainJson(prompts, "manifest prompts")) !== canonicalStringify(plainJson(expectedPrompts, "expected prompts")))
+    throw new TypeError("manifest prompt metadata is not derivable from the normalized manifest identity");
   const authorization = record(manifest.launchAuthorization, "manifest.launchAuthorization", ["mode"]);
   if (authorization.mode !== "confirmed" && authorization.mode !== "slash_command" && authorization.mode !== "direct")
     throw new TypeError("manifest launch authorization mode is invalid");

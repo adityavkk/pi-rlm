@@ -13,6 +13,13 @@ import { FunctionExtractor } from "./extractor.ts";
 import { DEFAULT_PROFILE } from "./profile.ts";
 import { runProgram, type RunResult } from "./run.ts";
 
+const extractorIdentity = (fixture: string) => ({
+  closure: { id: "test/extractor-closure", version: "1", configuration: { fixture } },
+  configuration: { fixture },
+  modelRoute: "test/model",
+  providerPrompt: { id: "test/extractor-prompt", version: "1", configuration: { fixture } },
+} as const);
+
 const tmp = () => mkdtemp(join(tmpdir(), "pi-rlm-cancel-"));
 const within = async <T>(work: Promise<T>, ms = 400): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -40,6 +47,7 @@ const program = (withInput = false): RlmProgram => {
 };
 
 class OneCellController implements ControllerDriver {
+  readonly identity = { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:42" } } as const;
   constructor(
     private readonly cell: Cell = { reasoning: "run", code: "1" },
     private readonly child?: ControllerDriver,
@@ -63,6 +71,7 @@ class FunctionBackend implements InterpreterBackend {
 }
 
 const unusedModel: ModelClient = {
+  identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:65" } },
   id: "unused",
   async complete(): Promise<ModelResponse> {
     throw new Error("unexpected model call");
@@ -137,6 +146,7 @@ describe("run cancellation and terminal finalization", () => {
     owner.abort();
     let calls = 0;
     const controller: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:139" } },
       async next(): Promise<Cell> { calls += 1; return { reasoning: "late", code: "1" }; },
       fork() { return this; },
     };
@@ -155,6 +165,7 @@ describe("run cancellation and terminal finalization", () => {
     let started!: () => void;
     const pending = new Promise<void>((resolve) => { started = resolve; });
     const controller: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:157" } },
       async next(_state: FrameState): Promise<Cell> {
         started();
         await new Promise(() => {});
@@ -181,6 +192,7 @@ describe("run cancellation and terminal finalization", () => {
     const started = new Promise<void>((resolve) => { markStarted = resolve; });
     let calls = 0;
     const model: ModelClient = {
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:183" } },
       id: "late-model",
       complete(request: ModelRequest): Promise<ModelResponse> {
         calls += 1;
@@ -224,6 +236,7 @@ describe("run cancellation and terminal finalization", () => {
     let childStarted!: () => void;
     const pending = new Promise<void>((resolve) => { childStarted = resolve; });
     const child: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:226" } },
       async next(): Promise<Cell> { childStarted(); await new Promise(() => {}); return { reasoning: "late", code: "1" }; },
       fork() { return this; },
     };
@@ -253,7 +266,7 @@ describe("run cancellation and terminal finalization", () => {
       let markStarted!: () => void;
       const started = new Promise<void>((resolve) => { markStarted = resolve; });
       const extractor = kind === "extractor"
-        ? new FunctionExtractor(async () => { markStarted(); await new Promise(() => {}); return { ok: false, code: "FAILED", message: "late" }; })
+        ? new FunctionExtractor(async () => { markStarted(); await new Promise(() => {}); return { ok: false, code: "FAILED", message: "late" }; }, "external", extractorIdentity("src/runtime/run-cancellation.test.ts:256"))
         : undefined;
       const backend = new FunctionBackend(async (options) => {
         if (kind === "interpreter") { markStarted(); await new Promise(() => {}); }
@@ -283,12 +296,15 @@ describe("run cancellation and terminal finalization", () => {
     const cases: Array<{ expected: string; controller: ControllerDriver; extractor?: FunctionExtractor }> = [
       {
         expected: "CONTROLLER_FAILED",
-        controller: { async next() { throw new Error("secret-controller-detail"); }, fork() { return this; } },
+        controller: {
+          identity: { id: "test/throwing-controller", version: "1", configuration: { fixture: "controller-exception" } },
+          async next() { throw new Error("secret-controller-detail"); }, fork() { return this; },
+        },
       },
       {
         expected: "EXTRACTOR_FAILED",
         controller: new OneCellController(),
-        extractor: new FunctionExtractor(async () => { throw new Error("secret-extractor-detail"); }),
+        extractor: new FunctionExtractor(async () => { throw new Error("secret-extractor-detail"); }, "external", extractorIdentity("src/runtime/run-cancellation.test.ts:291")),
       },
     ];
     for (const entry of cases) {
@@ -327,6 +343,7 @@ describe("run cancellation and terminal finalization", () => {
   test("run deadline aborts pending work and rebuilds terminal status", async () => {
     const dir = await tmp();
     const controller: ControllerDriver = {
+      identity: { id: "test/controller", version: "1", configuration: { fixture: "src/runtime/run-cancellation.test.ts:329" } },
       async next(): Promise<Cell> { await new Promise(() => {}); return { reasoning: "late", code: "1" }; },
       fork() { return this; },
     };
@@ -349,7 +366,10 @@ describe("run cancellation and terminal finalization", () => {
       const owner = new AbortController();
       if (classification === "cancelled") owner.abort();
       const controller: ControllerDriver = classification === "failed"
-        ? { async next() { throw new Error("expected failure"); }, fork() { return this; } }
+        ? {
+            identity: { id: "test/throwing-controller", version: "1", configuration: { fixture: `terminal-${fault}` } },
+            async next() { throw new Error("expected failure"); }, fork() { return this; },
+          }
         : new OneCellController();
       const backend = new FunctionBackend(async (options) => {
         options.effect("answer", { value: { answer: "done" } });

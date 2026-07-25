@@ -254,3 +254,16 @@ describe("PiModelClient retry policy", () => {
     expect(observedOptions).toMatchObject({ maxRetries: 0 });
   });
 });
+
+describe("PiModelClient manifest identity", () => {
+  test("binds default model and routing policy without runtime secrets", () => {
+    const a = new PiModelClient({} as never, "provider/model-a");
+    const b = new PiModelClient({} as never, "provider/model-b");
+    expect(a.identity).toMatchObject({
+      id: "pi-rlm/pi-model-client",
+      version: "1",
+      configuration: { defaultModel: "provider/model-a", transportRetries: 0 },
+    });
+    expect(a.identity).not.toEqual(b.identity);
+  });
+});

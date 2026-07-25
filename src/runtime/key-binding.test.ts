@@ -40,7 +40,10 @@ const makeState = async (append: (event: RlmEvent) => Promise<unknown>, model?: 
     ledger: { current: createLedger(resolveLimits(DEFAULT_PROFILE, startMs)) },
     store: new ContextStore(await mkdtemp(join(tmpdir(), "pi-rlm-bindings-"))),
     artifacts: new Map(),
-    model: model ?? { id: "unused", complete: async () => ({ text: "ok", usage: ZERO_CALL_USAGE }) },
+    model: model ?? {
+      id: "unused",
+      identity: { id: "test/key-binding-model", version: "1", configuration: { fixture: "unused" } },
+      complete: async () => ({ text: "ok", usage: ZERO_CALL_USAGE }) },
     journal: { append } as JournalStore,
     backend: {} as InterpreterBackend,
     callCache: new Map(),
@@ -118,6 +121,7 @@ describe("key binding journal transactions", () => {
         throw new JournalAppendError("event", false, new Error("injected"));
     }, {
       id: "counting",
+      identity: { id: "test/key-binding-model", version: "1", configuration: { fixture: "counting" } },
       complete: async () => {
         providerCalls += 1;
         return { text: "unexpected", usage: ZERO_CALL_USAGE };
@@ -140,6 +144,7 @@ describe("validate before key binding", () => {
     let providerCalls = 0;
     const state = await makeState(async (event) => { events.push(event); }, {
       id: "counting",
+      identity: { id: "test/key-binding-model", version: "1", configuration: { fixture: "validate" } },
       complete: async () => {
         providerCalls += 1;
         return { text: "ok", usage: ZERO_CALL_USAGE };
