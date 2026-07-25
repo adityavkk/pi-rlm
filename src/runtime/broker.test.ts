@@ -89,16 +89,46 @@ describe("tokenReservation", () => {
 describe("dispatchCall cancellation ownership", () => {
   test("releases a timed-out holder and aborted waiter, then admits an independent call", async () => {
     let rejectStuck!: (error: Error) => void;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let markHolderStarted!: () => void;
+    let markWaiterQueued!: () => void;
+    const holderStarted = new Promise<void>((resolve) => { markHolderStarted = resolve; });
+    const waiterQueued = new Promise<void>((resolve) => { markWaiterQueued = resolve; });
     const prompts: string[] = [];
+    let leafAcquireRequests = 0;
+    let leafAcquisitions = 0;
+    let leafReleaseInvocations = 0;
+    let retentionAcquisitions = 0;
+    let retentionReleaseInvocations = 0;
+
+    class ObservedSemaphore extends Semaphore {
+      constructor(
+        max: number,
+        private readonly onRequest: () => void,
+        private readonly onAcquired: () => void,
+        private readonly onRelease: () => void,
+      ) {
+        super(max);
+      }
+
+      override async acquire(signal?: AbortSignal): Promise<(() => void) | undefined> {
+        this.onRequest();
+        const release = await super.acquire(signal);
+        if (!release) return undefined;
+        this.onAcquired();
+        return () => {
+          this.onRelease();
+          release();
+        };
+      }
+    }
+
     const model: ModelClient = {
-      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:94" } },
+      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:122" } },
       id: "abort-ignoring-model",
       complete(request: ModelRequest): Promise<ModelResponse> {
         prompts.push(request.prompt);
         if (request.prompt === "stuck") {
-          markStarted();
+          markHolderStarted();
           return new Promise((_resolve, reject) => { rejectStuck = reject; });
         }
         return Promise.resolve({ text: "next-ok", usage: ZERO_CALL_USAGE });
@@ -113,13 +143,14 @@ describe("dispatchCall cancellation ownership", () => {
     });
     if (!normalized.ok) throw new Error("invalid test program");
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-broker-"));
-    const startMs = Date.now();
+    const clock = new ManualClock(1_000);
+    const startMs = clock.now();
     const profile = { ...DEFAULT_PROFILE, maxConcurrency: 1 };
     const state: RunState = {
       runId: "run_broker_abort",
       startMs,
       profile,
-      clock: systemClock,
+      clock,
       hasher: sha256,
       program: normalized.value,
       ledger: { current: createLedger(resolveLimits(profile, startMs)) },
@@ -132,13 +163,21 @@ describe("dispatchCall cancellation ownership", () => {
       inflight: new Map(),
       keyIdentities: new Map(),
       scopeUsage: new Map(),
-      semaphore: new Semaphore(1),
-      contextSemaphore: new Semaphore(1),
+      semaphore: new ObservedSemaphore(1, () => {
+        leafAcquireRequests += 1;
+        if (leafAcquireRequests === 2) markWaiterQueued();
+      }, () => { leafAcquisitions += 1; }, () => { leafReleaseInvocations += 1; }),
+      contextSemaphore: new ObservedSemaphore(
+        1,
+        () => {},
+        () => { retentionAcquisitions += 1; },
+        () => { retentionReleaseInvocations += 1; },
+      ),
       frameSeq: { current: 1 },
     };
     const frame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };
     const recurse = async (): Promise<GuestCallResult> => { throw new Error("unexpected recurse"); };
-    const deadlineMs = Date.now() + 5_000;
+    const deadlineMs = clock.now() + 10;
 
     const holderAbort = new AbortController();
     const holder = dispatchCall(
@@ -150,7 +189,13 @@ describe("dispatchCall cancellation ownership", () => {
       holderAbort.signal,
       deadlineMs,
     ) as Promise<GuestCallResult>;
-    await within(started);
+    await holderStarted;
+    expect(leafAcquireRequests).toBe(1);
+    expect(leafAcquisitions).toBe(1);
+    expect(leafReleaseInvocations).toBe(0);
+    expect(state.ledger.current.usage.activeLeafCalls).toBe(1);
+    expect(state.ledger.current.usage.logicalCalls).toBe(1);
+    expect(state.ledger.current.usage.attempts).toBe(1);
 
     const waiterAbort = new AbortController();
     const waiter = dispatchCall(
@@ -162,21 +207,26 @@ describe("dispatchCall cancellation ownership", () => {
       waiterAbort.signal,
       deadlineMs,
     ) as Promise<GuestCallResult>;
-    await within((async () => {
-      while (state.inflight.size !== 2) await new Promise((resolve) => setTimeout(resolve, 1));
-    })());
+    await waiterQueued;
     expect(state.inflight.size).toBe(2);
+    expect(leafAcquireRequests).toBe(2);
+    expect(leafAcquisitions).toBe(1);
     expect(state.ledger.current.usage.logicalCalls).toBe(1);
+    expect(retentionAcquisitions).toBe(0);
 
     waiterAbort.abort();
-    const waiterResult = await within(waiter);
+    const waiterResult = await waiter;
     expect(waiterResult.error?.code).toBe("CANCELLED");
     expect(state.inflight.size).toBe(1);
     expect(state.ledger.current.usage.logicalCalls).toBe(1);
+    expect(leafAcquisitions).toBe(1);
+    expect(leafReleaseInvocations).toBe(0);
+    expect(retentionAcquisitions).toBe(0);
 
-    const holderDeadline = setTimeout(() => holderAbort.abort(), 20);
-    const holderResult = await within(holder);
-    clearTimeout(holderDeadline);
+    clock.advance(10);
+    expect(clock.now()).toBe(deadlineMs);
+    holderAbort.abort();
+    const holderResult = await holder;
     expect(holderResult.error?.code).toBe("CANCELLED");
     expect(state.inflight.size).toBe(0);
     expect(state.ledger.current.usage.logicalCalls).toBe(1);
@@ -184,27 +234,40 @@ describe("dispatchCall cancellation ownership", () => {
     expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(state.callCache.size).toBe(0);
+    expect(leafAcquisitions).toBe(1);
+    expect(leafReleaseInvocations).toBe(1);
+    expect(retentionAcquisitions).toBe(0);
 
     rejectStuck(new Error("late model rejection"));
     await Promise.resolve();
     await Promise.resolve();
     expect(state.inflight.size).toBe(0);
     expect(state.callCache.size).toBe(0);
+    expect(leafReleaseInvocations).toBe(1);
 
-    const next = await within(dispatchCall(
+    const next = await dispatchCall(
       state,
       frame,
       "llm",
       { key: "next", prompt: "next" },
       recurse,
       new AbortController().signal,
-      deadlineMs,
-    ) as Promise<GuestCallResult>);
+      deadlineMs + 10,
+    ) as GuestCallResult;
     expect(next.ok).toBe(true);
     expect(next.value).toBe("next-ok");
     expect(prompts).toEqual(["stuck", "next"]);
     expect(state.inflight.size).toBe(0);
     expect(state.callCache.size).toBe(1);
+    expect(state.ledger.current.usage.logicalCalls).toBe(2);
+    expect(state.ledger.current.usage.attempts).toBe(2);
+    expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
+    expect(state.ledger.current.usage.tokensReserved).toBe(0);
+    expect(leafAcquireRequests).toBe(3);
+    expect(leafAcquisitions).toBe(2);
+    expect(leafReleaseInvocations).toBe(2);
+    expect(retentionAcquisitions).toBe(1);
+    expect(retentionReleaseInvocations).toBe(1);
   });
 
   test("preserves bounded Pi failure metadata and reported usage", async () => {
