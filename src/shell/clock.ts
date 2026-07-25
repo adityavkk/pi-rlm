@@ -5,6 +5,7 @@ export interface Clock {
 }
 
 export const systemClock: Clock = { now: () => Date.now() };
+export const monotonicClock: Clock = { now: () => performance.now() };
 
 /** A manually advanced clock for tests. */
 export class ManualClock implements Clock {

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { StopReason } from "@earendil-works/pi-ai";
+import { MAX_CALL_DURATION_MS } from "../../core/usage.ts";
+import { ManualClock } from "../clock.ts";
 import { PiModelClient, PiModelError, type PiModelErrorCode } from "./pi-model.ts";
 
 const REPORTED_USAGE = {
@@ -27,7 +29,8 @@ interface MessageFixture {
   readonly errorMessage?: string;
 }
 
-const clientFor = (fixture: MessageFixture): PiModelClient => {
+const clientFor = (fixture: MessageFixture, durationMs = 0): PiModelClient => {
+  const clock = new ManualClock();
   const message = {
     role: "assistant",
     api: "test-api",
@@ -40,9 +43,12 @@ const clientFor = (fixture: MessageFixture): PiModelClient => {
   const runtime = {
     getModel: (provider: string, model: string) =>
       provider === "test-provider" && model === "test-model" ? { provider, id: model } : undefined,
-    completeSimple: async () => message,
+    completeSimple: async () => {
+      clock.advance(durationMs);
+      return message;
+    },
   } as unknown as ModelRuntime;
-  return new PiModelClient(runtime, "test-provider/test-model");
+  return new PiModelClient(runtime, "test-provider/test-model", clock);
 };
 
 type AdapterCase =
@@ -104,6 +110,97 @@ const cases: readonly AdapterCase[] = [
 ];
 
 describe("PiModelClient stop reasons", () => {
+  test("measures completion duration for success and typed provider failure", async () => {
+    const success = await clientFor({ stopReason: "stop", content: [{ type: "text", text: "ok" }] }, 125)
+      .complete({ prompt: "test" });
+    expect(success.usage.durationMs).toBe(125);
+
+    try {
+      await clientFor({ stopReason: "error", content: [] }, 275).complete({ prompt: "test" });
+      throw new Error("expected PiModelError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PiModelError);
+      expect((error as PiModelError).usage.durationMs).toBe(275);
+    }
+  });
+
+  test("sanitizes ordinary runtime rejection and includes elapsed duration", async () => {
+    const clock = new ManualClock();
+    const runtime = {
+      getModel: () => ({ provider: "test-provider", id: "test-model" }),
+      completeSimple: async () => {
+        clock.advance(90);
+        const providerError = new Error("sensitive provider failure");
+        providerError.stack = "sensitive provider stack";
+        throw providerError;
+      },
+    } as unknown as ModelRuntime;
+
+    try {
+      await new PiModelClient(runtime, "test-provider/test-model", clock).complete({ prompt: "test" });
+      throw new Error("expected PiModelError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PiModelError);
+      expect(error).toMatchObject({
+        code: "PROVIDER_ERROR",
+        stopReason: "error",
+        provider: "test-provider",
+        model: "test-model",
+        usage: { attempts: 1, durationMs: 90 },
+      });
+      expect((error as Error).message).not.toContain("sensitive");
+      expect((error as Error).stack).not.toContain("provider stack");
+    }
+  });
+
+  test("bounds invalid and non-monotonic clock readings", async () => {
+    const cases = [
+      { readings: [0, 1.9], expected: 1 },
+      { readings: [100, 50], expected: 0 },
+      { readings: [Number.NaN, 100], expected: 0 },
+      { readings: [0, Number.POSITIVE_INFINITY], expected: 0 },
+      { readings: [-Number.MAX_VALUE, Number.MAX_VALUE], expected: MAX_CALL_DURATION_MS },
+    ];
+    for (const { readings, expected } of cases) {
+      let index = 0;
+      const clock = { now: () => readings[index++]! };
+      const runtime = {
+        getModel: () => ({ provider: "test-provider", id: "test-model" }),
+        completeSimple: async () => { throw new Error("runtime failure"); },
+      } as unknown as ModelRuntime;
+      try {
+        await new PiModelClient(runtime, "test-provider/test-model", clock).complete({ prompt: "test" });
+        throw new Error("expected PiModelError");
+      } catch (error) {
+        expect(error).toBeInstanceOf(PiModelError);
+        expect((error as PiModelError).usage.durationMs).toBe(expected);
+      }
+    }
+  });
+
+  test("types runtime rejection after cancellation and includes elapsed duration", async () => {
+    const clock = new ManualClock();
+    const runtime = {
+      getModel: () => ({ provider: "test-provider", id: "test-model" }),
+      completeSimple: async () => {
+        clock.advance(40);
+        throw new Error("sensitive abort reason");
+      },
+    } as unknown as ModelRuntime;
+    const owner = new AbortController();
+    owner.abort();
+    const completion = new PiModelClient(runtime, "test-provider/test-model", clock)
+      .complete({ prompt: "test", signal: owner.signal });
+    try {
+      await completion;
+      throw new Error("expected PiModelError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PiModelError);
+      expect(error).toMatchObject({ code: "CANCELLED", stopReason: "aborted", usage: { attempts: 1, durationMs: 40 } });
+      expect((error as Error).message).not.toContain("sensitive");
+    }
+  });
+
   for (const adapterCase of cases) {
     test(adapterCase.name, async () => {
       const completion = clientFor(adapterCase.fixture).complete({ prompt: "test" });

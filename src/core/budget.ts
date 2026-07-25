@@ -9,6 +9,7 @@
 
 import { type CallError, callError } from "./errors.ts";
 import { err, ok, type Result } from "./result.ts";
+import { MAX_CALL_TOKENS } from "./usage.ts";
 
 export interface BudgetLimits {
   readonly maxDepth: number;
@@ -95,20 +96,42 @@ export const reserveAttempt = (
   reserveTokens = 0,
 ): Result<Ledger, CallError> => {
   if (deadlinePassed(ledger, now)) return err(callError("BUDGET_DEADLINE", "run deadline reached"));
-  if (ledger.usage.attempts + 1 > ledger.limits.maxAttempts)
+  if (!Number.isSafeInteger(reserveTokens) || reserveTokens < 0 || reserveTokens > MAX_CALL_TOKENS)
+    return err(callError("INVALID_REQUEST", "invalid attempt token reservation"));
+  if (!Number.isSafeInteger(ledger.usage.attempts) || ledger.usage.attempts < 0
+    || !Number.isSafeInteger(ledger.usage.tokensReserved) || ledger.usage.tokensReserved < 0
+    || !Number.isSafeInteger(ledger.usage.tokensUsed) || ledger.usage.tokensUsed < 0)
+    return err(callError("INVALID_RESULT", "invalid ledger accounting"));
+  if (ledger.usage.attempts >= ledger.limits.maxAttempts)
     return err(callError("BUDGET_ATTEMPTS", `attempt limit ${ledger.limits.maxAttempts} reached`));
+  if (ledger.usage.tokensReserved > Number.MAX_SAFE_INTEGER - reserveTokens)
+    return err(callError("BUDGET_TOKENS", "token reservation overflow"));
   const nextReserved = ledger.usage.tokensReserved + reserveTokens;
-  if (ledger.limits.tokenLimit !== undefined && ledger.usage.tokensUsed + nextReserved > ledger.limits.tokenLimit)
+  if (ledger.limits.tokenLimit !== undefined
+    && (ledger.usage.tokensUsed > ledger.limits.tokenLimit - nextReserved))
     return err(callError("BUDGET_TOKENS", `token limit ${ledger.limits.tokenLimit} reached`));
   return ok(patch(ledger, { attempts: ledger.usage.attempts + 1, tokensReserved: nextReserved }));
 };
 
-/** Settle an attempt: release its reservation and record actual token usage. */
-export const settleAttempt = (ledger: Ledger, reservedTokens: number, actualTokens: number): Ledger =>
-  patch(ledger, {
-    tokensReserved: Math.max(0, ledger.usage.tokensReserved - reservedTokens),
-    tokensUsed: ledger.usage.tokensUsed + Math.max(0, actualTokens),
-  });
+/** Settle an attempt. Actual usage may exceed its optimistic reservation. */
+export const settleAttempt = (
+  ledger: Ledger,
+  reservedTokens: number,
+  actualTokens: number,
+): Result<Ledger, CallError> => {
+  if (!Number.isSafeInteger(ledger.usage.tokensReserved) || ledger.usage.tokensReserved < 0
+    || !Number.isSafeInteger(ledger.usage.tokensUsed) || ledger.usage.tokensUsed < 0)
+    return err(callError("INVALID_RESULT", "invalid ledger accounting"));
+  if (!Number.isSafeInteger(reservedTokens) || reservedTokens < 0 || reservedTokens > ledger.usage.tokensReserved)
+    return err(callError("INVALID_RESULT", "invalid token reservation settlement"));
+  if (!Number.isSafeInteger(actualTokens) || actualTokens < 0 || actualTokens > MAX_CALL_TOKENS
+    || ledger.usage.tokensUsed > Number.MAX_SAFE_INTEGER - actualTokens)
+    return err(callError("INVALID_RESULT", "invalid reported token usage"));
+  return ok(patch(ledger, {
+    tokensReserved: ledger.usage.tokensReserved - reservedTokens,
+    tokensUsed: ledger.usage.tokensUsed + actualTokens,
+  }));
+};
 
 /** Try to acquire a leaf concurrency slot. `"saturated"` means the scheduler must wait. */
 export const acquireLeaf = (ledger: Ledger): Ledger | "saturated" => {

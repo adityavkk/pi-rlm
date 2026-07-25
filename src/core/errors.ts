@@ -6,6 +6,8 @@
  * guest code. Budget errors are non-retryable unless a human raises a limit.
  */
 
+import { normalizeCallUsage } from "./usage.ts";
+
 export const CALL_ERROR_CODES = [
   "FAILED",
   "DENIED",
@@ -67,17 +69,74 @@ export const INTERPRETER_ERROR_CODES = [
 ] as const;
 export type InterpreterErrorCode = (typeof INTERPRETER_ERROR_CODES)[number];
 
+export const ERROR_MESSAGE_MAX_LENGTH = 2_048;
+export const ERROR_DETAIL_MAX_LENGTH = 256;
+
+export interface SafeErrorUsage {
+  readonly attempts: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly costUsd?: number;
+  readonly durationMs: number;
+}
+
+export interface CallErrorDetails {
+  readonly stopReason?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly usage?: SafeErrorUsage;
+}
+
+const ownData = (value: object, key: string): unknown => {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const boundedString = (value: unknown, maxLength: number): string | undefined =>
+  typeof value === "string" ? value.slice(0, maxLength) : undefined;
+
+const normalizeSafeUsage = (value: unknown): SafeErrorUsage | undefined => {
+  const normalized = normalizeCallUsage(value);
+  return normalized.ok ? normalized.value : undefined;
+};
+
+/** Copy only bounded, data-only fields that are safe to expose to a guest. */
+export const normalizeCallErrorDetails = (value: unknown): CallErrorDetails | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const stopReason = boundedString(ownData(value, "stopReason"), ERROR_DETAIL_MAX_LENGTH);
+  const provider = boundedString(ownData(value, "provider"), ERROR_DETAIL_MAX_LENGTH);
+  const model = boundedString(ownData(value, "model"), ERROR_DETAIL_MAX_LENGTH);
+  const usage = normalizeSafeUsage(ownData(value, "usage"));
+  if (stopReason === undefined && provider === undefined && model === undefined && usage === undefined) return undefined;
+  return {
+    ...(stopReason !== undefined ? { stopReason } : {}),
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+  };
+};
+
 export interface CallError {
   readonly code: CallErrorCode;
   readonly message: string;
   readonly retryable: boolean;
+  readonly details?: CallErrorDetails;
 }
 
-export const callError = (code: CallErrorCode, message: string): CallError => ({
-  code,
-  message,
-  retryable: isRetryable(code),
-});
+export const callError = (code: CallErrorCode, message: string, details?: unknown): CallError => {
+  const safeDetails = normalizeCallErrorDetails(details);
+  return {
+    code,
+    message: message.slice(0, ERROR_MESSAGE_MAX_LENGTH),
+    retryable: isRetryable(code),
+    ...(safeDetails ? { details: safeDetails } : {}),
+  };
+};
 
 export interface InterpreterError {
   readonly code: InterpreterErrorCode;

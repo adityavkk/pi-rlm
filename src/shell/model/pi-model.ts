@@ -8,7 +8,8 @@
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Context, StopReason } from "@earendil-works/pi-ai";
-import type { CallUsage } from "../../core/usage.ts";
+import { MAX_CALL_DURATION_MS, type CallUsage } from "../../core/usage.ts";
+import { monotonicClock, type Clock } from "../clock.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "./client.ts";
 
 export type PiModelErrorCode =
@@ -40,17 +41,23 @@ const splitModel = (id: string): { provider: string; model: string } => {
   return { provider: id.slice(0, slash), model: id.slice(slash + 1) };
 };
 
-const mapUsage = (message: AssistantMessage): CallUsage => ({
+const elapsedMs = (startedMs: number, completedMs: number): number => {
+  if (!Number.isFinite(startedMs) || !Number.isFinite(completedMs) || completedMs <= startedMs) return 0;
+  const elapsed = completedMs - startedMs;
+  return Number.isFinite(elapsed) ? Math.min(Math.floor(elapsed), MAX_CALL_DURATION_MS) : MAX_CALL_DURATION_MS;
+};
+
+const mapUsage = (message: AssistantMessage, durationMs: number): CallUsage => ({
   attempts: 1,
   inputTokens: message.usage.input,
   outputTokens: message.usage.output,
   totalTokens: message.usage.totalTokens,
   costUsd: message.usage.cost.total,
-  durationMs: 0,
+  durationMs,
 });
 
-const mapMessage = (message: AssistantMessage, provider: string, model: string): ModelResponse => {
-  const usage = mapUsage(message);
+const mapMessage = (message: AssistantMessage, provider: string, model: string, durationMs: number): ModelResponse => {
+  const usage = mapUsage(message, durationMs);
   const fail = (code: PiModelErrorCode, fallback: string): never => {
     throw new PiModelError(code, message.stopReason, provider, model, usage, message.errorMessage ?? fallback);
   };
@@ -80,6 +87,7 @@ export class PiModelClient implements ModelClient {
   constructor(
     private readonly runtime: ModelRuntime,
     private readonly defaultModel: string,
+    private readonly clock: Clock = monotonicClock,
   ) {}
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -97,12 +105,29 @@ export class PiModelClient implements ModelClient {
       ...(request.system ? { systemPrompt: request.system } : {}),
     };
     const reasoning = request.thinking && request.thinking !== "off" ? request.thinking : undefined;
-    const message = await this.runtime.completeSimple(resolved, context, {
-      ...(reasoning ? { reasoning } : {}),
-      ...(request.maxOutputTokens ? { maxTokens: request.maxOutputTokens } : {}),
-      ...(request.signal ? { signal: request.signal } : {}),
-    });
+    const startedMs = this.clock.now();
+    let message: AssistantMessage;
+    try {
+      message = await this.runtime.completeSimple(resolved, context, {
+        ...(reasoning ? { reasoning } : {}),
+        ...(request.maxOutputTokens !== undefined ? { maxTokens: request.maxOutputTokens } : {}),
+        ...(request.signal ? { signal: request.signal } : {}),
+      });
+    } catch {
+      const durationMs = elapsedMs(startedMs, this.clock.now());
+      const cancelled = request.signal?.aborted === true;
+      throw new PiModelError(
+        cancelled ? "CANCELLED" : "PROVIDER_ERROR",
+        cancelled ? "aborted" : "error",
+        provider,
+        model,
+        { attempts: 1, durationMs },
+        cancelled
+          ? `completion aborted for ${provider}/${model}`
+          : `provider ${provider} failed to complete model ${model}`,
+      );
+    }
 
-    return mapMessage(message, provider, model);
+    return mapMessage(message, provider, model, elapsedMs(startedMs, this.clock.now()));
   }
 }

@@ -12,7 +12,15 @@
 
 import { newQuickJSWASMModuleFromVariant, type QuickJSContext, type QuickJSDeferredPromise, type QuickJSHandle, type QuickJSRuntime, type QuickJSWASMModule, shouldInterruptAfterDeadline } from "quickjs-emscripten-core";
 import variant from "@jitl/quickjs-singlefile-mjs-release-sync";
-import { type InterpreterError, type InterpreterErrorCode, interpreterError } from "../../core/errors.ts";
+import {
+  ERROR_DETAIL_MAX_LENGTH,
+  ERROR_MESSAGE_MAX_LENGTH,
+  type CallErrorDetails,
+  type InterpreterError,
+  type InterpreterErrorCode,
+  interpreterError,
+  normalizeCallErrorDetails,
+} from "../../core/errors.ts";
 import type { JsonValue } from "../../core/json.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./backend.ts";
 import { buildPreamble } from "./preamble.ts";
@@ -454,16 +462,52 @@ const safeParse = (json: string): JsonValue => {
   }
 };
 
-const normalizeError = (error: unknown): { name: string; message: string; code?: string } => {
-  if (error && typeof error === "object") {
-    const e = error as { name?: unknown; message?: unknown; code?: unknown };
-    return {
-      name: typeof e.name === "string" ? e.name : "Error",
-      message: typeof e.message === "string" ? e.message : String(error),
-      ...(typeof e.code === "string" ? { code: e.code } : {}),
-    };
+interface NormalizedBridgeError {
+  readonly name: string;
+  readonly message: string;
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly details?: CallErrorDetails;
+}
+
+const ownData = (value: object, key: string): unknown => {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
   }
-  return { name: "Error", message: String(error) };
+};
+
+const primitiveMessage = (value: unknown): string => {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "string": return value;
+    case "number":
+    case "boolean":
+    case "bigint":
+    case "undefined": return String(value);
+    case "symbol": return value.description ?? "symbol";
+    default: return "host call failed";
+  }
+};
+
+const normalizeError = (error: unknown): NormalizedBridgeError => {
+  if (!error || typeof error !== "object") {
+    return { name: "Error", message: primitiveMessage(error).slice(0, ERROR_MESSAGE_MAX_LENGTH) };
+  }
+  const name = ownData(error, "name");
+  const message = ownData(error, "message");
+  const code = ownData(error, "code");
+  const retryable = ownData(error, "retryable");
+  const details = normalizeCallErrorDetails(ownData(error, "details"));
+  return {
+    name: (typeof name === "string" ? name : "Error").slice(0, ERROR_DETAIL_MAX_LENGTH),
+    message: (typeof message === "string" ? message : "host call failed").slice(0, ERROR_MESSAGE_MAX_LENGTH),
+    ...(typeof code === "string" ? { code: code.slice(0, ERROR_DETAIL_MAX_LENGTH) } : {}),
+    ...(typeof retryable === "boolean" ? { retryable } : {}),
+    ...(details ? { details } : {}),
+  };
 };
 
 const errorMessage = (ctx: QuickJSContext, handle: QuickJSHandle): string => {
