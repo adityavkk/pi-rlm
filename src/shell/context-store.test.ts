@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
+import { canonicalStringify, MAX_JSON_DEPTH, type JsonValue } from "../core/json.ts";
 import {
   ContextBudgetError,
   ContextChunkOverflowError,
@@ -11,6 +12,26 @@ import {
   DEFAULT_CONTEXT_STORE_LIMITS,
   type ContextStoreLimits,
 } from "./context-store.ts";
+import { sha256 } from "./hash.ts";
+
+const runSubprocess = async (script: string, timeoutMs = 5_000): Promise<{
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly timedOut: boolean;
+}> => {
+  const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const stdout = new Response(child.stdout).text();
+  const stderr = new Response(child.stderr).text();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, timeoutMs);
+  const code = await child.exited;
+  clearTimeout(timer);
+  return { code, stdout: await stdout, stderr: await stderr, timedOut };
+};
 
 const limitedStore = async (limits: Partial<ContextStoreLimits>): Promise<ContextStore> => {
   const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-limited-"));
@@ -254,6 +275,79 @@ describe("ContextStore", () => {
     expect(await readdir(join(dir, "contexts"))).toEqual(beforeFiles);
   });
 
+  test("materializes each unique prepared candidate exactly once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-materialize-"));
+    const materialized: string[] = [];
+    const observed = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+      onMaterialize: (descriptor) => materialized.push(descriptor.id),
+    });
+    const source = await observed.ingestText("duplicates", "abcdabcd");
+    materialized.length = 0;
+
+    const chunks = await observed.chunks(source.id, { targetTokens: 1, maxChunks: 2 });
+    expect(chunks[0]?.id).toBe(chunks[1]?.id);
+    expect(materialized).toEqual([chunks[0]?.id as string]);
+    expect(await observed.load(chunks[0]?.id as string)).toBe("abcd");
+
+    materialized.length = 0;
+    await observed.chunks(source.id, { targetTokens: 1, maxChunks: 2 });
+    expect(materialized).toEqual([]);
+  });
+
+  test("keeps exact-limit concat and chunk candidate allocations bounded in a subprocess", async () => {
+    const moduleUrl = new URL("./context-store.ts", import.meta.url).href;
+    const script = `
+      import { mkdtemp } from "node:fs/promises";
+      import { tmpdir } from "node:os";
+      import { join } from "node:path";
+      const { ContextStore, DEFAULT_CONTEXT_STORE_LIMITS } = await import(${JSON.stringify(moduleUrl)});
+      const allocations = [];
+      const store = new ContextStore(
+        await mkdtemp(join(tmpdir(), "pi-rlm-near-limit-")),
+        DEFAULT_CONTEXT_STORE_LIMITS,
+        { onMaterialize: (descriptor) => allocations.push(descriptor.bytes) },
+      );
+      const halfMiB = "abcd".repeat(128 * 1024);
+      const source = await store.ingestText("source", halfMiB + halfMiB);
+      allocations.length = 0;
+      let reserved = 0;
+      const chunks = await store.chunks(source.id, { targetTokens: 128 * 1024, maxChunks: 2 }, {
+        maxOutputBytes: 512 * 1024,
+        reserveBytes: (bytes) => {
+          reserved += bytes;
+          return { rollback: () => { reserved -= bytes; } };
+        },
+      });
+      const concat = await store.concat({ key: "near-limit", refs: [source, source], separator: "" }, {
+        maxOutputBytes: 2 * 1024 * 1024,
+        reserveBytes: (bytes) => {
+          reserved += bytes;
+          return { rollback: () => { reserved -= bytes; } };
+        },
+      });
+      console.log(JSON.stringify({
+        allocations,
+        chunkIds: chunks.map((chunk) => chunk.id),
+        concatBytes: concat.bytes,
+        reserved,
+        totalBytes: store.totalBytes(),
+      }));
+    `;
+    const result = await runSubprocess(script);
+    expect(result.timedOut).toBe(false);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      allocations: [512 * 1024, 2 * 1024 * 1024],
+      chunkIds: [expect.any(String), expect.any(String)],
+      concatBytes: 2 * 1024 * 1024,
+      reserved: 2_621_440,
+      totalBytes: 3_670_016,
+    });
+    const output = JSON.parse(result.stdout) as { chunkIds: string[] };
+    expect(output.chunkIds[0]).toBe(output.chunkIds[1]);
+  });
+
   test("reserves the exact unique byte delta for duplicate chunks", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-unique-"));
     const exact = new ContextStore(dir);
@@ -327,6 +421,94 @@ describe("ContextStore", () => {
         if (++checks === 3) throw new Error("cancelled");
       },
     })).toThrow("cancelled");
+  });
+
+  test("streamed JSON derive matches canonical ordering, escaping, depth, and identity", async () => {
+    const value = JSON.parse('{"z":"","constructor":{"b":2},"__proto__":{"a":1}}') as Record<string, JsonValue>;
+    value["z"] = 'quote" slash\\ controls\b\f\n\r\t\u0000\u001f separators\u2028\u2029 pair😀 lone\ud800';
+    value["a"] = [{ y: 2, x: 1 }, true, null];
+    const expected = canonicalStringify(value);
+    const descriptor = await store.derive({ key: "canonical", value });
+    expect(await store.load(descriptor.id)).toBe(expected);
+    expect(descriptor.bytes).toBe(Buffer.byteLength(expected, "utf8"));
+    expect(descriptor.sha256).toBe(sha256(expected));
+
+    let nested: JsonValue = 0;
+    for (let i = 0; i < MAX_JSON_DEPTH; i++) nested = [nested];
+    const atLimit = await store.derive({ key: "depth-limit", value: nested });
+    expect(await store.load(atLimit.id)).toBe(canonicalStringify(nested));
+    nested = [nested];
+    await expect(store.derive({ key: "too-deep", value: nested })).rejects.toThrow("maximum JSON depth");
+
+    let invoked = false;
+    const accessor = Object.defineProperty({}, "value", {
+      enumerable: true,
+      get: () => {
+        invoked = true;
+        return 1;
+      },
+    }) as JsonValue;
+    await expect(store.derive({ key: "accessor", value: accessor })).rejects.toThrow("accessor property");
+    expect(invoked).toBe(false);
+  });
+
+  test("denies large JSON before canonical output allocation and leaves ledger, store, and files unchanged", async () => {
+    const moduleUrl = new URL("./context-store.ts", import.meta.url).href;
+    const script = `
+      import { mkdtemp, readdir } from "node:fs/promises";
+      import { tmpdir } from "node:os";
+      import { join } from "node:path";
+      const { ContextStore, DEFAULT_CONTEXT_STORE_LIMITS } = await import(${JSON.stringify(moduleUrl)});
+      const dir = await mkdtemp(join(tmpdir(), "pi-rlm-json-denial-"));
+      let materialized = 0;
+      let reserved = 0;
+      let fullStringifyAttempted = false;
+      const store = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+        onMaterialize: () => { materialized++; },
+      });
+      const nativeStringify = JSON.stringify;
+      JSON.stringify = (value, ...args) => {
+        if ((typeof value === "string" && value.length > 1024) || (value !== null && typeof value === "object")) {
+          fullStringifyAttempted = true;
+          throw new Error("full canonical stringify attempted");
+        }
+        return nativeStringify(value, ...args);
+      };
+      let code = "NO_ERROR";
+      try {
+        await store.derive({ key: "large", value: { z: "x".repeat(8 * 1024 * 1024), a: [1, true, null] } }, {
+          maxOutputBytes: 1,
+          reserveBytes: (bytes) => {
+            reserved += bytes;
+            return { rollback: () => { reserved -= bytes; } };
+          },
+        });
+      } catch (error) {
+        code = error?.code ?? error?.message ?? "UNKNOWN";
+      } finally {
+        JSON.stringify = nativeStringify;
+      }
+      console.log(nativeStringify({
+        code,
+        fullStringifyAttempted,
+        materialized,
+        reserved,
+        totalBytes: store.totalBytes(),
+        files: await readdir(dir),
+      }));
+    `;
+    const result = await runSubprocess(script, 10_000);
+    expect(result.timedOut).toBe(false);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      code: "BUDGET_BYTES",
+      fullStringifyAttempted: false,
+      materialized: 0,
+      reserved: 0,
+      totalBytes: 0,
+      files: [],
+    });
   });
 
   test("derive and concat produce readable contexts", async () => {

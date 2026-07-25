@@ -12,8 +12,8 @@ import { mkdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonValue } from "../core/json.ts";
-import { canonicalStringify } from "../core/json.ts";
 import { headTailPreview } from "../core/preview.ts";
+import { prepareCanonicalJson } from "./canonical-json.ts";
 import {
   ContextBudgetError,
   type ContextByteReservation,
@@ -23,6 +23,7 @@ import {
   type ContextOperationControl,
   type ContextRead,
   ContextSpecError,
+  type ContextStoreInstrumentation,
   type ContextStoreLimits,
   ContextUnavailableError,
   DEFAULT_CONTEXT_STORE_LIMITS,
@@ -42,6 +43,7 @@ export type {
   ContextMatch,
   ContextOperationControl,
   ContextRead,
+  ContextStoreInstrumentation,
   ContextStoreLimits,
 } from "./context-store-contract.ts";
 
@@ -55,9 +57,25 @@ interface Entry {
   readonly bytesArray: Uint8Array;
 }
 
-interface PreparedEntry {
-  readonly descriptor: ContextDescriptor;
-  readonly materialize: () => Uint8Array;
+class PreparedEntry {
+  private bytesArray: Uint8Array | undefined;
+
+  constructor(
+    readonly descriptor: ContextDescriptor,
+    private materializer: (() => Uint8Array) | undefined,
+    private onMaterialize?: (descriptor: ContextDescriptor) => void,
+  ) {}
+
+  materialize(): Uint8Array {
+    if (this.bytesArray !== undefined) return this.bytesArray;
+    if (this.materializer === undefined) throw new Error(`prepared context ${this.descriptor.id} has no bytes`);
+    this.bytesArray = this.materializer();
+    this.materializer = undefined;
+    const observer = this.onMaterialize;
+    this.onMaterialize = undefined;
+    observer?.(this.descriptor);
+    return this.bytesArray;
+  }
 }
 
 const isContinuation = (byte: number): boolean => (byte & 0xc0) === 0x80;
@@ -124,7 +142,11 @@ export class ContextStore {
   private readonly limits: ContextStoreLimits;
   private uniqueBytes = 0;
 
-  constructor(private readonly dir: string, limits: ContextStoreLimits = DEFAULT_CONTEXT_STORE_LIMITS) {
+  constructor(
+    private readonly dir: string,
+    limits: ContextStoreLimits = DEFAULT_CONTEXT_STORE_LIMITS,
+    private readonly instrumentation: ContextStoreInstrumentation = {},
+  ) {
     this.contentDir = join(dir, "contexts");
     this.limits = validateLimits(limits);
   }
@@ -148,12 +170,18 @@ export class ContextStore {
   private prepareText(label: string, text: string, mimeType: string): PreparedEntry {
     const sha = sha256(text);
     const descriptor = this.makeDescriptor(label, mimeType, sha, Buffer.byteLength(text, "utf8"));
-    return { descriptor, materialize: () => encoder.encode(text) };
+    return new PreparedEntry(descriptor, () => encoder.encode(text), this.instrumentation.onMaterialize);
   }
 
   private prepareBytes(label: string, bytes: Uint8Array, mimeType: string): PreparedEntry {
     const descriptor = this.makeDescriptor(label, mimeType, sha256Bytes(bytes), bytes.length);
-    return { descriptor, materialize: () => bytes.slice() };
+    return new PreparedEntry(descriptor, () => bytes.slice(), this.instrumentation.onMaterialize);
+  }
+
+  private prepareJson(label: string, value: JsonValue, control?: ContextOperationControl): PreparedEntry {
+    const prepared = prepareCanonicalJson(value, control?.checkpoint);
+    const descriptor = this.makeDescriptor(label, "application/json", prepared.sha256, prepared.bytes);
+    return new PreparedEntry(descriptor, prepared.materialize, this.instrumentation.onMaterialize);
   }
 
   private async commitPrepared(
@@ -184,20 +212,24 @@ export class ContextStore {
     const insertedIds: string[] = [];
     try {
       if (delta > 0) reservation = control?.reserveBytes?.(delta);
-      if (additions.length > 0 && !existsSync(this.contentDir)) {
+      const materialized: Entry[] = [];
+      for (const candidate of additions) {
+        control?.checkpoint?.();
+        const bytesArray = candidate.materialize();
+        if (bytesArray.length !== candidate.descriptor.bytes || sha256Bytes(bytesArray) !== candidate.descriptor.sha256)
+          throw new Error(`prepared context ${candidate.descriptor.id} changed before commit`);
+        materialized.push({ descriptor: candidate.descriptor, bytesArray });
+      }
+      if (materialized.length > 0 && !existsSync(this.contentDir)) {
         await mkdir(this.contentDir, { recursive: true });
         createdDir = true;
       }
-      for (const candidate of additions) {
+      for (const entry of materialized) {
         control?.checkpoint?.();
-        const { descriptor } = candidate;
-        const path = join(this.contentDir, `${descriptor.sha256}.bin`);
+        const path = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
         if (existsSync(path)) continue;
-        const bytes = candidate.materialize();
-        if (bytes.length !== descriptor.bytes || sha256Bytes(bytes) !== descriptor.sha256)
-          throw new Error(`prepared context ${descriptor.id} changed before commit`);
         try {
-          await writeFile(path, bytes, { flag: "wx" });
+          await writeFile(path, entry.bytesArray, { flag: "wx" });
           createdPaths.push(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
@@ -206,12 +238,9 @@ export class ContextStore {
           }
         }
       }
-      for (const candidate of additions) {
-        this.entries.set(candidate.descriptor.id, {
-          descriptor: candidate.descriptor,
-          bytesArray: candidate.materialize(),
-        });
-        insertedIds.push(candidate.descriptor.id);
+      for (const entry of materialized) {
+        this.entries.set(entry.descriptor.id, entry);
+        insertedIds.push(entry.descriptor.id);
       }
       this.uniqueBytes += delta;
       bytesCommitted = true;
@@ -431,9 +460,9 @@ export class ContextStore {
     spec: { key: string; value: string | JsonValue; label?: string },
     control?: ContextOperationControl,
   ): Promise<ContextDescriptor> {
-    const text = typeof spec.value === "string" ? spec.value : canonicalStringify(spec.value);
-    const mime = typeof spec.value === "string" ? "text/plain" : "application/json";
-    return this.intern(spec.label ?? `derived:${spec.key}`, text, mime, control);
+    const label = spec.label ?? `derived:${spec.key}`;
+    if (typeof spec.value === "string") return this.intern(label, spec.value, "text/plain", control);
+    return (await this.commitPrepared([this.prepareJson(label, spec.value, control)], control))[0] as ContextDescriptor;
   }
 
   async concat(
@@ -465,24 +494,21 @@ export class ContextStore {
       sha256Parts(values()),
       bytes,
     );
-    const prepared: PreparedEntry = {
-      descriptor,
-      materialize: () => {
-        const out = new Uint8Array(bytes);
-        const encodedSeparator = parts.length > 1 ? encoder.encode(separator) : new Uint8Array();
-        let offset = 0;
-        for (let i = 0; i < parts.length; i++) {
-          if (i > 0) {
-            out.set(encodedSeparator, offset);
-            offset += encodedSeparator.length;
-          }
-          const part = parts[i] as Uint8Array;
-          out.set(part, offset);
-          offset += part.length;
+    const prepared = new PreparedEntry(descriptor, () => {
+      const out = new Uint8Array(bytes);
+      const encodedSeparator = parts.length > 1 ? encoder.encode(separator) : new Uint8Array();
+      let offset = 0;
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) {
+          out.set(encodedSeparator, offset);
+          offset += encodedSeparator.length;
         }
-        return out;
-      },
-    };
+        const part = parts[i] as Uint8Array;
+        out.set(part, offset);
+        offset += part.length;
+      }
+      return out;
+    }, this.instrumentation.onMaterialize);
     return (await this.commitPrepared([prepared], control))[0] as ContextDescriptor;
   }
 

@@ -31,6 +31,11 @@ export interface ContextStoreLimits {
   readonly maxPatternBytes: number;
 }
 
+/** Optional allocation observer for diagnostics and deterministic tests. */
+export interface ContextStoreInstrumentation {
+  readonly onMaterialize?: (descriptor: ContextDescriptor) => void;
+}
+
 export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
   maxReadBytes: 1024 * 1024,
   maxLines: 10_000,
