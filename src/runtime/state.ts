@@ -24,6 +24,8 @@ export interface KeyIdentityBinding {
   readonly canonicalIdentity: string;
   readonly identityHash: string;
   readonly ready: Promise<void>;
+  state: "pending" | "durable" | "durable_failed";
+  error?: unknown;
 }
 
 export interface FrameRef {

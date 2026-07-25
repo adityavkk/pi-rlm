@@ -22,7 +22,7 @@ import { transformCell } from "../core/cell.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { CellEvalOutcome } from "../shell/interpreter/backend.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
-import { bindKeys, contextControl, dispatchCall, withContextMutation } from "./broker.ts";
+import { bindKeys, contextControl, dispatchCall, resolveContextRefs, withContextMutation } from "./broker.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, RunState } from "./state.ts";
@@ -309,11 +309,10 @@ const runChild = async (
   if (!isJsonObject(args)) return errResult("call_recurse_invalid", callError("INVALID_REQUEST", "recurse spec must be an object"), ZERO_CALL_USAGE, false);
   const key = typeof args["key"] === "string" ? args["key"] : "recurse";
   const objective = typeof args["objective"] === "string" ? args["objective"] : "";
-  const refs = Array.isArray(args["context"]) ? args["context"] : args["context"] !== undefined ? [args["context"]] : [];
-  const contextIds = refs.flatMap((ref) => isJsonObject(ref) && typeof ref["id"] === "string" ? [ref["id"]] : []);
+  const contexts = resolveContextRefs(state, args["context"], "context");
   const identity: JsonValue = {
     objective,
-    contexts: contextIds.map((id) => state.store.get(id)?.sha256 ?? id),
+    contexts: contexts.map((context) => context.sha256),
     profile: typeof args["profile"] === "string" ? args["profile"] : state.profile.name,
   };
   const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "recurse", key, identity });
@@ -336,9 +335,8 @@ const runChild = async (
   }
 
   const inputs: Record<string, ContextDescriptor> = {};
-  contextIds.forEach((id, i) => {
-    const desc = state.store.get(id);
-    if (desc) inputs[i === 0 ? "context" : `context${i + 1}`] = desc;
+  contexts.forEach((context, i) => {
+    inputs[i === 0 ? "context" : `context${i + 1}`] = context;
   });
 
   let task!: Promise<GuestCallResult>;

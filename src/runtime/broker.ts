@@ -14,11 +14,12 @@ import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
-import type { ContextOperationControl } from "../shell/context-store.ts";
+import type { ContextDescriptor, ContextOperationControl } from "../shell/context-store.ts";
+import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
-import type { FrameRef, RunState } from "./state.ts";
+import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
 
 export type RecurseFn = (args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<GuestCallResult>;
 
@@ -40,14 +41,20 @@ const reqStr = (obj: JsonObject, key: string): string => {
   return v;
 };
 
-const contextIds = (value: JsonValue | undefined): string[] => {
+export const resolveContextRefs = (
+  state: RunState,
+  value: JsonValue | undefined,
+  field: string,
+): ContextDescriptor[] => {
   if (value === undefined) return [];
   const list = Array.isArray(value) ? value : [value];
-  const ids: string[] = [];
-  for (const item of list) {
-    if (isJsonObject(item) && typeof item["id"] === "string") ids.push(item["id"]);
-  }
-  return ids;
+  return list.map((item) => {
+    if (!isJsonObject(item) || typeof item["id"] !== "string" || item["id"].length === 0)
+      throw new DslError("INVALID_SPEC", `${field} must contain context handles`);
+    const descriptor = state.store.get(item["id"]);
+    if (!descriptor) throw new DslError("INVALID_STATE", `context ${item["id"]} not found`);
+    return descriptor;
+  });
 };
 
 const resolveModel = (state: RunState, selector: JsonValue | undefined): { model: string; thinking?: ThinkingLevel } => {
@@ -98,46 +105,77 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
     if (!prior) requested.set(id, normalized);
   }
 
-  const existingReady: Promise<void>[] = [];
-  const additions: Array<KeyClaim & { canonicalIdentity: string; identityHash: string }> = [];
-  for (const [id, claim] of requested) {
-    const bound = state.keyIdentities.get(id);
-    if (bound && bound.canonicalIdentity !== claim.canonicalIdentity)
-      throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
-    if (bound) existingReady.push(bound.ready);
-    else additions.push(claim);
-  }
+  for (;;) {
+    const pending: Promise<void>[] = [];
+    const additions: Array<KeyClaim & { canonicalIdentity: string; identityHash: string }> = [];
+    for (const [id, claim] of requested) {
+      const bound = state.keyIdentities.get(id);
+      if (bound && bound.canonicalIdentity !== claim.canonicalIdentity)
+        throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
+      if (bound?.state === "durable_failed") throw bound.error;
+      if (bound?.state === "pending") pending.push(bound.ready);
+      if (!bound) additions.push(claim);
+    }
 
-  if (additions.length === 0) {
-    await Promise.all(existingReady);
+    if (pending.length > 0) {
+      await Promise.all(pending);
+      continue;
+    }
+    if (additions.length === 0) return;
+
+    const installed = additions.map((claim) => {
+      let resolveReady!: () => void;
+      let rejectReady!: (error: unknown) => void;
+      const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      const binding: KeyIdentityBinding = {
+        canonicalIdentity: claim.canonicalIdentity,
+        identityHash: claim.identityHash,
+        ready,
+        state: "pending",
+      };
+      state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), binding);
+      return { claim, binding, resolveReady, rejectReady };
+    });
+    // Observe every deferred before journal I/O can reject one. This also makes
+    // the initiating caller receive the same failure as concurrent waiters.
+    const installedReady = Promise.all(installed.map(({ binding }) => binding.ready));
+
+    for (let index = 0; index < installed.length; index++) {
+      const current = installed[index]!;
+      const { claim, binding } = current;
+      try {
+        await state.journal.append({
+          type: "key_bound",
+          frameId: claim.frame.frameId,
+          kind: claim.kind,
+          key: claim.key,
+          identityHash: claim.identityHash,
+        });
+        binding.state = "durable";
+        current.resolveReady();
+      } catch (error) {
+        if (error instanceof JournalAppendError && error.eventDurable) {
+          binding.state = "durable_failed";
+          binding.error = error;
+        } else if (state.keyIdentities.get(keyRegistryId(claim.kind, claim.key)) === binding) {
+          state.keyIdentities.delete(keyRegistryId(claim.kind, claim.key));
+        }
+        current.rejectReady(error);
+        for (const remaining of installed.slice(index + 1)) {
+          const id = keyRegistryId(remaining.claim.kind, remaining.claim.key);
+          if (state.keyIdentities.get(id) === remaining.binding) state.keyIdentities.delete(id);
+          remaining.rejectReady(error);
+        }
+        await installedReady;
+        return;
+      }
+    }
+    await installedReady;
     return;
   }
-
-  let resolveReady!: () => void;
-  let rejectReady!: (error: unknown) => void;
-  const ready = new Promise<void>((resolve, reject) => {
-    resolveReady = resolve;
-    rejectReady = reject;
-  });
-  for (const claim of additions) {
-    state.keyIdentities.set(keyRegistryId(claim.kind, claim.key), {
-      canonicalIdentity: claim.canonicalIdentity,
-      identityHash: claim.identityHash,
-      ready,
-    });
-  }
-  void (async () => {
-    for (const claim of additions) {
-      await state.journal.append({
-        type: "key_bound",
-        frameId: claim.frame.frameId,
-        kind: claim.kind,
-        key: claim.key,
-        identityHash: claim.identityHash,
-      });
-    }
-  })().then(resolveReady, rejectReady);
-  await Promise.all([...existingReady, ready]);
 };
 
 interface NormalizedLlmSpec {
@@ -155,7 +193,8 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
   const key = reqStr(spec, "key");
   const prompt = reqStr(spec, "prompt");
   const { model, thinking } = resolveModel(state, spec["model"]);
-  const ctxIds = contextIds(spec["context"]);
+  const contexts = resolveContextRefs(state, spec["context"], "context");
+  const ctxIds = contexts.map((context) => context.id);
   const schemaValue = spec["schema"];
   let schema: JsonObject | undefined;
   if (schemaValue !== undefined) {
@@ -173,7 +212,7 @@ const normalizeLlmSpec = (state: RunState, spec: JsonObject): NormalizedLlmSpec 
     model,
     ...(thinking ? { thinking } : {}),
     ...(schema ? { schema } : {}),
-    contexts: ctxIds.map((id) => state.store.get(id)?.sha256 ?? id),
+    contexts: contexts.map((context) => context.sha256),
     ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
   };
   return {
@@ -263,10 +302,10 @@ export const dispatchCall = async (
         state.store.derive(spec, contextControl(state, deadlineMs, signal, true)), signal) as unknown as JsonValue;
     }
     case "contexts.concat": {
-      const spec = concatSpec(asObject(args));
+      const { spec, descriptors } = concatSpec(state, asObject(args));
       const identity: JsonValue = {
         operation: "concat",
-        refs: spec.refs.map((ref) => state.store.get(ref.id)?.sha256 ?? ref.id),
+        refs: descriptors.map((descriptor) => descriptor.sha256),
         separator: spec.separator ?? "\n",
         label: spec.label ?? `concat:${spec.key}`,
       };
@@ -343,15 +382,29 @@ export const contextControl = (
 });
 
 const deriveSpec = (spec: JsonObject): { key: string; value: string | JsonValue; label?: string } => {
+  const key = reqStr(spec, "key");
+  if (!Object.prototype.hasOwnProperty.call(spec, "value"))
+    throw new DslError("INVALID_SPEC", '"value" is required');
   const label = spec["label"];
-  return { key: reqStr(spec, "key"), value: spec["value"] as JsonValue, ...(typeof label === "string" ? { label } : {}) };
+  return { key, value: spec["value"] as JsonValue, ...(typeof label === "string" ? { label } : {}) };
 };
 
-const concatSpec = (spec: JsonObject): { key: string; refs: Array<{ id: string }>; separator?: string; label?: string } => {
-  const refs = contextIds(spec["refs"]).map((id) => ({ id }));
-  const sep = spec["separator"];
-  const label = spec["label"];
-  return { key: reqStr(spec, "key"), refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) };
+const concatSpec = (
+  state: RunState,
+  value: JsonObject,
+): {
+  spec: { key: string; refs: Array<{ id: string }>; separator?: string; label?: string };
+  descriptors: ContextDescriptor[];
+} => {
+  const key = reqStr(value, "key");
+  const descriptors = resolveContextRefs(state, value["refs"], "refs");
+  const refs = descriptors.map(({ id }) => ({ id }));
+  const sep = value["separator"];
+  const label = value["label"];
+  return {
+    spec: { key, refs, ...(typeof sep === "string" ? { separator: sep } : {}), ...(typeof label === "string" ? { label } : {}) },
+    descriptors,
+  };
 };
 
 export const withContextMutation = async <T>(
@@ -372,6 +425,8 @@ export const withContextMutation = async <T>(
 const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject) => {
   const key = reqStr(spec, "key");
   const name = reqStr(spec, "name");
+  if (!Object.prototype.hasOwnProperty.call(spec, "value"))
+    throw new DslError("INVALID_SPEC", '"value" is required');
   const value = spec["value"] as JsonValue;
   const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
   const identity: JsonValue = { name, value, mimeType };

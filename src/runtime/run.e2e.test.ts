@@ -658,6 +658,36 @@ describe("runProgram e2e", () => {
     expect(result.ledger.usage.logicalCalls).toBe(1);
   });
 
+  test("invalid recurse context leaves its key reusable without opening a frame", async () => {
+    const controller = new MockController(
+      [{
+        reasoning: "validate child inputs first",
+        code: `
+          let code = 'none';
+          try { await recurse({ key: 'child-ref', objective: 'same', context: { id: 'missing' } }); }
+          catch (error) { code = error.code; }
+          const child = await recurse({ key: 'child-ref', objective: 'same', context: input });
+          answer({ answer: code + ':' + child.value });`,
+      }],
+      () => new MockController([{ reasoning: "child", code: "answer('child-ok')" }]),
+    );
+    const dir = await tmp();
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "valid" },
+      controller,
+      model: new MockModelClient(() => "unused"),
+      backend,
+      dir,
+      signal: new AbortController().signal,
+    });
+    expect(result.answer).toEqual({ answer: "INVALID_STATE:child-ok" });
+    expect(result.ledger.usage.framesOpened).toBe(1);
+    expect(result.ledger.usage.logicalCalls).toBe(1);
+    const events = (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; kind?: string; key?: string });
+    expect(events.filter((event) => event.type === "key_bound" && event.kind === "recurse" && event.key === "child-ref")).toHaveLength(1);
+  });
+
   test("context and artifact keys reuse equal identities and reject changes", async () => {
     const controller = new MockController([{
       reasoning: "check keyed producers",
