@@ -1,14 +1,108 @@
-import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, open, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { BudgetLimits } from "../core/budget.ts";
 import type { RlmEvent } from "../core/journal.ts";
-import { JournalStore } from "./journal-store.ts";
+import {
+  JournalStore,
+  type JournalFileHandle,
+  type JournalFileSystem,
+} from "./journal-store.ts";
 
 const limits: BudgetLimits = {
   maxDepth: 2, maxFrames: 4, maxLogicalCalls: 10, maxAttempts: 20,
   maxControllerTurns: 10, maxConcurrency: 2, storedByteLimit: 1000, deadlineMs: 1000,
+};
+
+const started: RlmEvent = { type: "run_started", runId: "r1", manifestHash: "m", limits };
+const completed: RlmEvent = { type: "run_completed", runId: "r1", completionMode: "answer" };
+
+const nodeFileSystem: JournalFileSystem = {
+  open: async (path, flags) => open(path, flags),
+  readFile: async (path) => readFile(path),
+  rename,
+};
+
+type FaultOperation =
+  | "events append"
+  | "events sync"
+  | "events close"
+  | "status write"
+  | "status sync"
+  | "status close"
+  | "status rename"
+  | "directory sync"
+  | "directory close";
+
+const instrumentedFileSystem = (root: string, failAt?: FaultOperation): {
+  readonly fileSystem: JournalFileSystem;
+  readonly operations: string[];
+} => {
+  const operations: string[] = [];
+  const eventsPath = join(root, "events.jsonl");
+  const statusPath = join(root, "status.json.tmp");
+
+  const operation = (path: string, name: string): string => {
+    if (path === eventsPath) return `events ${name}`;
+    if (path === statusPath) return `status ${name}`;
+    if (path === root) return `directory ${name}`;
+    return `other ${name}`;
+  };
+  const maybeFail = (name: string): void => {
+    if (name === failAt) throw new Error(`injected ${name} failure`);
+  };
+
+  const wrap = (path: string, handle: JournalFileHandle): JournalFileHandle => ({
+    appendFile: async (data, encoding) => {
+      const name = operation(path, "append");
+      operations.push(name);
+      maybeFail(name);
+      await handle.appendFile(data, encoding);
+    },
+    close: async () => {
+      const name = operation(path, "close");
+      operations.push(name);
+      await handle.close();
+      maybeFail(name);
+    },
+    readFile: async () => {
+      operations.push(operation(path, "read"));
+      return handle.readFile();
+    },
+    sync: async () => {
+      const name = operation(path, "sync");
+      operations.push(name);
+      maybeFail(name);
+      await handle.sync();
+    },
+    truncate: async (length) => {
+      operations.push(operation(path, "truncate"));
+      await handle.truncate(length);
+    },
+    writeFile: async (data, encoding) => {
+      const name = operation(path, "write");
+      operations.push(name);
+      maybeFail(name);
+      await handle.writeFile(data, encoding);
+    },
+  });
+
+  return {
+    operations,
+    fileSystem: {
+      open: async (path, flags) => {
+        operations.push(operation(path, "open"));
+        return wrap(path, await nodeFileSystem.open(path, flags));
+      },
+      readFile: nodeFileSystem.readFile,
+      rename: async (oldPath, newPath) => {
+        operations.push("status rename");
+        maybeFail("status rename");
+        await nodeFileSystem.rename(oldPath, newPath);
+      },
+    },
+  };
 };
 
 let dir: string;
@@ -20,37 +114,120 @@ describe("JournalStore", () => {
   test("appends durably and projects authoritative status", async () => {
     const store = new JournalStore(dir);
     const events: RlmEvent[] = [
-      { type: "run_started", runId: "r1", manifestHash: "m", limits },
+      started,
       { type: "frame_opened", frameId: "f0", parentFrameId: null, depth: 0, objective: "root" },
-      { type: "run_completed", runId: "r1", completionMode: "answer" },
+      completed,
     ];
-    for (const e of events) await store.append(e);
+    for (const event of events) await store.append(event);
     const status = await store.status();
     expect(status.ok).toBe(true);
     if (status.ok) expect(status.value.state).toBe("completed");
-    // status.json cache exists and matches
     const cached = JSON.parse(await readFile(join(dir, "status.json"), "utf8"));
     expect(cached.state).toBe("completed");
   });
 
-  test("recovers from a torn final append", async () => {
-    const store = new JournalStore(dir);
-    await store.append({ type: "run_started", runId: "r1", manifestHash: "m", limits });
-    // simulate a crash mid-append: a partial line with no trailing newline
-    await appendFile(join(dir, "events.jsonl"), '{"type":"frame_opened","frameId":"f0"');
+  test("repairs a torn tail before append and continues the recovered fold", async () => {
+    const { fileSystem, operations } = instrumentedFileSystem(dir);
+    const store = new JournalStore(dir, fileSystem);
+    await store.append(started);
+    await appendFile(join(dir, "events.jsonl"), '{"type":"frame_opened","frameId":"torn"');
+
+    operations.length = 0;
+    await store.append({ type: "frame_opened", frameId: "f0", parentFrameId: null, depth: 0, objective: "root" });
+    await store.append(completed);
+
+    const raw = await readFile(join(dir, "events.jsonl"), "utf8");
+    expect(raw).not.toContain('"frameId":"torn"');
+    expect(raw.endsWith("\n")).toBe(true);
+    expect(raw.trimEnd().split("\n")).toHaveLength(3);
+    expect(operations.slice(0, 6)).toEqual([
+      "events open",
+      "events read",
+      "events truncate",
+      "events sync",
+      "events append",
+      "events sync",
+    ]);
+
     const events = await store.readEvents();
     expect(events.ok).toBe(true);
-    if (events.ok) {
-      expect(events.value).toHaveLength(1);
-      expect(events.value[0]!.type).toBe("run_started");
-    }
+    if (events.ok) expect(events.value.map((event) => event.type)).toEqual(["run_started", "frame_opened", "run_completed"]);
+    const status = await store.status();
+    expect(status.ok).toBe(true);
+    if (status.ok) expect(status.value.state).toBe("completed");
   });
 
-  test("flags a corrupt interior line", async () => {
-    await writeFile(join(dir, "events.jsonl"), 'not-json\n{"type":"run_started"}\n');
+  test("does not treat an unterminated valid JSON object as a verified record", async () => {
+    await writeFile(join(dir, "events.jsonl"), `${JSON.stringify(started)}\n${JSON.stringify(completed)}`);
     const store = new JournalStore(dir);
+    await store.append({ type: "run_failed", runId: "r1", code: "FAILED", message: "replacement" });
+
     const events = await store.readEvents();
-    expect(events.ok).toBe(false);
-    if (!events.ok) expect(events.error.code).toBe("JOURNAL_CORRUPT");
+    expect(events.ok).toBe(true);
+    if (events.ok) expect(events.value.map((event) => event.type)).toEqual(["run_started", "run_failed"]);
   });
+
+  test("flags complete corruption and refuses to truncate or append", async () => {
+    const original = `${JSON.stringify(started)}\nnot-json\npartial-tail`;
+    await writeFile(join(dir, "events.jsonl"), original);
+    const store = new JournalStore(dir);
+
+    let failure: unknown;
+    try {
+      await store.append(completed);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toEqual(expect.objectContaining({ code: "JOURNAL_CORRUPT" }));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(original);
+  });
+
+  test("returns an empty journal only for ENOENT and propagates real read errors", async () => {
+    const missing = await new JournalStore(dir).readEvents();
+    expect(missing).toEqual({ ok: true, value: [] });
+
+    const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+    const fileSystem: JournalFileSystem = {
+      ...nodeFileSystem,
+      readFile: async () => { throw denied; },
+    };
+    await expect(new JournalStore(dir, fileSystem).readEvents()).rejects.toBe(denied);
+  });
+
+  test("syncs status content before rename and the containing directory after", async () => {
+    const { fileSystem, operations } = instrumentedFileSystem(dir);
+    await new JournalStore(dir, fileSystem).append(started);
+    expect(operations).toEqual([
+      "events open",
+      "events read",
+      "events append",
+      "events sync",
+      "events close",
+      "status open",
+      "status write",
+      "status sync",
+      "status close",
+      "status rename",
+      "directory open",
+      "directory sync",
+      "directory close",
+    ]);
+  });
+
+  for (const fault of [
+    "events append",
+    "events sync",
+    "events close",
+    "status write",
+    "status sync",
+    "status close",
+    "status rename",
+    "directory sync",
+    "directory close",
+  ] as const) {
+    test(`propagates ${fault} failures`, async () => {
+      const { fileSystem } = instrumentedFileSystem(dir, fault);
+      await expect(new JournalStore(dir, fileSystem).append(started)).rejects.toThrow(`injected ${fault} failure`);
+    });
+  }
 });
