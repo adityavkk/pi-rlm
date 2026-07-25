@@ -428,12 +428,13 @@ describe("dispatchCall cancellation ownership", () => {
       "hidden",
     );
     const failures = [topAccessor, nestedAccessor, cyclic, oversized];
-    const model: ModelClient = {
-      identity: { id: "test/model-client", version: "1", configuration: { fixture: "src/runtime/broker.test.ts:422" } },
-      id: "hostile-errors",
-      async complete(): Promise<ModelResponse> { throw failures.shift(); },
-    };
-    const state = await brokerState(model, "run_hostile_errors");
+    const clock = new ManualClock();
+    const fallbackDurationMs = 37;
+    const model = new MockModelClient(() => {
+      clock.advance(fallbackDurationMs);
+      throw failures.shift();
+    }, modelIdentity("src/runtime/broker.test.ts:422"));
+    const state = await brokerState(model, "run_hostile_errors", clock);
     const results: GuestCallResult[] = [];
     for (let index = 0; index < 4; index++) {
       results.push(await dispatchCall(
@@ -448,17 +449,21 @@ describe("dispatchCall cancellation ownership", () => {
     }
 
     expect(getterCalls).toBe(0);
-    expect(results[0]).toMatchObject({ ok: false, error: { code: "FAILED" }, usage: { attempts: 1, durationMs: 0 } });
+    expect(results[0]).toMatchObject({
+      ok: false,
+      error: { code: "FAILED" },
+      usage: { attempts: 1, durationMs: fallbackDurationMs },
+    });
     expect(results[0]?.error?.details).toBeUndefined();
     expect(results[1]?.error?.details).toBeUndefined();
-    expect(results[1]?.usage).toEqual({ attempts: 1, durationMs: 0 });
+    expect(results[1]?.usage).toEqual({ attempts: 1, durationMs: fallbackDurationMs });
     expect(results[2]).toMatchObject({
       error: { details: { usage: { attempts: 1, durationMs: 2 } } },
       usage: { attempts: 1, durationMs: 2 },
     });
     expect(JSON.stringify(results[2])).not.toContain("cycle");
     expect(results[3]?.error?.details).toBeUndefined();
-    expect(results[3]?.usage).toEqual({ attempts: 1, durationMs: 0 });
+    expect(results[3]?.usage).toEqual({ attempts: 1, durationMs: fallbackDurationMs });
     expect(JSON.stringify(results)).not.toContain("pppppppp");
     expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(state.ledger.current.usage.tokensUsed).toBe(0);
