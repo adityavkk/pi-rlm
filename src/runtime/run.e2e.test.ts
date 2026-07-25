@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
@@ -277,5 +277,63 @@ describe("runProgram e2e", () => {
     });
     expect(result.status).toBe("completed");
     expect(result.answer).toEqual({ toString: "fixed" });
+  });
+
+  test("context limit and unsupported syntax errors are typed and guest-catchable", async () => {
+    const model = new MockModelClient(() => "ok");
+    const controller = new MockController([{
+      reasoning: "recover from invalid context options",
+      code: `
+        const codes = [];
+        try { await input.grep({ pattern: '(a+)+$', syntax: 're2', maxMatches: 1 }); }
+        catch (error) { codes.push(error.code); }
+        try { await input.grep({ pattern: 'a', maxMatches: Infinity }); }
+        catch (error) { codes.push(error.code); }
+        answer({ answer: codes.join(',') });`,
+    }]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: `${"a".repeat(100_000)}!` },
+      controller,
+      model,
+      backend,
+      dir: await tmp(),
+    });
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({ answer: "INVALID_SPEC,INVALID_SPEC" });
+  });
+
+  test("denied context producers leave ledger, entries, and files unchanged", async () => {
+    const dir = await tmp();
+    const model = new MockModelClient(() => "ok");
+    const controller = new MockController([{
+      reasoning: "exercise tiny stored-byte budget",
+      code: `
+        const codes = [];
+        for (let i = 0; i < 2; i++) {
+          try { await contexts.derive({ key: 'denied', value: 'x'.repeat(65) }); }
+          catch (error) { codes.push(error.code); }
+        }
+        try { await contexts.concat({ key: 'concat', refs: [input, input], separator: '' }); }
+        catch (error) { codes.push(error.code); }
+        try { await input.chunks({ targetTokens: 20, maxChunks: 2 }); }
+        catch (error) { codes.push(error.code); }
+        answer({ answer: codes.join(',') });`,
+    }]);
+    const result = await runProgram({
+      program: program(),
+      sources: { context: "x".repeat(100) },
+      controller,
+      model,
+      backend,
+      dir,
+      profile: { ...DEFAULT_PROFILE, storedByteLimit: 164 },
+    });
+    expect(result.status).toBe("completed");
+    expect(result.answer).toEqual({
+      answer: "BUDGET_BYTES,BUDGET_BYTES,BUDGET_BYTES,BUDGET_BYTES",
+    });
+    expect(result.ledger.usage.storedBytes).toBe(164);
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(2);
   });
 });

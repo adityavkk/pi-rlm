@@ -75,6 +75,7 @@ describe("dispatchCall cancellation ownership", () => {
       callCache: new Map(),
       inflight: new Map(),
       semaphore: new Semaphore(1),
+      contextSemaphore: new Semaphore(1),
       frameSeq: { current: 1 },
     };
     const frame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };

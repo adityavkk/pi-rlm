@@ -126,6 +126,10 @@ export const reserveBytes = (ledger: Ledger, bytes: number): Result<Ledger, Call
   return ok(patch(ledger, { storedBytes: ledger.usage.storedBytes + bytes }));
 };
 
+/** Release a prior stored-byte reservation after a context commit fails. */
+export const releaseBytes = (ledger: Ledger, bytes: number): Ledger =>
+  patch(ledger, { storedBytes: Math.max(0, ledger.usage.storedBytes - bytes) });
+
 export interface BudgetView {
   readonly depth: number;
   readonly maxDepth: number;

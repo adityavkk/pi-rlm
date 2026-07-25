@@ -28,8 +28,9 @@ persist across cells; persist state by assigning to the \`workspace\` object.
 
 Available globals:
 - objective: string, inputs: { name: ContextRef }, input: ContextRef (single-input runs).
-- ContextRef: { id, label, bytes, sha256 } with async read({offsetBytes,lengthBytes}),
-  lines({startLine,count}), grep({pattern,maxMatches}), chunks({targetTokens,maxChunks,overlapTokens}).
+- ContextRef: { id, label, bytes, sha256 } with bounded async read({offsetBytes,lengthBytes}),
+  lines({startLine,count}), grep({pattern,maxMatches,caseSensitive?,syntax?:"literal"}),
+  chunks({targetTokens,maxChunks,overlapTokens?,boundary?}). Regex/RE2 syntax is deferred in v1, not emulated.
 - workspace: mutable object of JSON or { contextId } / { artifactId } handles; persists across cells.
 - budget: read-only remaining calls, attempts, tokens, depth, deadline.
 - await llm({ key, prompt, context?, model?, schema? }) -> CallResult (r.ok, r.value | r.error).
