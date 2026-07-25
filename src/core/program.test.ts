@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { canonicalStringify } from "./json.ts";
 import { compileShorthand, normalizeProgram, programIdentity } from "./program.ts";
 
 const valid = {
@@ -29,6 +30,26 @@ describe("normalizeProgram", () => {
     const r2 = normalizeProgram({ ...valid, inputs: [{ name: "9bad", adapter: "text", description: "" }] });
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.error[0]?.message).toContain("not a valid identifier");
+  });
+
+  test("validates output names while preserving the conventional answer field", () => {
+    expect(normalizeProgram(valid).ok).toBe(true);
+    for (const name of ["9bad", "__proto__", "constructor"]) {
+      const result = normalizeProgram({ ...valid, outputs: [{ name, schema: { type: "string" } }] });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.some((error) => error.path === "outputs[0].name")).toBe(true);
+    }
+  });
+
+  test("rejects schemas outside the supported subset", () => {
+    const schemas = [
+      { type: "string", minLength: 1 },
+      { type: ["string", "null"] },
+      { type: "date" },
+      { type: "array", items: [{ type: "string" }] },
+      { type: "object", properties: { value: true } },
+    ];
+    for (const schema of schemas) expect(normalizeProgram({ ...valid, outputs: [{ name: "answer", schema }] }).ok).toBe(false);
   });
 
   test("rejects duplicate names", () => {
@@ -67,5 +88,11 @@ describe("shorthand + identity", () => {
       inputs: [{ name: "context", adapter: "text", description: "different description" }],
     });
     if (a.ok && b.ok) expect(JSON.stringify(programIdentity(a.value))).toBe(JSON.stringify(programIdentity(b.value)));
+  });
+
+  test("schema insertion order does not change canonical program identity", () => {
+    const a = normalizeProgram({ ...valid, outputs: [{ name: "answer", schema: { type: "object", properties: { b: { type: "number" }, a: { type: "string" } } } }] });
+    const b = normalizeProgram({ ...valid, outputs: [{ name: "answer", schema: { properties: { a: { type: "string" }, b: { type: "number" } }, type: "object" } }] });
+    if (a.ok && b.ok) expect(canonicalStringify(programIdentity(a.value))).toBe(canonicalStringify(programIdentity(b.value)));
   });
 });

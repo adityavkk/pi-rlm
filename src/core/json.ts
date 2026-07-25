@@ -11,12 +11,21 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue };
 export type JsonObject = { readonly [key: string]: JsonValue };
 
+/** Maximum nesting accepted at an untrusted JSON boundary. */
+export const MAX_JSON_DEPTH = 100;
+
 export const isJsonObject = (value: unknown): value is JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const nullRecord = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+
+const childPath = (path: string, key: string): string =>
+  /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`;
+
 /**
  * Validate that an unknown value is strict JSON with no cycles.
- * Returns a typed value or a human-readable path to the first offending node.
+ * Returns a typed, prototype-free value or a human-readable path to the first
+ * offending node.
  */
 export const parseJsonValue = (
   input: unknown,
@@ -25,7 +34,10 @@ export const parseJsonValue = (
   const walk = (
     value: unknown,
     path: string,
+    depth: number,
   ): { ok: true; value: JsonValue } | { ok: false; path: string; reason: string } => {
+    if (depth > MAX_JSON_DEPTH)
+      return { ok: false, path, reason: `maximum JSON depth of ${MAX_JSON_DEPTH} exceeded` };
     if (value === null) return { ok: true, value: null };
     switch (typeof value) {
       case "string":
@@ -51,15 +63,22 @@ export const parseJsonValue = (
           if (Array.isArray(value)) {
             const out: JsonValue[] = [];
             for (let i = 0; i < value.length; i++) {
-              const r = walk(value[i], `${path}[${i}]`);
+              const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
+              if (!descriptor) return { ok: false, path: `${path}[${i}]`, reason: "array holes are not JSON" };
+              if (!("value" in descriptor))
+                return { ok: false, path: `${path}[${i}]`, reason: "accessor properties are not JSON" };
+              const r = walk(descriptor.value, `${path}[${i}]`, depth + 1);
               if (!r.ok) return r;
               out.push(r.value);
             }
             return { ok: true, value: out };
           }
-          const out: Record<string, JsonValue> = {};
+          const out = nullRecord<JsonValue>();
           for (const key of Object.keys(value as Record<string, unknown>)) {
-            const r = walk((value as Record<string, unknown>)[key], `${path}.${key}`);
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !("value" in descriptor))
+              return { ok: false, path: childPath(path, key), reason: "accessor properties are not JSON" };
+            const r = walk(descriptor.value, childPath(path, key), depth + 1);
             if (!r.ok) return r;
             out[key] = r.value;
           }
@@ -72,19 +91,27 @@ export const parseJsonValue = (
         return { ok: false, path, reason: `unsupported type ${typeof value}` };
     }
   };
-  return walk(input, "$");
+  return walk(input, "$", 0);
 };
 
-/** Recursively sort object keys, producing a canonical JsonValue. */
-export const canonicalize = (value: JsonValue): JsonValue => {
-  if (Array.isArray(value)) return value.map(canonicalize);
+const canonicalizeAt = (value: JsonValue, path: string, depth: number): JsonValue => {
+  if (depth > MAX_JSON_DEPTH) throw new RangeError(`maximum JSON depth of ${MAX_JSON_DEPTH} exceeded at ${path}`);
+  if (Array.isArray(value)) return value.map((item, i) => canonicalizeAt(item, `${path}[${i}]`, depth + 1));
   if (isJsonObject(value)) {
-    const sorted: Record<string, JsonValue> = {};
-    for (const key of Object.keys(value).sort()) sorted[key] = canonicalize(value[key] as JsonValue);
+    const sorted = nullRecord<JsonValue>();
+    for (const key of Object.keys(value).sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor))
+        throw new TypeError(`accessor property is not canonical JSON at ${childPath(path, key)}`);
+      sorted[key] = canonicalizeAt(descriptor.value as JsonValue, childPath(path, key), depth + 1);
+    }
     return sorted;
   }
   return value;
 };
+
+/** Recursively sort own object keys, producing prototype-free canonical JSON. */
+export const canonicalize = (value: JsonValue): JsonValue => canonicalizeAt(value, "$", 0);
 
 /** Deterministic JSON string with sorted keys. Stable across insertion order. */
 export const canonicalStringify = (value: JsonValue): string => JSON.stringify(canonicalize(value));

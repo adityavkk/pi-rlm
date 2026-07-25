@@ -11,7 +11,7 @@ import { callError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
 import { isJsonObject } from "../core/json.ts";
-import { validateAgainstSchema } from "../core/schema.ts";
+import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
 import type { CallUsage } from "../core/usage.ts";
 import { addUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
@@ -211,7 +211,17 @@ const llm = async (state: RunState, frame: FrameRef, spec: JsonObject): Promise<
   const prompt = reqStr(spec, "prompt");
   const { model, thinking } = resolveModel(state, spec["model"]);
   const ctxIds = contextIds(spec["context"]);
-  const schema = isJsonObject(spec["schema"]) ? (spec["schema"] as JsonObject) : undefined;
+  const schemaValue = spec["schema"];
+  let schema: JsonObject | undefined;
+  if (schemaValue !== undefined) {
+    const normalized = normalizeJsonSchema(schemaValue);
+    if (!normalized.ok)
+      throw new DslError(
+        "INVALID_SPEC",
+        `invalid JSON schema: ${normalized.error.map((error) => `${error.path}: ${error.message}`).join("; ")}`,
+      );
+    schema = normalized.value;
+  }
   const maxOutputTokens = typeof spec["maxOutputTokens"] === "number" ? spec["maxOutputTokens"] : undefined;
   const identity: JsonValue = {
     prompt,
