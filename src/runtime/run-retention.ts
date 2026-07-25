@@ -914,14 +914,23 @@ export class ManagedRunStore {
     }
     try { await this.remover(quarantine); }
     catch (cause) {
-      if (errorCode(cause) === "ENOENT") return "already_removed";
-      try { await lstat(quarantine); }
-      catch (missing) {
-        if (errorCode(missing) === "ENOENT") return "already_removed";
+      let residual: Awaited<ReturnType<typeof lstat>>;
+      try { residual = await lstat(quarantine); }
+      catch (inspection) {
+        if (errorCode(inspection) === "ENOENT") return "already_removed";
+        throw new RunRetentionError(
+          "RUN_RETENTION_CLEANUP_FAILED",
+          "failed to inspect quarantine after removal failure",
+          new AggregateError([cause, inspection], "quarantine removal and residual inspection both failed"),
+        );
       }
+      const sameIdentity = residual.isDirectory() && !residual.isSymbolicLink()
+        && residual.dev === run.identity.dev && residual.ino === run.identity.ino;
       throw new RunRetentionError(
         "RUN_RETENTION_CLEANUP_FAILED",
-        "failed to remove quarantined managed run",
+        sameIdentity
+          ? "failed to remove quarantined managed run"
+          : "quarantined run identity changed during failed removal; retained without deletion",
         cause,
         undefined,
         [await boundedSurvivor(quarantine, "quarantine")],

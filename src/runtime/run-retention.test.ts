@@ -452,6 +452,50 @@ describe("bounded deterministic retention", () => {
     expect(failure).toMatchObject({ code: "RUN_RETENTION_POLICY_UNSATISFIED", result: { retained: [name] } });
   });
 
+  test("remover ENOENT retains a quarantine that still exists and exposes the typed residual", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens(), now: () => 1 });
+    const name = await terminalFixture(producer, "completed", "remover-enoent-residual", 1);
+    const nested = Object.assign(new Error("nested removal evidence disappeared"), { code: "ENOENT" });
+    const removal = Object.assign(new Error("injected remover ENOENT", { cause: nested }), { code: "ENOENT" });
+    const failing = new ManagedRunStore({
+      root: path,
+      now: () => 2,
+      removeDirectory: async () => { throw removal; },
+    });
+    let failure: unknown;
+    try { await failing.cleanup({ force: true }); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(RunRetentionError);
+    expect(failure).toMatchObject({
+      code: "RUN_RETENTION_CLEANUP_FAILED",
+      result: { deleted: [], skipped: [], retained: [name] },
+      survivors: [{ kind: "quarantine" }],
+    });
+    const quarantines = (await readdir(path)).filter((entry) => entry.startsWith(".pi-rlm-quarantine-"));
+    expect(quarantines).toHaveLength(1);
+    expect((await lstat(join(path, quarantines[0]!))).isDirectory()).toBe(true);
+    expect((failure as RunRetentionError).cause).toBeInstanceOf(AggregateError);
+  });
+
+  test("remover failure skips a loser only when the whole quarantine is absent", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens(), now: () => 1 });
+    const name = await terminalFixture(producer, "completed", "remover-absent", 1);
+    const sweeper = new ManagedRunStore({
+      root: path,
+      now: () => 2,
+      removeDirectory: async (quarantine) => {
+        await rm(quarantine, { recursive: true });
+        throw Object.assign(new Error("remover lost its completed result"), { code: "EIO" });
+      },
+    });
+    const result = await sweeper.cleanup({ force: true });
+    expect(result.deleted).toEqual([]);
+    expect(result.skipped).toEqual([{ runName: name, reason: "already_removed" }]);
+    expect(result.retained).toEqual([]);
+    expect((await readdir(path)).filter((entry) => entry.startsWith(".pi-rlm-quarantine-"))).toEqual([]);
+  });
+
   test("rereads a selected lifecycle under claim and retains a newly published lease", async () => {
     const path = await root();
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
