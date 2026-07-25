@@ -34,9 +34,21 @@ export interface ContextStoreLimits {
 /** Optional allocation and persistence hooks for diagnostics and deterministic tests. */
 export interface ContextStoreInstrumentation {
   readonly onMaterialize?: (descriptor: ContextDescriptor) => void;
+  readonly hasher?: (value: string | Uint8Array) => string;
+  /** Write a new temporary payload. Implementations must reject an existing path. */
   readonly writeFile?: (path: string, bytes: Uint8Array) => Promise<void>;
+  readonly syncFile?: (path: string) => Promise<void>;
+  /** Atomically publish oldPath at newPath without replacing an existing path. */
+  readonly rename?: (oldPath: string, newPath: string) => Promise<void>;
+  readonly syncDirectory?: (path: string) => Promise<void>;
   readonly unlink?: (path: string) => Promise<void>;
   readonly fileBytes?: (path: string) => Promise<number>;
+}
+
+export interface ContextContentReference {
+  readonly id: string;
+  readonly sha256: string;
+  readonly bytes: number;
 }
 
 export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
@@ -76,6 +88,16 @@ export class ContextUnavailableError extends Error {
   constructor(id: string) {
     super(`context ${id} is unavailable`);
     this.name = "ContextUnavailableError";
+  }
+}
+
+export type ContextIntegrityReason = "length" | "hash" | "type" | "containment";
+
+export class ContextIntegrityError extends Error {
+  readonly code = "CONTEXT_INTEGRITY_FAILED";
+  constructor(readonly contextId: string, readonly reason: ContextIntegrityReason) {
+    super(`context ${contextId} failed ${reason} verification`);
+    this.name = "ContextIntegrityError";
   }
 }
 

@@ -13,7 +13,7 @@ describe("deterministic ids", () => {
     const a = deriveCallId(sha256, { runId: "r1", kind: "llm", key: "k", identity: { p: 1 } });
     const b = deriveCallId(sha256, { runId: "r1", kind: "llm", key: "k", identity: { p: 1 } });
     expect(a).toBe(b);
-    expect(a.startsWith("call_llm_")).toBe(true);
+    expect(a).toMatch(/^call_llm_[0-9a-f]{64}$/);
   });
 
   test("callId changes with identity, kind, key, or run", () => {
@@ -23,6 +23,16 @@ describe("deterministic ids", () => {
     expect(deriveCallId(sha256, { ...base, kind: "agent" })).not.toBe(id);
     expect(deriveCallId(sha256, { ...base, key: "k2" })).not.toBe(id);
     expect(deriveCallId(sha256, { ...base, runId: "r2" })).not.toBe(id);
+  });
+
+  test("callId does not alias equal prefixes and rejects non-SHA digests", () => {
+    const base = { runId: "r1", kind: "llm" as const, key: "k", identity: { p: 1 } };
+    const prefix = "a".repeat(24);
+    const first = deriveCallId(() => `${prefix}${"1".repeat(40)}`, base);
+    const second = deriveCallId(() => `${prefix}${"2".repeat(40)}`, base);
+    expect(first).not.toBe(second);
+    expect(() => deriveCallId(() => "a".repeat(63), base)).toThrow(/64 lowercase hexadecimal/);
+    expect(() => identityHash(() => "A".repeat(64), {})).toThrow(/64 lowercase hexadecimal/);
   });
 
   test("shortHash length", () => {

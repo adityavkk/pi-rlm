@@ -24,7 +24,7 @@ import { JournalAppendError } from "../shell/journal-store.ts";
 import { waitForAbort, wasAborted } from "./abort.ts";
 import { bindKeys, dispatchCall, resolveContextRefs, retainCallResult } from "./broker.ts";
 import { createModelOperation, hasAttemptCapacity, ModelInvocationError } from "./provider.ts";
-import { persistAnswer } from "./answer-persistence.ts";
+import { persistAnswer, persistWorkspace } from "./answer-persistence.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
@@ -155,7 +155,7 @@ export const runFrame = async (
         frameId: frame.frameId,
         iteration,
         reasoning: cell.reasoning,
-        codeHash: state.hasher(cell.code).slice(0, 16),
+        codeHash: state.hasher(cell.code),
         hasResult: false,
         outputPreview: "",
         usage: controllerUsage,
@@ -214,7 +214,7 @@ export const runFrame = async (
         frameId: frame.frameId,
         iteration,
         reasoning: cell.reasoning,
-        codeHash: state.hasher(cell.code).slice(0, 16),
+        codeHash: state.hasher(cell.code),
         hasResult: false,
         outputPreview: "",
         error: errorInfo(outcome.error),
@@ -228,6 +228,8 @@ export const runFrame = async (
       const validated = validateWorkspace(isJsonObject(outcome.workspace) ? outcome.workspace : {});
       if (validated.ok) workspace = validated.value as unknown as JsonValue;
     }
+    await persistWorkspace(state, frame.frameId, iteration, workspace, cellDeadline, signal);
+    if (signal.aborted) return cancelled();
 
     let error: CallError | undefined;
     let preview = "";
@@ -263,23 +265,27 @@ export const runFrame = async (
                 state,
                 `answer:${frame.frameId}:${iteration}`,
                 candidate,
-                (outputRef) => [{
+                (outputRef, outputRefBytes, outputRefSha256) => [{
                   type: "cell_committed",
                   frameId: frame.frameId,
                   iteration,
                   reasoning: cell.reasoning,
-                  codeHash: state.hasher(cell.code).slice(0, 16),
+                  codeHash: state.hasher(cell.code),
                   hasResult: outcome.hasResult,
                   outputPreview: preview,
                   outputBytes,
                   outputOmittedBytes,
                   usage: controllerUsage,
                   outputRef,
+                  outputRefSha256,
+                  outputRefBytes,
                 }, {
                   type: "answer_committed",
                   frameId: frame.frameId,
                   completionMode: "answer",
                   outputRef,
+                  outputSha256: outputRefSha256,
+                  outputBytes: outputRefBytes,
                 }],
                 cellDeadline,
                 signal,
@@ -315,7 +321,7 @@ export const runFrame = async (
       frameId: frame.frameId,
       iteration,
       reasoning: cell.reasoning,
-      codeHash: state.hasher(cell.code).slice(0, 16),
+      codeHash: state.hasher(cell.code),
       hasResult: outcome.kind === "value" ? outcome.hasResult : false,
       outputPreview: preview,
       outputBytes,

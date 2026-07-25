@@ -475,7 +475,7 @@ describe("dispatchCall cancellation ownership", () => {
     expect(state.callCache.size).toBe(0);
     expect(state.ledger.current.usage.storedBytes).toBe(0);
     const events = await state.journal.readEvents();
-    expect(events.ok && events.value.filter((event) => event.type === "call_committed")).toHaveLength(2);
+    expect(events.ok && events.value.filter((event) => event.type === "call_committed")).toHaveLength(0);
   });
 
   test("cancellation while waiting for retention ownership leaves no cache reservation", async () => {
@@ -528,11 +528,13 @@ describe("dispatchCall cancellation ownership", () => {
     await within(appendStarted);
     abort.abort();
     await expect(within(pending)).rejects.toMatchObject({ name: "OperationAbortedError" });
+    expect(state.callCache.size).toBe(0);
+    expect(state.ledger.current.usage.storedBytes).toBe(retainedJsonBytes(result as never));
     resolveAppend({ event: "committed", statusCache: { state: "refreshed" } });
     await Promise.resolve();
     await Promise.resolve();
     expect(state.callCache.size).toBe(0);
-    expect(state.ledger.current.usage.storedBytes).toBe(0);
+    expect(state.ledger.current.usage.storedBytes).toBe(retainedJsonBytes(result as never));
   });
 
   test("durable status refresh failure retains one cache charge and propagates once", async () => {
@@ -562,12 +564,12 @@ describe("dispatchCall cancellation ownership", () => {
 
     await expect(retainCallResult(state, result, event, new AbortController().signal)).rejects.toBe(injected);
     const charged = retainedJsonBytes(result as never);
-    expect(state.callCache.get(result.callId)).toBe(result);
+    expect(state.callCache.get(result.callId)).toEqual({ ...result, outputRef: expect.stringMatching(/^ctx_[0-9a-f]{64}$/) });
     expect(state.ledger.current.usage.storedBytes).toBe(charged);
     expect(appends).toBe(1);
 
     const duplicate = await retainCallResult(state, result, event, new AbortController().signal);
-    expect(duplicate).toBe(result);
+    expect(duplicate).toBe(state.callCache.get(result.callId)!);
     expect(state.ledger.current.usage.storedBytes).toBe(charged);
     expect(appends).toBe(1);
   });
