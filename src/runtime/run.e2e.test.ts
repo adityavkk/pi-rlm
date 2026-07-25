@@ -543,7 +543,7 @@ describe("runProgram e2e", () => {
     });
     const events = await journalEvents(dir);
     const committedCells = events.filter((event) => event.type === "cell_committed");
-    expect(events.find((event) => event.type === "emit")?.message).toBe("0");
+    expect(events.find((event) => event.type === "emit")).toBeUndefined();
     expect(committedCells[0]?.outputRef).toBeUndefined();
     expect(events.filter((event) => event.type === "answer_committed")).toHaveLength(1);
     expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(3);

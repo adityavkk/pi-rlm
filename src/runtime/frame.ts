@@ -12,6 +12,7 @@
 import { budgetView, openFrame, releaseLogicalCall, reserveControllerTurn, reserveLogicalCall } from "../core/budget.ts";
 import { type CallError, callError, type InterpreterError, interpreterError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
+import type { RlmEvent } from "../core/journal.ts";
 import { isJsonObject, type JsonValue } from "../core/json.ts";
 import { headTailPreview } from "../core/preview.ts";
 import { appendEntry, projectTrajectory, type TrajectoryEntry } from "../core/trajectory.ts";
@@ -77,6 +78,15 @@ const captureAnswer = (args: JsonValue): CapturedAnswer => {
 const hasErrorCode = (error: unknown, code: string): boolean =>
   typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
 
+type ProgressEvent = Extract<RlmEvent, { type: "phase" | "emit" }>;
+
+const appendProgressEvents = async (state: RunState, events: readonly ProgressEvent[]): Promise<void> => {
+  for (const event of events) {
+    const outcome = await state.journal.append(event);
+    if (outcome.event === "ignored_after_terminal") throw new Error("progress journal event ignored after terminal");
+  }
+};
+
 export const runFrame = async (
   state: InternalRunState,
   frame: FrameRef,
@@ -87,8 +97,6 @@ export const runFrame = async (
   let workspace: JsonValue = {};
   let entries: readonly TrajectoryEntry[] = [];
   let lastOutcome: { kind: string; preview?: string; message?: string } | undefined;
-  let phaseOrdinal = 0;
-  let emitOrdinal = 0;
 
   const cancelled = (): FrameResult => ({ exhausted: false, cancelled: true, workspace, entries });
   const recurseFn = (args: JsonValue, cellSignal: AbortSignal, deadlineMs: number): Promise<GuestCallResult> =>
@@ -170,15 +178,28 @@ export const runFrame = async (
 
     let answerEffectCount = 0;
     let capturedAnswer: CapturedAnswer | undefined;
+    const progressEffects: ProgressEvent[] = [];
     const effect = (name: string, args: JsonValue): void => {
       if (signal?.aborted) return;
       if (name === "answer") {
         answerEffectCount += 1;
         if (answerEffectCount === 1) capturedAnswer = captureAnswer(args);
       } else if (name === "phase" && isJsonObject(args)) {
-        void state.journal.append({ type: "phase", frameId: frame.frameId, ordinal: phaseOrdinal++, name: String(args["name"]) }).catch(() => {});
+        progressEffects.push({
+          type: "phase",
+          frameId: frame.frameId,
+          iteration,
+          ordinal: progressEffects.length,
+          name: String(args["name"]),
+        });
       } else if (name === "emit" && isJsonObject(args)) {
-        void state.journal.append({ type: "emit", frameId: frame.frameId, ordinal: emitOrdinal++, message: String(args["message"] ?? "") }).catch(() => {});
+        progressEffects.push({
+          type: "emit",
+          frameId: frame.frameId,
+          iteration,
+          ordinal: progressEffects.length,
+          message: String(args["message"] ?? ""),
+        });
       }
     };
 
@@ -267,7 +288,7 @@ export const runFrame = async (
                 state,
                 `answer:${frame.frameId}:${iteration}`,
                 candidate,
-                (outputRef, outputRefBytes, outputRefSha256) => [{
+                (outputRef, outputRefBytes, outputRefSha256) => [...progressEffects, {
                   type: "cell_committed",
                   frameId: frame.frameId,
                   iteration,
@@ -305,6 +326,8 @@ export const runFrame = async (
         }
       }
     }
+
+    if (!error) await appendProgressEvents(state, progressEffects);
 
     entries = appendEntry(entries, {
       iteration,

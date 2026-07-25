@@ -19,7 +19,7 @@ describe("reduceStatus", () => {
     const events: RlmEvent[] = [
       { type: "run_started", runId: "r1", manifestHash: "m", limits },
       { type: "frame_opened", frameId: "f0", parentFrameId: null, depth: 0, objective: "root" },
-      { type: "phase", frameId: "f0", ordinal: 0, name: "explore" },
+      { type: "phase", frameId: "f0", iteration: 1, ordinal: 0, name: "explore" },
       { type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "r", codeHash: "h1", hasResult: true, outputPreview: "p1" },
       { type: "cell_committed", frameId: "f0", iteration: 1, reasoning: "r", codeHash: "h1", hasResult: true, outputPreview: "p1" }, // replay dup
       { type: "key_bound", frameId: "f0", kind: "llm", key: "k", identityHash: "identity-1" },

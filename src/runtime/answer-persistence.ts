@@ -96,10 +96,11 @@ export const persistAnswer = async (
       throwIfAborted(signal);
       try {
         const outcome = await state.journal.append(event);
-        if (outcome.event !== "committed") throw new Error("answer journal event ignored after terminal");
-        referenced = true;
+        if (outcome.event === "ignored_after_terminal") throw new Error("answer journal event ignored after terminal");
+        if (outcome.event === "committed" && "outputRef" in event && event.outputRef === descriptor.id) referenced = true;
       } catch (error) {
-        if (error instanceof JournalAppendError && error.eventDurable) referenced = true;
+        if (error instanceof JournalAppendError && error.eventDurable && "outputRef" in event && event.outputRef === descriptor.id)
+          referenced = true;
         throw error;
       }
     }

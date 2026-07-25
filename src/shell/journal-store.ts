@@ -73,6 +73,14 @@ const isMissing = (error: unknown): boolean =>
 const isTerminal = (event: RlmEvent): boolean =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
 
+const isProgress = (event: RlmEvent): event is Extract<RlmEvent, { type: "phase" | "emit" }> =>
+  event.type === "phase" || event.type === "emit";
+
+const sameProgressIdentity = (
+  left: Extract<RlmEvent, { type: "phase" | "emit" }>,
+  right: Extract<RlmEvent, { type: "phase" | "emit" }>,
+): boolean => left.frameId === right.frameId && left.iteration === right.iteration && left.ordinal === right.ordinal;
+
 export type JournalAppendPhase = "event" | "status_cache";
 
 /** Distinguishes authoritative event failures from rebuildable cache failures. */
@@ -89,7 +97,7 @@ export class JournalAppendError extends Error {
 }
 
 export interface JournalAppendOutcome {
-  readonly event: "committed" | "ignored_after_terminal";
+  readonly event: "committed" | "deduplicated" | "ignored_after_terminal";
   readonly statusCache:
     | { readonly state: "refreshed" }
     | { readonly state: "skipped" }
@@ -135,6 +143,11 @@ export class JournalStore {
           disposition = "ignored_after_terminal";
           finalEvents = events;
           refreshStatus = isTerminal(event);
+        } else if (isProgress(event) && events.some((existing) =>
+          isProgress(existing) && sameProgressIdentity(existing, event))) {
+          disposition = "deduplicated";
+          finalEvents = events;
+          refreshStatus = false;
         } else {
           await handle.appendFile(line, "utf8");
           await handle.sync();
