@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -357,7 +357,10 @@ describe("ContextStore", () => {
       maxOutputBytes: 4,
       reserveBytes: (bytes) => {
         reserved += bytes;
-        return { rollback: () => { reserved -= bytes; } };
+        return {
+          release: (released) => { reserved -= released; },
+          rollback: () => { reserved -= bytes; },
+        };
       },
     });
     expect(reserved).toBe(4);
@@ -405,12 +408,115 @@ describe("ContextStore", () => {
       maxOutputBytes: 100,
       reserveBytes: (bytes) => {
         reserved += bytes;
-        return { rollback: () => { reserved -= bytes; } };
+        return {
+          release: (released) => { reserved -= released; },
+          rollback: () => { reserved -= bytes; },
+        };
       },
     })).rejects.toBeInstanceOf(Error);
     expect(reserved).toBe(0);
     expect(failing.totalBytes()).toBe(0);
     expect(await readFile(contentPath, "utf8")).toBe("block writes");
+  });
+
+  test("retains exact partial payload charge when failed-write cleanup cannot unlink", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-orphan-"));
+    let unlinkAttempts = 0;
+    const orphaned = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+      writeFile: async (path, bytes) => {
+        await writeFile(path, bytes.subarray(0, 4), { flag: "wx" });
+        throw new Error("injected partial write failure");
+      },
+      unlink: async (path) => {
+        unlinkAttempts++;
+        if (unlinkAttempts === 1) throw new Error("injected unlink failure");
+        await unlink(path);
+      },
+    });
+    let ledgerBytes = 0;
+    const reserveBytes = (bytes: number) => {
+      ledgerBytes += bytes;
+      let remaining = bytes;
+      return {
+        release: (released: number) => {
+          ledgerBytes -= released;
+          remaining -= released;
+        },
+        rollback: () => {
+          ledgerBytes -= remaining;
+          remaining = 0;
+        },
+      };
+    };
+    const value = "partial payload";
+
+    await expect(orphaned.derive({ key: "partial", value }, {
+      maxOutputBytes: 100,
+      reserveBytes,
+    })).rejects.toMatchObject({ code: "CONTEXT_CLEANUP_FAILED", failures: [{ bytes: 4 }] });
+    expect(orphaned.get(`ctx_${sha256(value).slice(0, 16)}`)).toBeUndefined();
+    expect(orphaned.totalBytes()).toBe(4);
+    expect(orphaned.orphanedBytes()).toBe(4);
+    expect(ledgerBytes).toBe(4);
+    expect(await readdir(join(dir, "contexts"))).toHaveLength(1);
+
+    await orphaned.cleanupOrphans();
+    expect(orphaned.totalBytes()).toBe(0);
+    expect(orphaned.orphanedBytes()).toBe(0);
+    expect(ledgerBytes).toBe(0);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  test("releases an orphan when unlink removes the payload before throwing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rlm-ctx-orphan-removed-"));
+    let unlinkAttempts = 0;
+    const orphaned = new ContextStore(dir, DEFAULT_CONTEXT_STORE_LIMITS, {
+      writeFile: async (path, bytes) => {
+        await writeFile(path, bytes.subarray(0, 4), { flag: "wx" });
+        throw new Error("injected partial write failure");
+      },
+      unlink: async (path) => {
+        unlinkAttempts++;
+        if (unlinkAttempts === 1) throw new Error("injected unlink failure before removal");
+        await unlink(path);
+        throw new Error("injected unlink failure after removal");
+      },
+    });
+    let ledgerBytes = 0;
+    const value = "partial payload";
+    const contentPath = join(dir, "contexts", `${sha256(value)}.bin`);
+
+    await expect(orphaned.derive({ key: "partial", value }, {
+      maxOutputBytes: 100,
+      reserveBytes: (bytes) => {
+        ledgerBytes += bytes;
+        let remaining = bytes;
+        return {
+          release: (released) => {
+            ledgerBytes -= released;
+            remaining -= released;
+          },
+          rollback: () => {
+            ledgerBytes -= remaining;
+            remaining = 0;
+          },
+        };
+      },
+    })).rejects.toMatchObject({ code: "CONTEXT_CLEANUP_FAILED", failures: [{ bytes: 4 }] });
+    expect(orphaned.totalBytes()).toBe(4);
+    expect(orphaned.orphanedBytes()).toBe(4);
+    expect(ledgerBytes).toBe(4);
+
+    await orphaned.cleanupOrphans();
+    await expect(readFile(contentPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(orphaned.totalBytes()).toBe(0);
+    expect(orphaned.orphanedBytes()).toBe(0);
+    expect(ledgerBytes).toBe(0);
+
+    await orphaned.cleanupOrphans();
+    expect(orphaned.totalBytes()).toBe(0);
+    expect(orphaned.orphanedBytes()).toBe(0);
+    expect(ledgerBytes).toBe(0);
   });
 
   test("checks cancellation/deadline composition points while scanning", async () => {

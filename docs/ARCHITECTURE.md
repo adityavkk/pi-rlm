@@ -103,3 +103,28 @@ host-owned command nonce and immediately consumes its bound grant.
 - The event journal is the source of truth; status is a pure fold of events.
 - Content-addressed identity makes duplicate calls cache and makes replay
   idempotent.
+
+## Stored-byte accounting scope
+
+`storedByteLimit` bounds logical payload bytes retained for a run. The tree-wide
+ledger reserves the exact unique delta before mutation, then commits or rolls
+back with the mutation. Included producers:
+
+- UTF-8 context payloads: initial source batches, derive, concat, chunks,
+  artifact-to-context conversion, and direct/fallback answer snapshots. A SHA
+  already present in `ContextStore` has zero delta, including duplicate chunks.
+- UTF-8 artifact payloads retained by artifact id. Duplicate content in the
+  artifact map has zero delta; a separate context snapshot is a separate
+  logical producer.
+- Canonical JSON bytes for each distinct `GuestCallResult` retained in the call
+  cache. In-flight provider values are transient and become chargeable only if
+  cache insertion commits.
+
+The logical payload is charged once even when `ContextStore` keeps both an
+in-memory byte array and its durable content-addressed file. Returned views,
+bounded previews, workspace/trajectory objects, and serialization buffers are
+transient and not additional charges. `events.jsonl`, rebuildable `status.json`,
+run-manifest hashes, and control metadata are excluded: this journal is the
+authoritative control plane and must remain writable to record exhaustion and
+terminal state. The v1 checkpoint bridge stores no snapshots. Provider-token
+accounting remains separate from stored bytes.

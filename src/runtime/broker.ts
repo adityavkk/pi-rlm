@@ -6,9 +6,10 @@
  * (guest-catchable); call failures return a typed CallResult.
  */
 
-import { releaseBytes, releaseLogicalCall, reserveAttempt, reserveBytes, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
+import { releaseLogicalCall, reserveAttempt, reserveLogicalCall, settleAttempt } from "../core/budget.ts";
 import { callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
 import { deriveCallId, identityHash, type CallKind } from "../core/ids.ts";
+import type { RlmEvent } from "../core/journal.ts";
 import type { JsonObject, JsonValue } from "../core/json.ts";
 import { canonicalStringify, isJsonObject } from "../core/json.ts";
 import { normalizeJsonSchema, validateAgainstSchema } from "../core/schema.ts";
@@ -29,6 +30,7 @@ import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
+import { remainingStoredBytes, reserveStoredBytes, retainedJsonBytes } from "./stored-bytes.ts";
 
 export type RecurseFn = (args: JsonValue, signal: AbortSignal, deadlineMs: number) => Promise<GuestCallResult>;
 
@@ -91,6 +93,12 @@ const strictJson = (text: string): { ok: true; value: JsonValue } | { ok: false 
 };
 
 const now = (state: RunState): number => state.clock.now();
+
+const checkpointCall = (state: RunState, signal: AbortSignal, deadlineMs?: number): void => {
+  throwIfAborted(signal);
+  if (deadlineMs !== undefined && state.clock.now() >= deadlineMs)
+    throw new DslError("BUDGET_DEADLINE", "deadline reached during call");
+};
 
 interface KeyClaim {
   readonly frame: FrameRef;
@@ -331,9 +339,9 @@ export const dispatchCall = async (
   throwIfAborted(signal);
   switch (name) {
     case "llm":
-      return llm(state, frame, asObject(args), signal);
+      return llm(state, frame, asObject(args), signal, false, deadlineMs);
     case "llm.batch":
-      return llmBatch(state, frame, asObject(args), recurse, signal);
+      return llmBatch(state, frame, asObject(args), recurse, signal, deadlineMs);
     case "recurse":
       return recurse(args, signal, deadlineMs);
     case "agent": {
@@ -411,7 +419,7 @@ export const dispatchCall = async (
       return desc as unknown as JsonValue;
     }
     case "artifacts.write":
-      return writeArtifact(state, frame, asObject(args)) as unknown as JsonValue;
+      return writeArtifact(state, frame, asObject(args), signal) as unknown as JsonValue;
     case "artifacts.open": {
       const id = reqStr(asObject(args), "id");
       const entry = state.artifacts.get(id);
@@ -454,19 +462,11 @@ export const contextControl = (
   },
   ...(reserveOutput
     ? {
-        maxOutputBytes: Math.max(0, state.ledger.current.limits.storedByteLimit - state.ledger.current.usage.storedBytes),
+        maxOutputBytes: remainingStoredBytes(state.ledger.current),
         reserveBytes: (bytes: number) => {
-          const reserved = reserveBytes(state.ledger.current, bytes);
+          const reserved = reserveStoredBytes(state.ledger, bytes);
           if (!reserved.ok) throw new DslError(reserved.error.code, reserved.error.message);
-          state.ledger.current = reserved.value;
-          let active = true;
-          return {
-            rollback: () => {
-              if (!active) return;
-              active = false;
-              state.ledger.current = releaseBytes(state.ledger.current, bytes);
-            },
-          };
+          return reserved.value;
         },
       }
     : {}),
@@ -513,7 +513,12 @@ export const withContextMutation = async <T>(
   }
 };
 
-const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject) => {
+const writeArtifact = async (
+  state: RunState,
+  frame: FrameRef,
+  spec: JsonObject,
+  signal: AbortSignal,
+) => {
   const key = reqStr(spec, "key");
   const name = reqStr(spec, "name");
   if (!Object.prototype.hasOwnProperty.call(spec, "value"))
@@ -522,16 +527,79 @@ const writeArtifact = async (state: RunState, frame: FrameRef, spec: JsonObject)
   const mimeType = typeof spec["mimeType"] === "string" ? (spec["mimeType"] as string) : typeof value === "string" ? "text/plain" : "application/json";
   const identity: JsonValue = { name, value, mimeType };
   await bindKeys(state, [{ frame, kind: "artifact", key, identity }]);
+  throwIfAborted(signal);
   const text = typeof value === "string" ? value : canonicalStringify(value);
   const sha = state.hasher(text);
   const id = `art_${sha.slice(0, 16)}`;
-  const descriptor = { id, name, bytes: new TextEncoder().encode(text).length, sha256: sha, mimeType };
-  if (!state.artifacts.has(id)) {
+  const existing = state.artifacts.get(id);
+  if (existing) return existing.descriptor;
+  const descriptor = { id, name, bytes: Buffer.byteLength(text, "utf8"), sha256: sha, mimeType };
+  const reserved = reserveStoredBytes(state.ledger, descriptor.bytes);
+  if (!reserved.ok) throw new DslError(reserved.error.code, reserved.error.message);
+  try {
+    throwIfAborted(signal);
     state.artifacts.set(id, { descriptor, text });
-    const reserved = reserveBytes(state.ledger.current, descriptor.bytes);
-    if (reserved.ok) state.ledger.current = reserved.value;
+    reserved.value.commit();
+    return descriptor;
+  } catch (error) {
+    reserved.value.rollback();
+    if (state.artifacts.get(id)?.descriptor === descriptor) state.artifacts.delete(id);
+    throw error;
   }
-  return descriptor;
+};
+
+export const retainCallResult = async (
+  state: RunState,
+  result: GuestCallResult,
+  event: Extract<RlmEvent, { type: "call_committed" }>,
+  signal: AbortSignal,
+  deadlineMs?: number,
+): Promise<GuestCallResult> => {
+  checkpointCall(state, signal, deadlineMs);
+  const release = await state.contextSemaphore.acquire(signal);
+  if (!release) {
+    checkpointCall(state, signal, deadlineMs);
+    throw new Error("stored-byte persistence lock unavailable");
+  }
+  try {
+    checkpointCall(state, signal, deadlineMs);
+    const cached = state.callCache.get(result.callId);
+    if (cached) return cached;
+
+    let journalCommitted = false;
+    let journalFailure: JournalAppendError | undefined;
+    try {
+      const outcome = await waitForAbort(state.journal.append(event), signal);
+      const observed = outcome as {
+        readonly event?: "committed" | "ignored_after_terminal";
+        readonly statusCache?: { readonly state: string; readonly error?: JournalAppendError };
+      } | undefined;
+      journalCommitted = observed?.event === undefined || observed.event === "committed";
+      if (observed?.statusCache?.state === "failed" && observed.statusCache.error)
+        journalFailure = observed.statusCache.error;
+    } catch (error) {
+      if (!(error instanceof JournalAppendError) || !error.eventDurable) throw error;
+      journalCommitted = true;
+      journalFailure = error;
+    }
+    if (!journalCommitted) throw new Error("call journal event ignored after terminal");
+
+    checkpointCall(state, signal, deadlineMs);
+    const reserved = reserveStoredBytes(state.ledger, retainedJsonBytes(result as unknown as JsonValue));
+    if (!reserved.ok) return errResult(result.callId, reserved.error, result.usage, false);
+    try {
+      state.callCache.set(result.callId, result);
+      reserved.value.commit();
+    } catch (error) {
+      if (state.callCache.get(result.callId) === result) state.callCache.delete(result.callId);
+      reserved.value.rollback();
+      throw error;
+    }
+    if (journalFailure) throw journalFailure;
+    return result;
+  } finally {
+    release();
+  }
 };
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 512;
@@ -558,6 +626,7 @@ const llm = async (
   spec: JsonObject,
   signal: AbortSignal,
   identityBound = false,
+  deadlineMs?: number,
 ): Promise<GuestCallResult> => {
   const normalized = normalizeLlmSpec(state, spec);
   const { key, prompt, model, thinking, contextIds: ctxIds, schema, maxOutputTokens, identity } = normalized;
@@ -595,7 +664,7 @@ const llm = async (
 
       release = await state.semaphore.acquire(signal);
       if (!release) return cancelled(usage);
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
 
       const contexts = await waitForAbort(Promise.all(ctxIds.map((id) => state.store.load(id))), signal);
       throwIfAborted(signal);
@@ -618,7 +687,7 @@ const llm = async (
       pendingTokenReservation = reserveTokens;
 
       const firstRaw = await waitForAbort(state.model.complete(request), signal);
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
       const first = normalizeModelResponse(firstRaw, limits);
       if (!first) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
       const firstSettlement = settle(state, reserveTokens, first.usage.totalTokens ?? 0);
@@ -644,7 +713,7 @@ const llm = async (
             state.ledger.current = repairReserve.value;
             pendingTokenReservation = repairReserveTokens;
             const repairRaw = await waitForAbort(state.model.complete(repairRequest), signal);
-            throwIfAborted(signal);
+            checkpointCall(state, signal, deadlineMs);
             const repair = normalizeModelResponse(repairRaw, limits);
             if (!repair) return errResult(callId, callError("INVALID_RESULT", "model returned invalid usage"), usage, false);
             const combined = addUsage(usage, repair.usage);
@@ -666,16 +735,24 @@ const llm = async (
         value = first.text;
       }
 
-      throwIfAborted(signal);
+      checkpointCall(state, signal, deadlineMs);
       const result = okResult(callId, value, usage, false);
-      await state.journal.append({ type: "call_committed", frameId: frame.frameId, callId, kind: "llm", key, cached: false, ok: true, usage });
-      throwIfAborted(signal);
-      state.callCache.set(callId, result);
+      const retained = await retainCallResult(state, result, {
+        type: "call_committed",
+        frameId: frame.frameId,
+        callId,
+        kind: "llm",
+        key,
+        cached: false,
+        ok: true,
+        usage,
+      }, signal, deadlineMs);
       logicalReserved = false;
-      return result;
+      return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled(usage);
       logicalReserved = false;
+      if (error instanceof JournalAppendError) throw error;
       if (error instanceof PiModelError) {
         const failure = normalizePiFailure(error, usageLimits(state));
         if (failure) {
@@ -721,6 +798,7 @@ const llmBatch = async (
   spec: JsonObject,
   recurse: RecurseFn,
   signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<unknown> => {
   void recurse;
   reqStr(spec, "key");
@@ -737,8 +815,8 @@ const llmBatch = async (
       throwIfAborted(signal);
       const index = cursor++;
       if (index >= items.length) return;
-      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true);
-      throwIfAborted(signal);
+      const result = await llm(state, frame, itemSpecs[index] as JsonObject, signal, true, deadlineMs);
+      checkpointCall(state, signal, deadlineMs);
       results[index] = result;
     }
   });

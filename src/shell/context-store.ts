@@ -8,7 +8,7 @@
  * from the same sources on resume.
  */
 
-import { mkdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { JsonValue } from "../core/json.ts";
@@ -18,6 +18,7 @@ import {
   ContextBudgetError,
   type ContextByteReservation,
   ContextChunkOverflowError,
+  ContextCleanupError,
   type ContextDescriptor,
   type ContextMatch,
   type ContextOperationControl,
@@ -25,6 +26,7 @@ import {
   ContextSpecError,
   type ContextStoreInstrumentation,
   type ContextStoreLimits,
+  type ContextStoreTransaction,
   ContextUnavailableError,
   DEFAULT_CONTEXT_STORE_LIMITS,
 } from "./context-store-contract.ts";
@@ -33,6 +35,7 @@ import { sha256, sha256Bytes, sha256Parts } from "./hash.ts";
 export {
   ContextBudgetError,
   ContextChunkOverflowError,
+  ContextCleanupError,
   ContextSpecError,
   ContextUnavailableError,
   DEFAULT_CONTEXT_STORE_LIMITS,
@@ -45,6 +48,7 @@ export type {
   ContextRead,
   ContextStoreInstrumentation,
   ContextStoreLimits,
+  ContextStoreTransaction,
 } from "./context-store-contract.ts";
 
 const encoder = new TextEncoder();
@@ -55,6 +59,13 @@ const estimateTokens = (bytes: number): number => Math.ceil(bytes / 4);
 interface Entry {
   readonly descriptor: ContextDescriptor;
   readonly bytesArray: Uint8Array;
+}
+
+interface OrphanEntry {
+  readonly path: string;
+  bytes: number;
+  reservation?: ContextByteReservation;
+  cause: unknown;
 }
 
 class PreparedEntry {
@@ -140,7 +151,9 @@ export class ContextStore {
   private readonly entries = new Map<string, Entry>();
   private readonly contentDir: string;
   private readonly limits: ContextStoreLimits;
+  private mutationTail: Promise<void> = Promise.resolve();
   private uniqueBytes = 0;
+  private readonly orphans = new Map<string, OrphanEntry>();
 
   constructor(
     private readonly dir: string,
@@ -184,76 +197,191 @@ export class ContextStore {
     return new PreparedEntry(descriptor, prepared.materialize, this.instrumentation.onMaterialize);
   }
 
+  private async acquireMutation(): Promise<() => void> {
+    const previous = this.mutationTail;
+    let unlock!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { unlock = resolve; });
+    await previous;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      unlock();
+    };
+  }
+
+  private async beginPrepared(
+    prepared: readonly PreparedEntry[],
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
+    const release = await this.acquireMutation();
+    let createdDir = false;
+    let bytesInserted = false;
+    let delta = 0;
+    const staged: Array<{
+      readonly entry: Entry;
+      reservation?: ContextByteReservation;
+      path?: string;
+      ownsPath: boolean;
+    }> = [];
+
+    const retainedPayload = async (
+      path: string,
+      maximum: number,
+    ): Promise<{ readonly exists: boolean; readonly bytes: number }> => {
+      try {
+        const bytes = this.instrumentation.fileBytes
+          ? await this.instrumentation.fileBytes(path)
+          : (await stat(path)).size;
+        return { exists: true, bytes: Number.isSafeInteger(bytes) && bytes >= 0 && bytes <= maximum ? bytes : maximum };
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === "ENOENT" || code === "ENOTDIR"
+          ? { exists: false, bytes: 0 }
+          : { exists: true, bytes: maximum };
+      }
+    };
+    const remove = this.instrumentation.unlink ?? unlink;
+    const rollbackStaged = async (): Promise<void> => {
+      for (const { entry } of staged) {
+        if (this.entries.get(entry.descriptor.id) === entry) this.entries.delete(entry.descriptor.id);
+      }
+      if (bytesInserted) this.uniqueBytes -= delta;
+
+      const failures: Array<{ path: string; bytes: number; cause: unknown }> = [];
+      for (const candidate of staged) {
+        if (!candidate.ownsPath || candidate.path === undefined) {
+          candidate.reservation?.rollback();
+          continue;
+        }
+        try {
+          await remove(candidate.path);
+          candidate.reservation?.rollback();
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code === "ENOENT") {
+            candidate.reservation?.rollback();
+            continue;
+          }
+          const retained = await retainedPayload(candidate.path, candidate.entry.descriptor.bytes);
+          if (!retained.exists) {
+            candidate.reservation?.rollback();
+            continue;
+          }
+          const { bytes } = retained;
+          candidate.reservation?.release(candidate.entry.descriptor.bytes - bytes);
+          const orphan: OrphanEntry = { path: candidate.path, bytes, cause };
+          if (candidate.reservation) orphan.reservation = candidate.reservation;
+          this.orphans.set(candidate.path, orphan);
+          this.uniqueBytes += bytes;
+          failures.push({ path: candidate.path, bytes, cause });
+        }
+      }
+      if (createdDir && this.orphans.size === 0) await rmdir(this.contentDir).catch(() => undefined);
+      if (failures.length > 0) throw new ContextCleanupError(failures);
+    };
+
+    try {
+      const canonical = new Map<string, ContextDescriptor>();
+      for (const [id, entry] of this.entries) canonical.set(id, entry.descriptor);
+      const additions: PreparedEntry[] = [];
+      const descriptors = prepared.map((candidate) => {
+        const existing = canonical.get(candidate.descriptor.id);
+        if (existing) return existing;
+        canonical.set(candidate.descriptor.id, candidate.descriptor);
+        additions.push(candidate);
+        return candidate.descriptor;
+      });
+      for (const candidate of additions) {
+        if (delta > Number.MAX_SAFE_INTEGER - candidate.descriptor.bytes)
+          throw new ContextSpecError("context output is too large");
+        delta += candidate.descriptor.bytes;
+      }
+      const maxOutputBytes = control?.maxOutputBytes === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
+      if (delta > maxOutputBytes)
+        throw new ContextBudgetError(`context output requires ${delta} bytes; ${maxOutputBytes} bytes remain`);
+
+      for (const candidate of additions) {
+        const reservation = control?.reserveBytes?.(candidate.descriptor.bytes);
+        try {
+          control?.checkpoint?.();
+          const bytesArray = candidate.materialize();
+          if (bytesArray.length !== candidate.descriptor.bytes || sha256Bytes(bytesArray) !== candidate.descriptor.sha256)
+            throw new Error(`prepared context ${candidate.descriptor.id} changed before commit`);
+          const stagedCandidate: (typeof staged)[number] = {
+            entry: { descriptor: candidate.descriptor, bytesArray },
+            ownsPath: false,
+          };
+          if (reservation) stagedCandidate.reservation = reservation;
+          staged.push(stagedCandidate);
+        } catch (error) {
+          reservation?.rollback();
+          throw error;
+        }
+      }
+      if (staged.length > 0 && !existsSync(this.contentDir)) {
+        await mkdir(this.contentDir, { recursive: true });
+        createdDir = true;
+      }
+      for (const candidate of staged) {
+        control?.checkpoint?.();
+        const { entry } = candidate;
+        const path = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
+        const orphan = this.orphans.get(path);
+        if (orphan) throw new ContextCleanupError([{ path, bytes: orphan.bytes, cause: orphan.cause }]);
+        if (existsSync(path)) continue;
+        candidate.path = path;
+        candidate.ownsPath = true;
+        try {
+          if (this.instrumentation.writeFile) await this.instrumentation.writeFile(path, entry.bytesArray);
+          else await writeFile(path, entry.bytesArray, { flag: "wx" });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") candidate.ownsPath = false;
+          else throw error;
+        }
+      }
+      for (const { entry } of staged) this.entries.set(entry.descriptor.id, entry);
+      this.uniqueBytes += delta;
+      bytesInserted = true;
+      control?.checkpoint?.();
+
+      let active = true;
+      return {
+        value: descriptors,
+        commit: () => {
+          if (!active) return;
+          active = false;
+          for (const candidate of staged) candidate.reservation?.commit?.();
+          release();
+        },
+        rollback: async () => {
+          if (!active) return;
+          active = false;
+          try {
+            await rollbackStaged();
+          } finally {
+            release();
+          }
+        },
+      };
+    } catch (error) {
+      try {
+        await rollbackStaged();
+      } finally {
+        release();
+      }
+      throw error;
+    }
+  }
+
   private async commitPrepared(
     prepared: readonly PreparedEntry[],
     control?: ContextOperationControl,
   ): Promise<ContextDescriptor[]> {
-    const canonical = new Map<string, ContextDescriptor>();
-    for (const [id, entry] of this.entries) canonical.set(id, entry.descriptor);
-    const additions: PreparedEntry[] = [];
-    const descriptors = prepared.map((candidate) => {
-      const existing = canonical.get(candidate.descriptor.id);
-      if (existing) return existing;
-      canonical.set(candidate.descriptor.id, candidate.descriptor);
-      additions.push(candidate);
-      return candidate.descriptor;
-    });
-    const delta = additions.reduce((sum, candidate) => sum + candidate.descriptor.bytes, 0);
-    const maxOutputBytes = control?.maxOutputBytes === undefined
-      ? Number.MAX_SAFE_INTEGER
-      : boundedInteger(control.maxOutputBytes, "maxOutputBytes", 0, Number.MAX_SAFE_INTEGER);
-    if (delta > maxOutputBytes)
-      throw new ContextBudgetError(`context output requires ${delta} bytes; ${maxOutputBytes} bytes remain`);
-
-    let reservation: ContextByteReservation | undefined;
-    let createdDir = false;
-    let bytesCommitted = false;
-    const createdPaths: string[] = [];
-    const insertedIds: string[] = [];
-    try {
-      if (delta > 0) reservation = control?.reserveBytes?.(delta);
-      const materialized: Entry[] = [];
-      for (const candidate of additions) {
-        control?.checkpoint?.();
-        const bytesArray = candidate.materialize();
-        if (bytesArray.length !== candidate.descriptor.bytes || sha256Bytes(bytesArray) !== candidate.descriptor.sha256)
-          throw new Error(`prepared context ${candidate.descriptor.id} changed before commit`);
-        materialized.push({ descriptor: candidate.descriptor, bytesArray });
-      }
-      if (materialized.length > 0 && !existsSync(this.contentDir)) {
-        await mkdir(this.contentDir, { recursive: true });
-        createdDir = true;
-      }
-      for (const entry of materialized) {
-        control?.checkpoint?.();
-        const path = join(this.contentDir, `${entry.descriptor.sha256}.bin`);
-        if (existsSync(path)) continue;
-        try {
-          await writeFile(path, entry.bytesArray, { flag: "wx" });
-          createdPaths.push(path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-            await unlink(path).catch(() => undefined);
-            throw error;
-          }
-        }
-      }
-      for (const entry of materialized) {
-        this.entries.set(entry.descriptor.id, entry);
-        insertedIds.push(entry.descriptor.id);
-      }
-      this.uniqueBytes += delta;
-      bytesCommitted = true;
-      control?.checkpoint?.();
-      return descriptors;
-    } catch (error) {
-      for (const id of insertedIds) this.entries.delete(id);
-      if (bytesCommitted) this.uniqueBytes -= delta;
-      reservation?.rollback();
-      await Promise.allSettled(createdPaths.map((path) => unlink(path)));
-      if (createdDir) await rmdir(this.contentDir).catch(() => undefined);
-      throw error;
-    }
+    const transaction = await this.beginPrepared(prepared, control);
+    transaction.commit();
+    return transaction.value;
   }
 
   private async intern(
@@ -274,12 +402,75 @@ export class ContextStore {
     return this.intern(label, text, mimeType, control);
   }
 
+  /** Stage all initial sources as one unique-byte transaction. */
+  beginIngestTexts(
+    sources: readonly { readonly label: string; readonly text: string; readonly mimeType?: string }[],
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
+    return this.beginPrepared(
+      sources.map((source) => this.prepareText(source.label, source.text, source.mimeType ?? "text/plain")),
+      control,
+    );
+  }
+
   get(id: string): ContextDescriptor | undefined {
     return this.entries.get(id)?.descriptor;
   }
 
   totalBytes(): number {
     return this.uniqueBytes;
+  }
+
+  orphanedBytes(): number {
+    let bytes = 0;
+    for (const orphan of this.orphans.values()) bytes += orphan.bytes;
+    return bytes;
+  }
+
+  /** Retry removal of non-usable payloads retained after a failed rollback. */
+  async cleanupOrphans(control?: ContextOperationControl): Promise<void> {
+    const release = await this.acquireMutation();
+    const remove = this.instrumentation.unlink ?? unlink;
+    const failures: Array<{ path: string; bytes: number; cause: unknown }> = [];
+    try {
+      for (const [path, orphan] of this.orphans) {
+        control?.checkpoint?.();
+        try {
+          await remove(path);
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+            let bytes = orphan.bytes;
+            let exists = true;
+            try {
+              const measured = this.instrumentation.fileBytes
+                ? await this.instrumentation.fileBytes(path)
+                : (await stat(path)).size;
+              if (Number.isSafeInteger(measured) && measured >= 0 && measured <= bytes) bytes = measured;
+            } catch (measurementCause) {
+              const code = (measurementCause as NodeJS.ErrnoException).code;
+              if (code === "ENOENT" || code === "ENOTDIR") exists = false;
+            }
+            if (exists) {
+              if (bytes < orphan.bytes) {
+                orphan.reservation?.release(orphan.bytes - bytes);
+                this.uniqueBytes -= orphan.bytes - bytes;
+                orphan.bytes = bytes;
+              }
+              orphan.cause = cause;
+              failures.push({ path, bytes: orphan.bytes, cause });
+              continue;
+            }
+          }
+        }
+        this.orphans.delete(path);
+        this.uniqueBytes -= orphan.bytes;
+        orphan.reservation?.rollback();
+      }
+      if (this.entries.size === 0 && this.orphans.size === 0) await rmdir(this.contentDir).catch(() => undefined);
+      if (failures.length > 0) throw new ContextCleanupError(failures);
+    } finally {
+      release();
+    }
   }
 
   private entryOrThrow(id: string): Entry {
@@ -456,13 +647,29 @@ export class ContextStore {
     return this.commitPrepared(prepared, control);
   }
 
+  async beginDerive(
+    spec: { key: string; value: string | JsonValue; label?: string },
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor>> {
+    const label = spec.label ?? `derived:${spec.key}`;
+    const prepared = typeof spec.value === "string"
+      ? this.prepareText(label, spec.value, "text/plain")
+      : this.prepareJson(label, spec.value, control);
+    const transaction = await this.beginPrepared([prepared], control);
+    return {
+      value: transaction.value[0] as ContextDescriptor,
+      commit: () => transaction.commit(),
+      rollback: () => transaction.rollback(),
+    };
+  }
+
   async derive(
     spec: { key: string; value: string | JsonValue; label?: string },
     control?: ContextOperationControl,
   ): Promise<ContextDescriptor> {
-    const label = spec.label ?? `derived:${spec.key}`;
-    if (typeof spec.value === "string") return this.intern(label, spec.value, "text/plain", control);
-    return (await this.commitPrepared([this.prepareJson(label, spec.value, control)], control))[0] as ContextDescriptor;
+    const transaction = await this.beginDerive(spec, control);
+    transaction.commit();
+    return transaction.value;
   }
 
   async concat(

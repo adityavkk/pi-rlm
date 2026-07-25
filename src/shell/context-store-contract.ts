@@ -31,9 +31,12 @@ export interface ContextStoreLimits {
   readonly maxPatternBytes: number;
 }
 
-/** Optional allocation observer for diagnostics and deterministic tests. */
+/** Optional allocation and persistence hooks for diagnostics and deterministic tests. */
 export interface ContextStoreInstrumentation {
   readonly onMaterialize?: (descriptor: ContextDescriptor) => void;
+  readonly writeFile?: (path: string, bytes: Uint8Array) => Promise<void>;
+  readonly unlink?: (path: string) => Promise<void>;
+  readonly fileBytes?: (path: string) => Promise<number>;
 }
 
 export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
@@ -46,7 +49,19 @@ export const DEFAULT_CONTEXT_STORE_LIMITS: ContextStoreLimits = {
 };
 
 export interface ContextByteReservation {
+  /** Finalize exactly one successful retained-byte mutation. */
+  readonly commit?: () => void;
+  /** Release part of an unsettled reservation while retaining the remainder. */
+  release(bytes: number): void;
+  /** Release the complete unsettled reservation when its mutation does not commit. */
   rollback(): void;
+}
+
+/** A staged context mutation. The store lock remains held until settlement. */
+export interface ContextStoreTransaction<T> {
+  readonly value: T;
+  commit(): void;
+  rollback(): Promise<void>;
 }
 
 /** Optional composition points for broker deadlines and atomic byte reservation. */
@@ -84,5 +99,21 @@ export class ContextBudgetError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ContextBudgetError";
+  }
+}
+
+export interface ContextCleanupFailure {
+  readonly path: string;
+  readonly bytes: number;
+  readonly cause: unknown;
+}
+
+/** A payload remains physically retained and charged after rollback cleanup failed. */
+export class ContextCleanupError extends Error {
+  readonly code = "CONTEXT_CLEANUP_FAILED";
+
+  constructor(readonly failures: readonly ContextCleanupFailure[]) {
+    super(`failed to remove ${failures.length} staged context payload${failures.length === 1 ? "" : "s"}`);
+    this.name = "ContextCleanupError";
   }
 }

@@ -142,16 +142,22 @@ export const acquireLeaf = (ledger: Ledger): Ledger | "saturated" => {
 export const releaseLeaf = (ledger: Ledger): Ledger =>
   patch(ledger, { activeLeafCalls: Math.max(0, ledger.usage.activeLeafCalls - 1) });
 
-/** Reserve host-stored bytes for a context/artifact snapshot. */
+/** Reserve a finite, exact logical retained-byte delta. */
 export const reserveBytes = (ledger: Ledger, bytes: number): Result<Ledger, CallError> => {
-  if (ledger.usage.storedBytes + bytes > ledger.limits.storedByteLimit)
+  if (!Number.isSafeInteger(bytes) || bytes < 0
+    || !Number.isSafeInteger(ledger.usage.storedBytes) || ledger.usage.storedBytes < 0)
+    return err(callError("INVALID_RESULT", "invalid stored-byte accounting"));
+  if (bytes > ledger.limits.storedByteLimit - ledger.usage.storedBytes)
     return err(callError("BUDGET_BYTES", `stored byte limit ${ledger.limits.storedByteLimit} reached`));
   return ok(patch(ledger, { storedBytes: ledger.usage.storedBytes + bytes }));
 };
 
-/** Release a prior stored-byte reservation after a context commit fails. */
-export const releaseBytes = (ledger: Ledger, bytes: number): Ledger =>
-  patch(ledger, { storedBytes: Math.max(0, ledger.usage.storedBytes - bytes) });
+/** Release one active stored-byte reservation after its retained mutation fails. */
+export const releaseBytes = (ledger: Ledger, bytes: number): Ledger => {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > ledger.usage.storedBytes)
+    throw new Error("invalid stored-byte reservation rollback");
+  return patch(ledger, { storedBytes: ledger.usage.storedBytes - bytes });
+};
 
 export interface BudgetView {
   readonly depth: number;
