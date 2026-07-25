@@ -12,8 +12,8 @@ import type { CallKind } from "./ids.ts";
 import type { CallUsage } from "./usage.ts";
 
 export type CompletionMode = "answer" | "fallback_extract";
-export type RunState = "running" | "completed" | "failed";
-export type FrameState = "open" | "answered" | "closed" | "failed";
+export type RunState = "running" | "completed" | "failed" | "cancelled";
+export type FrameState = "open" | "answered" | "closed" | "failed" | "cancelled";
 
 export interface EventErrorInfo {
   readonly code: string;
@@ -50,7 +50,8 @@ export type RlmEvent =
   | { readonly type: "answer_committed"; readonly frameId: string; readonly completionMode: CompletionMode; readonly outputRef: string }
   | { readonly type: "frame_closed"; readonly frameId: string; readonly state: FrameState }
   | { readonly type: "run_completed"; readonly runId: string; readonly completionMode: CompletionMode; readonly outputRef?: string }
-  | { readonly type: "run_failed"; readonly runId: string; readonly code: string; readonly message: string };
+  | { readonly type: "run_failed"; readonly runId: string; readonly code: string; readonly message: string }
+  | { readonly type: "run_cancelled"; readonly runId: string; readonly code: "CANCELLED"; readonly message: string };
 
 export interface FrameStatus {
   readonly frameId: string;
@@ -97,6 +98,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
   let completionMode: CompletionMode | undefined;
   let outputRef: string | undefined;
   let error: EventErrorInfo | undefined;
+  let terminal = false;
   const frames = new Map<string, MutableFrame>();
   const frameOrder: string[] = [];
   const committedCallIds = new Set<string>();
@@ -159,13 +161,26 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         break;
       }
       case "run_completed":
-        state = "completed";
-        completionMode = event.completionMode;
-        if (event.outputRef !== undefined) outputRef = event.outputRef;
+        if (!terminal) {
+          terminal = true;
+          state = "completed";
+          completionMode = event.completionMode;
+          if (event.outputRef !== undefined) outputRef = event.outputRef;
+        }
         break;
       case "run_failed":
-        state = "failed";
-        error = { code: event.code, message: event.message };
+        if (!terminal) {
+          terminal = true;
+          state = "failed";
+          error = { code: event.code, message: event.message };
+        }
+        break;
+      case "run_cancelled":
+        if (!terminal) {
+          terminal = true;
+          state = "cancelled";
+          error = { code: event.code, message: event.message };
+        }
         break;
       default: {
         const _exhaustive: never = event;

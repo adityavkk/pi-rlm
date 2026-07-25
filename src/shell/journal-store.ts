@@ -70,6 +70,9 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
 const isMissing = (error: unknown): boolean =>
   typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 
+const isTerminal = (event: RlmEvent): boolean =>
+  event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled";
+
 export class JournalStore {
   private readonly eventsPath: string;
   private readonly statusPath: string;
@@ -88,22 +91,31 @@ export class JournalStore {
     const run = async (): Promise<void> => {
       const line = `${JSON.stringify(event)}\n`;
       const handle = await this.fileSystem.open(this.eventsPath, "a+");
-      let events: RlmEvent[];
+      let finalEvents: RlmEvent[] = [];
+      let refreshStatus = true;
       try {
         const raw = await handle.readFile();
         const scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
-        events = scanned.value.events;
+        const events = scanned.value.events;
         if (scanned.value.verifiedBytes !== raw.length) {
           await handle.truncate(scanned.value.verifiedBytes);
           await handle.sync();
         }
-        await handle.appendFile(line, "utf8");
-        await handle.sync();
+        // The first run terminal is authoritative. This also drops callbacks
+        // that were queued after finalization without creating late events.
+        if (events.some(isTerminal)) {
+          finalEvents = events;
+          refreshStatus = isTerminal(event);
+        } else {
+          await handle.appendFile(line, "utf8");
+          await handle.sync();
+          finalEvents = [...events, event];
+        }
       } finally {
         await handle.close();
       }
-      await this.writeStatus(reduceStatus([...events, event]));
+      if (refreshStatus) await this.writeStatus(reduceStatus(finalEvents));
     };
     this.queue = this.queue.then(run, run);
     return this.queue;
