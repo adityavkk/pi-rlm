@@ -2,6 +2,19 @@
 
 Pinned Pi version: `@earendil-works/pi-coding-agent` 0.80.10.
 
+Packed-package acceptance runs two independent cases with separate clean
+HOME/XDG/npm/Bun directories. The direct case invokes the pinned Pi CLI as
+`pi -e <installed-package-directory> /rlm`. The installed-discovery case puts
+the installed package directory in the isolated global settings `packages`
+array, validates that its packed `package.json` declares `pi.extensions`, and
+invokes Pi without `-e`; Pi alone resolves the extension manifest entry. Both
+run offline with an empty environment allowlist, use separate bounded JSONL and
+stderr files, and require one `pi-rlm-result` lifecycle containing
+`RLM_SOURCE_REQUIRED` without starting a provider turn. The isolation wrapper
+also verifies caller paths are unchanged and the temporary fixture is removed.
+Run `bun run smoke:packed` directly or `bun run test:smoke-isolation` for the
+outer caller-environment check.
+
 Credential-free integration uses Pi's public `CreateAgentSessionRuntimeFactory`, `createAgentSessionServices`, `createAgentSessionFromServices`, and `createAgentSessionRuntime` APIs. `resourceLoaderOptions.extensionFactories` injects `createRlmExtension` with its public `executeRun` seam; no provider call or credential is used. For every extension mode binding (`tui`, `rpc`, `json`, and `print`), the real `AgentSession` and `ExtensionRunner` path is observed through public `session.subscribe()`: exactly one matching `pi-rlm-result` `message_start`, `message_end`, and session entry are required.
 
 ## Offline provider/runtime fixture

@@ -54,5 +54,9 @@ if ! cmp -s "$before" "$after"; then
   diff -u "$before" "$after" >&2 || true
   exit 1
 fi
+if [[ -n "$(find "$smoke_tmp" -mindepth 1 -print -quit)" ]]; then
+  echo "packed smoke left a residual temporary fixture" >&2
+  exit 1
+fi
 
-echo "packed smoke caller-environment isolation passed"
+echo "packed smoke caller-environment isolation and cleanup passed"
