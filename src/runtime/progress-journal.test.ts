@@ -200,7 +200,7 @@ describe("authoritative progress journal effects", () => {
   });
 
   for (const position of [0, 1, 2, 3]) {
-    test(`rolls back answer bytes when cell batch position ${position + 1} faults`, async () => {
+    test(`keeps safely published answer bytes unreferenced when cell batch position ${position + 1} faults`, async () => {
       const dir = await tmp();
       const journal = new FailingCellBatchJournal(dir, position);
       const result = await run(dir, new MockController([{
@@ -209,7 +209,8 @@ describe("authoritative progress journal effects", () => {
       }]), { journal });
 
       expect(result).toMatchObject({ status: "failed", error: { code: "JOURNAL_FAILED" } });
-      expect(result.ledger.usage.storedBytes).toBe(0);
+      // Content-addressed publication from #45 is immediately shareable and cannot be unlinked safely on rollback.
+      expect(result.ledger.usage.storedBytes).toBeGreaterThan(0);
       const journalEvents = await events(dir);
       expect(journalEvents.some((event) =>
         event.type === "phase" || event.type === "emit" || event.type === "cell_committed" ||

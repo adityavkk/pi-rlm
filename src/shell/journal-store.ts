@@ -10,13 +10,18 @@ import { createHash } from "node:crypto";
 import { open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
-import { type JsonValue, canonicalStringify, isJsonObject } from "../core/json.ts";
+import { type JsonValue, canonicalStringify } from "../core/json.ts";
 import { reduceStatus, type RlmEvent, type RunStatus } from "../core/journal.ts";
 import { err, ok, type Result } from "../core/result.ts";
+import { parseRlmEvent } from "./journal-event.ts";
+
+export { parseRlmEvent } from "./journal-event.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 const lineHash = (line: string): string => sha256(line).slice(0, 12);
 const BATCH_RECORD_TYPE = "journal_batch";
+const BATCH_RECORD_VERSION = 1;
+const SHA256 = /^[0-9a-f]{64}$/;
 
 export interface JournalFileHandle {
   appendFile(data: string, encoding: BufferEncoding): Promise<void>;
@@ -41,6 +46,7 @@ const nodeFileSystem: JournalFileSystem = {
 
 interface JournalBatchRecord {
   readonly type: typeof BATCH_RECORD_TYPE;
+  readonly version: typeof BATCH_RECORD_VERSION;
   readonly batchId: string;
   readonly checksum: string;
   readonly events: readonly RlmEvent[];
@@ -48,7 +54,34 @@ interface JournalBatchRecord {
 
 const makeBatchRecord = (events: readonly RlmEvent[]): JournalBatchRecord => {
   const checksum = sha256(canonicalStringify(events as unknown as JsonValue));
-  return { type: BATCH_RECORD_TYPE, batchId: `batch_${checksum}`, checksum, events };
+  return { type: BATCH_RECORD_TYPE, version: BATCH_RECORD_VERSION, batchId: `batch_${checksum}`, checksum, events };
+};
+
+const sameOutput = (
+  cell: Extract<RlmEvent, { type: "cell_committed" }>,
+  answer: Extract<RlmEvent, { type: "answer_committed" }>,
+): boolean => cell.outputRef === answer.outputRef && cell.outputRefSha256 === answer.outputSha256
+  && cell.outputRefBytes === answer.outputBytes;
+
+/** Only the two transactions emitted by the runtime are valid batch payloads. */
+const validBatchSemantics = (events: readonly RlmEvent[]): boolean => {
+  if (events.length === 2 && events[0]?.type === "fallback_evidence_cited" && events[1]?.type === "answer_committed") {
+    return events[0].frameId === events[1].frameId && events[1].completionMode === "fallback_extract";
+  }
+  const cellIndexes = events.flatMap((event, index) => event.type === "cell_committed" ? [index] : []);
+  if (cellIndexes.length !== 1) return false;
+  const cellIndex = cellIndexes[0] as number;
+  const cell = events[cellIndex] as Extract<RlmEvent, { type: "cell_committed" }>;
+  if (cellIndex !== events.length - 1 && cellIndex !== events.length - 2) return false;
+  for (let index = 0; index < cellIndex; index++) {
+    const progress = events[index];
+    if (!progress || (progress.type !== "phase" && progress.type !== "emit") || progress.frameId !== cell.frameId
+      || progress.iteration !== cell.iteration || progress.ordinal !== index) return false;
+  }
+  const answer = events[cellIndex + 1];
+  if (!answer) return cell.outputRef === undefined && cell.outputRefSha256 === undefined && cell.outputRefBytes === undefined;
+  return answer.type === "answer_committed" && answer.frameId === cell.frameId && answer.completionMode === "answer"
+    && sameOutput(cell, answer);
 };
 
 const recordLine = (record: RlmEvent | JournalBatchRecord): string =>
@@ -75,24 +108,38 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
   for (let i = 0; i < verifiedBytes; i++) {
     if (raw[i] !== 0x0a) continue;
     const line = Buffer.from(raw.subarray(lineStart, i)).toString("utf8");
-    if (line.length > 0) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        return err(corruptLine(lineNumber, line));
-      }
-      if (isJsonObject(parsed) && parsed["type"] === BATCH_RECORD_TYPE) {
-        const batchEvents = parsed["events"];
-        if (!Array.isArray(batchEvents)) return err(corruptLine(lineNumber, line));
-        const expected = makeBatchRecord(batchEvents as RlmEvent[]);
-        if (parsed["batchId"] !== expected.batchId || parsed["checksum"] !== expected.checksum)
+    if (line.length === 0) return err(corruptLine(lineNumber, line));
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        && Object.getOwnPropertyDescriptor(parsed, "type")?.value === BATCH_RECORD_TYPE) {
+        const envelope = parsed as Record<string, unknown>;
+        const keys = Object.keys(envelope).sort();
+        if (keys.join("\0") !== ["batchId", "checksum", "events", "type", "version"].join("\0")
+          || envelope["version"] !== BATCH_RECORD_VERSION || typeof envelope["batchId"] !== "string"
+          || !/^batch_[0-9a-f]{64}$/.test(envelope["batchId"]) || typeof envelope["checksum"] !== "string"
+          || !SHA256.test(envelope["checksum"]) || !Array.isArray(envelope["events"]) || envelope["events"].length === 0)
           return err(corruptLine(lineNumber, line));
+        const batchEvents: RlmEvent[] = [];
+        for (const rawEvent of envelope["events"]) {
+          const event = parseRlmEvent(rawEvent);
+          if (!event.ok) return err(corruptLine(lineNumber, line));
+          batchEvents.push(event.value);
+        }
+        if (!validBatchSemantics(batchEvents)) return err(corruptLine(lineNumber, line));
+        const expected = makeBatchRecord(batchEvents);
+        if (envelope["batchId"] !== expected.batchId || envelope["checksum"] !== expected.checksum
+          || line !== recordLine(expected).slice(0, -1)) return err(corruptLine(lineNumber, line));
         if (!batchIds.has(expected.batchId)) events.push(...expected.events);
         batchIds.add(expected.batchId);
       } else {
-        events.push(parsed as RlmEvent);
+        const event = parseRlmEvent(parsed);
+        if (!event.ok) return err(corruptLine(lineNumber, line));
+        events.push(event.value);
       }
+    } catch {
+      return err(corruptLine(lineNumber, line));
     }
     lineStart = i + 1;
     lineNumber++;
@@ -161,7 +208,9 @@ export class JournalStore {
   }
 
   append(event: RlmEvent): Promise<JournalAppendOutcome> {
-    return this.enqueue([event], false).then((outcome) => ({
+    const parsed = parseRlmEvent(event);
+    if (!parsed.ok) return Promise.reject(new JournalAppendError("event", false, parsed.error));
+    return this.enqueue([parsed.value], false).then((outcome) => ({
       event: outcome.events[0] as JournalAppendDisposition,
       statusCache: outcome.statusCache,
     }));
@@ -169,8 +218,15 @@ export class JournalStore {
 
   /** Append one logical batch as exactly one canonical, checksummed JSONL record. */
   appendBatch(batch: readonly RlmEvent[]): Promise<JournalBatchAppendOutcome> {
-    if (batch.length === 0) throw new RangeError("journal batch must contain at least one event");
-    return this.enqueue(batch, true);
+    const parsed: RlmEvent[] = [];
+    for (const rawEvent of batch) {
+      const event = parseRlmEvent(rawEvent);
+      if (!event.ok) return Promise.reject(new JournalAppendError("event", false, event.error));
+      parsed.push(event.value);
+    }
+    if (!validBatchSemantics(parsed))
+      return Promise.reject(new JournalAppendError("event", false, interpreterError("JOURNAL_CORRUPT", "invalid journal batch")));
+    return this.enqueue(parsed, true);
   }
 
   private enqueue(batch: readonly RlmEvent[], batched: boolean): Promise<JournalBatchAppendOutcome> {
@@ -238,6 +294,8 @@ export class JournalStore {
 
           refreshStatus = accepted.length > 0 || batch.some(isTerminal);
           if (accepted.length > 0) {
+            if (batched && !validBatchSemantics(accepted))
+              throw new JournalAppendError("event", false, interpreterError("JOURNAL_CORRUPT", "invalid deduplicated journal batch"));
             const record = batched ? makeBatchRecord(accepted) : accepted[0] as RlmEvent;
             if (batched && scanned.value.batchIds.has((record as JournalBatchRecord).batchId)) {
               for (const index of acceptedIndexes) dispositions[index] = "deduplicated";
