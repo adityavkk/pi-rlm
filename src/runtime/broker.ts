@@ -267,11 +267,6 @@ export const dispatchCall = async (
       const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "agent", key: reqStr(spec, "key"), identity: spec });
       return errResult(callId, callError("UNAVAILABLE_CONTEXT", "agent() requires pi-subagents delegation (Phase 2)"), ZERO_CALL_USAGE, false) as unknown as JsonValue;
     }
-    case "tools.call": {
-      const spec = asObject(args);
-      const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "tool", key: reqStr(spec, "key"), identity: spec });
-      return errResult(callId, callError("DENIED", "tools.call requires an allowlisted profile (Phase 3)"), ZERO_CALL_USAGE, false) as unknown as JsonValue;
-    }
     case "checkpoint":
       return "denied";
     case "context.read": {

@@ -205,7 +205,6 @@ export const buildPreamble = (globals: CellGlobals): string => {
     open: (id) => call("artifacts.open", { id }),
     asContext: (artifact, options) => call("artifacts.asContext", { artifact, options }).then(makeContextRef),
   };
-  globalThis.tools = { call: (s) => call("tools.call", s) };
   // Non-determinism is withheld from the guest in v1.
   Object.defineProperty(globalThis, "Date", { value: undefined });
   if (globalThis.Math) globalThis.Math.random = () => { throw new Error("Math.random is disabled in pi-rlm cells"); };

@@ -38,9 +38,8 @@ What is not done yet:
 - The live provider path (real model calls through Pi) is implemented against
   the SDK and type-checks, but it needs configured model auth and has not been
   run end to end here. Treat it as interactive-use code pending live testing.
-- `agent()` delegation to pi-subagents, `tools.call()`, the TUI inspector,
-  cross-process resume, and the security-probe suite are designed but not built.
-  See the roadmap.
+- `agent()` delegation to pi-subagents, the TUI inspector, cross-process resume,
+  and the security-probe suite are designed but not built. See the roadmap.
 
 ## Install
 
@@ -172,9 +171,14 @@ from Pi settings without `-e`. Both require the exact bounded and durable
 
 - Phase 2: `agent()` delegation through `pi-subagents`, background runs, and the
   TUI inspector, widget, and approvals.
-- Phase 3: allowlisted `tools.call()`, checkpoints, and the security probe suite.
+- Phase 3: checkpoints, cross-process resume, and the security probe suite.
 - Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
   compaction, and ordinary subagent fan-out.
+
+Direct host tools are outside the version 1 scope. A later version may accept
+an explicit list of host functions, similar to DSPy's `RLM(tools=[...])`. It
+will not discover or execute arbitrary registered Pi tools through private Pi
+internals.
 
 The full design lives in the
 [agent-spells design suite](https://github.com/adityavkk/agent-spells/blob/main/docs/design/pi-rlm.md).
