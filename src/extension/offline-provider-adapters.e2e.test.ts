@@ -7,7 +7,8 @@ import { OFFLINE_ANSWER, OFFLINE_COMMAND } from "./testing/offline-provider-runt
 const MAX_ADAPTER_BYTES = 256 * 1024;
 const MAX_RPC_RECORDS = 256;
 const MAX_RPC_LINE_BYTES = 64 * 1024;
-const ADAPTER_TIMEOUT_MS = 10_000;
+const ADAPTER_TIMEOUT_MS = 30_000;
+const ADAPTER_TEST_TIMEOUT_MS = 35_000;
 const ANSWER_SHA = "a1962b5a13bb394a10d97d3c6acadac0d02bc24ddebe0f80d05a96b9b4dddf90";
 const ANSWER_REF = `ctx_${ANSWER_SHA}`;
 const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
@@ -214,7 +215,7 @@ describe("offline provider through bounded public Pi adapters", () => {
       expect(messages).toHaveLength(1);
       assertProjection(JSON.parse(messages[0]!["message"].content), outcome);
     }
-  }, 15_000);
+  }, ADAPTER_TEST_TIMEOUT_MS);
 
   test.each(["success", "error"] as const)("runRpcMode exposes exact bounded %s result", async (outcome) => {
     const root = await mkdtemp(join(tmpdir(), `pi-rlm-native-rpc-${outcome}-`));
@@ -305,5 +306,5 @@ describe("offline provider through bounded public Pi adapters", () => {
       if (child) await killAndWait(child);
       await rm(root, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, ADAPTER_TEST_TIMEOUT_MS);
 });

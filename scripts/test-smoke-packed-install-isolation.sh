@@ -82,7 +82,7 @@ env() {
 export -f env
 export HOSTILE_ENV_MARKER="$hostile_marker"
 NODE_OPTIONS=--pi-rlm-smoke-must-strip-caller-node-options \
-  "$bash_bin" "$root_dir/scripts/smoke-packed-install.sh"
+  "$bash_bin" "$root_dir/scripts/smoke-packed-install.sh" --isolation-probe
 unset -f env
 unset HOSTILE_ENV_MARKER
 if [[ -e "$hostile_marker" ]]; then
