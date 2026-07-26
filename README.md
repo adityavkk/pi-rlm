@@ -41,8 +41,9 @@ What is not done yet:
 - The live provider path (real model calls through Pi) is implemented against
   the SDK and type-checks, but it needs configured model auth and has not been
   run end to end here. Treat it as interactive-use code pending live testing.
-- The TUI inspector, cross-process resume, and the security-probe suite are
-  designed but not built. See the roadmap.
+- Read-only recovery inspection validates terminal and nonterminal run state from
+  the manifest, journal, and content store. Cross-process execution resume and the
+  TUI inspector remain in progress.
 
 ## Install
 
@@ -194,7 +195,8 @@ from Pi settings without `-e`. Both require the exact bounded and durable
 ## Roadmap
 
 - Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls.
-- Phase 3: checkpoints, cross-process resume, and the security probe suite.
+- Phase 3: read-only recovery inspection is complete. Writer fencing,
+  checkpoints, cross-process execution resume, and host lifecycle commands remain.
 - Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
   compaction, and ordinary subagent fan-out.
 

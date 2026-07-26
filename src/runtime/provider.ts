@@ -315,7 +315,8 @@ export const createModelOperation = (
 ): ModelOperation => {
   let logicalReserved = false;
   let aggregate: CallUsage = ZERO_CALL_USAGE;
-  let attemptOrdinal = 0;
+  const attemptKey = `${frame.frameId}\0${options.operationId}`;
+  let attemptOrdinal = state.operationAttempts.get(attemptKey) ?? 0;
 
   const checkpoint = (): void => {
     throwIfAborted(options.signal);
@@ -332,6 +333,7 @@ export const createModelOperation = (
     state.ledger.current = attempt.value;
     logicalReserved = true;
     attemptOrdinal += 1;
+    state.operationAttempts.set(attemptKey, attemptOrdinal);
     return undefined;
   };
 

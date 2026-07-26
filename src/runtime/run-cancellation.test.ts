@@ -140,7 +140,7 @@ const expectSingleTerminal = async (dir: string, result: RunResult): Promise<voi
 };
 
 describe("run cancellation and terminal finalization", () => {
-  test("abort before start writes one cancellation terminal and schedules nothing", async () => {
+  test("abort before authoritative start leaves an orphan and schedules nothing", async () => {
     const dir = await tmp();
     const owner = new AbortController();
     owner.abort();
@@ -156,7 +156,7 @@ describe("run cancellation and terminal finalization", () => {
     }));
     expect(result.status).toBe("cancelled");
     expect(calls).toBe(0);
-    await expectSingleTerminal(dir, result);
+    expect(await readdir(dir)).not.toContain("events.jsonl");
   });
 
   test("abort bounds an abort-ignoring controller", async () => {
@@ -364,13 +364,22 @@ describe("run cancellation and terminal finalization", () => {
       const dir = await tmp();
       const journal = new JournalStore(dir, terminalStatusFaultFileSystem(dir, fault));
       const owner = new AbortController();
-      if (classification === "cancelled") owner.abort();
       const controller: ControllerDriver = classification === "failed"
         ? {
             identity: { id: "test/throwing-controller", version: "1", configuration: { fixture: `terminal-${fault}` } },
             async next() { throw new Error("expected failure"); }, fork() { return this; },
           }
-        : new OneCellController();
+        : classification === "cancelled"
+          ? {
+              identity: { id: "test/cancelling-controller", version: "1", configuration: { fixture: `terminal-${fault}` } },
+              async next(_state, signal) {
+                owner.abort();
+                await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+                return { reasoning: "unreachable", code: "1" };
+              },
+              fork() { return this; },
+            }
+          : new OneCellController();
       const backend = new FunctionBackend(async (options) => {
         options.effect("answer", { value: { answer: "done" } });
         return valueOutcome();

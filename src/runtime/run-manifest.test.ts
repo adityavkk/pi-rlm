@@ -332,7 +332,7 @@ describe("source-bound run identity and manifest", () => {
     (incompatible.manifest.runtime as { dslVersion: string }).dslVersion = "99";
     rehash(incompatible);
     await writeFile(join(dir, RUN_MANIFEST_FILE), `${JSON.stringify(incompatible)}\n`);
-    await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
+    await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INCOMPATIBLE" });
   });
 
   test("shared directory permits one writer and permanently rejects reuse", async () => {

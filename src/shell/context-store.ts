@@ -5,7 +5,8 @@
  * same bytes always yield the same id (which makes call identity and restart
  * replay stable). Reads are byte-accurate and never split a UTF-8 code point.
  * The store persists content under `<dir>/contexts/<sha>.bin`. Journaled content
- * references support later recovery work; this store does not implement resume.
+ * references support recovery inspection and later hydration. This store does
+ * not resume runtime execution.
  */
 
 import { randomUUID } from "node:crypto";
@@ -126,6 +127,7 @@ const backwardBoundary = (bytes: Uint8Array, index: number): number => {
 };
 
 const CHECKPOINT_INTERVAL_BYTES = 16 * 1024;
+const MAX_VERIFIED_CONTEXT_BYTES = 256 * 1024 * 1024;
 
 const boundedInteger = (value: unknown, name: string, min: number, max: number): number => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max)
@@ -228,8 +230,12 @@ export class ContextStore {
   private async trustedRootPath(contextId: string): Promise<string> {
     let actual: string;
     try {
+      const info = await lstat(this.dir);
+      if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0)
+        throw new ContextIntegrityError(contextId, "type");
       actual = await realpath(this.dir);
-    } catch {
+    } catch (error) {
+      if (error instanceof ContextIntegrityError) throw error;
       throw new ContextIntegrityError(contextId, "containment");
     }
     if (this.trustedRoot === undefined) this.trustedRoot = actual;
@@ -259,7 +265,8 @@ export class ContextStore {
       if (!create && (error as NodeJS.ErrnoException).code === "ENOENT") throw new ContextUnavailableError(contextId);
       throw error;
     }
-    if (info.isSymbolicLink() || !info.isDirectory()) throw new ContextIntegrityError(contextId, "type");
+    if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0)
+      throw new ContextIntegrityError(contextId, "type");
     const actual = await realpath(this.contentDir);
     const expected = join(root, "contexts");
     if (actual !== expected || !this.contained(root, actual)) throw new ContextIntegrityError(contextId, "containment");
@@ -278,7 +285,7 @@ export class ContextStore {
       throw new ContextIntegrityError(contextId, "containment");
   }
 
-  private async openPayload(path: string, directory: string, contextId: string) {
+  private async openPayload(path: string, directory: string, contextId: string, requirePrivateMode = false) {
     if (dirname(path) !== directory || !this.contained(directory, path))
       throw new ContextIntegrityError(contextId, "containment");
     await this.revalidateDirectory(directory, contextId);
@@ -293,7 +300,8 @@ export class ContextStore {
     }
     try {
       const info = await handle.stat();
-      if (!info.isFile() || info.nlink !== 1) throw new ContextIntegrityError(contextId, "type");
+      if (!info.isFile() || info.nlink !== 1 || (requirePrivateMode && (info.mode & 0o077) !== 0))
+        throw new ContextIntegrityError(contextId, "type");
       await this.revalidateDirectory(directory, contextId);
       return handle;
     } catch (error) {
@@ -307,7 +315,7 @@ export class ContextStore {
       await this.instrumentation.syncFile(path);
       return;
     }
-    const handle = await this.openPayload(path, directory, reference.id);
+    const handle = await this.openPayload(path, directory, reference.id, true);
     try {
       await handle.sync();
     } finally {
@@ -337,13 +345,27 @@ export class ContextStore {
     directory: string,
     reference: ContextContentReference,
   ): Promise<Uint8Array> {
-    const handle = await this.openPayload(path, directory, reference.id);
+    const handle = await this.openPayload(path, directory, reference.id, true);
     try {
-      const bytes = new Uint8Array(await handle.readFile());
-      const info = await handle.stat();
-      if (!info.isFile() || info.nlink !== 1) throw new ContextIntegrityError(reference.id, "type");
-      if (bytes.length !== reference.bytes || info.size !== reference.bytes)
+      const before = await handle.stat();
+      if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o077) !== 0)
+        throw new ContextIntegrityError(reference.id, "type");
+      if (before.size !== reference.bytes || reference.bytes > MAX_VERIFIED_CONTEXT_BYTES)
         throw new ContextIntegrityError(reference.id, "length");
+      const buffer = Buffer.alloc(reference.bytes);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      const after = await handle.stat();
+      if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o077) !== 0)
+        throw new ContextIntegrityError(reference.id, "type");
+      if (offset !== reference.bytes || after.size !== reference.bytes || before.dev !== after.dev
+        || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
+        throw new ContextIntegrityError(reference.id, "length");
+      const bytes = new Uint8Array(buffer);
       if (this.contentHash(bytes) !== reference.sha256) throw new ContextIntegrityError(reference.id, "hash");
       await this.revalidateDirectory(directory, reference.id);
       return bytes;

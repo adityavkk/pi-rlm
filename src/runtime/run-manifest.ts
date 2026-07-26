@@ -34,6 +34,10 @@ export const RUN_LOCK_FILE = ".pi-rlm-run.lock";
 
 export type LaunchAuthorizationMode = "confirmed" | "slash_command" | "direct";
 
+export class RunManifestCompatibilityError extends TypeError {
+  override readonly name = "RunManifestCompatibilityError";
+}
+
 export interface RunManifest {
   readonly schemaVersion: number;
   readonly runtime: {
@@ -379,6 +383,7 @@ export type RunDirectoryErrorCode =
   | "MANIFEST_WRITE_FAILED"
   | "MANIFEST_CLEANUP_FAILED"
   | "MANIFEST_INVALID"
+  | "MANIFEST_INCOMPATIBLE"
   | "MANIFEST_MISMATCH";
 
 export class RunDirectoryError extends Error {
@@ -500,10 +505,12 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const manifest = record(document.manifest, "manifest", [
     "schemaVersion", "runtime", "run", "program", "inputs", "profile", "limits", "backend", "components", "prompts", "launchAuthorization",
   ]);
-  if (manifest.schemaVersion !== RUN_MANIFEST_SCHEMA_VERSION) throw new TypeError("unsupported manifest schema version");
+  const actualHash = computeManifestHash(manifest);
+  if (actualHash !== document.manifestHash) throw new TypeError("manifest hash is stale or invalid");
+  if (manifest.schemaVersion !== RUN_MANIFEST_SCHEMA_VERSION) throw new RunManifestCompatibilityError("unsupported manifest schema version");
   const runtime = record(manifest.runtime, "manifest.runtime", ["package", "packageVersion", "dslVersion"]);
   if (runtime.package !== "pi-rlm" || runtime.packageVersion !== RLM_RUNTIME_VERSION || runtime.dslVersion !== RLM_DSL_VERSION)
-    throw new TypeError("manifest runtime is incompatible");
+    throw new RunManifestCompatibilityError("manifest runtime is incompatible");
   const run = record(manifest.run, "manifest.run", ["nonce", "id"]);
   const nonce = string(run.nonce, "manifest.run.nonce");
   if (!NONCE.test(nonce) || run.id !== `run_${sha256(nonce)}`) throw new TypeError("manifest run identity is invalid");
@@ -543,7 +550,7 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
     "staticVersion", "staticRenderedSha256", "turnVersion", "turnConfiguration", "bindingInputsSha256", "responseSchemaSha256",
   ]);
   if (controller.staticVersion !== CONTROLLER_PROMPT_VERSION || controller.turnVersion !== CONTROLLER_TURN_VERSION)
-    throw new TypeError("manifest controller prompt version is unsupported");
+    throw new RunManifestCompatibilityError("manifest controller prompt version is unsupported");
   plainJson(controller.turnConfiguration, "manifest.prompts.controller.turnConfiguration");
   for (const field of ["staticRenderedSha256", "bindingInputsSha256", "responseSchemaSha256"] as const)
     hash(controller[field], `manifest.prompts.controller.${field}`);
@@ -551,7 +558,7 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
     "enabled", "version", "configuration", "bindingInputsSha256",
   ]);
   if (typeof extractor.enabled !== "boolean") throw new TypeError("manifest.prompts.extractor.enabled must be boolean");
-  if (extractor.version !== EXTRACTOR_PROMPT_VERSION) throw new TypeError("manifest extractor prompt version is unsupported");
+  if (extractor.version !== EXTRACTOR_PROMPT_VERSION) throw new RunManifestCompatibilityError("manifest extractor prompt version is unsupported");
   plainJson(extractor.configuration, "manifest.prompts.extractor.configuration");
   hash(extractor.bindingInputsSha256, "manifest.prompts.extractor.bindingInputsSha256");
   const expectedPrompts = promptBindings(program, inputs, profile, limits, components);
@@ -560,10 +567,12 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const authorization = record(manifest.launchAuthorization, "manifest.launchAuthorization", ["mode"]);
   if (authorization.mode !== "confirmed" && authorization.mode !== "slash_command" && authorization.mode !== "direct")
     throw new TypeError("manifest launch authorization mode is invalid");
-  const actualHash = computeManifestHash(manifest);
-  if (actualHash !== document.manifestHash) throw new TypeError("manifest hash is stale or invalid");
   return snapshot as unknown as RunManifestDocument;
 };
+
+/** Strict pure parser for a manifest snapshot obtained through a trusted file handle. */
+export const parseRunManifestDocument = (input: unknown): RunManifestDocument =>
+  parseManifestDocument(input);
 
 /** Read and strictly validate an existing compatible manifest. */
 export const readRunManifest = async (
@@ -575,6 +584,8 @@ export const readRunManifest = async (
     return parseManifestDocument(parsed);
   } catch (error) {
     if (error instanceof RunDirectoryError) throw error;
+    if (error instanceof RunManifestCompatibilityError)
+      throw new RunDirectoryError("MANIFEST_INCOMPATIBLE", "stored run manifest is incompatible", error);
     throw new RunDirectoryError("MANIFEST_INVALID", "stored run manifest is invalid", error);
   }
 };

@@ -52,6 +52,9 @@ Shell (`src/shell`, effects):
 - `interpreter/quickjs.ts` the QuickJS backend (bun-safe async bridge).
 - `journal-store.ts` append-only `events.jsonl` with fsync and torn-write
   recovery, plus a rebuildable `status.json`.
+- `run-recovery.ts` bounded read-only validation of the manifest, permanent
+  lock, journal history, and referenced content. It does not use `status.json`
+  as authority. See [Run recovery](run-recovery.md).
 - `model/client.ts`, `model/mock.ts`, `model/pi-model.ts` the model boundary.
 - `delegation/` the bounded public `pi-subagents` version 2 event client.
 
