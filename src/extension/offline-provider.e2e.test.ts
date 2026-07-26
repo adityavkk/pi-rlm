@@ -264,7 +264,8 @@ describe("credential-free offline Pi provider E2E", () => {
       fixture.state.emitLate();
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(fixture.state.lateEmissionAttempts).toBe(1);
-      expect(fixture.state.lateEmissionAccepted).toBe(0);
+      expect(fixture.state.lateEmissionDispatchAttempts).toBe(1);
+      expect(fixture.state.lateEmissionAccepted).toBe(1);
       expect(fixture.state.aborts).toBe(1);
       expect(await fixture.readJournalBytes()).toEqual(journalBefore);
       expect(await fixture.readEvents()).toEqual(eventsBefore);

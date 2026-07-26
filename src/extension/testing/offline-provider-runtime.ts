@@ -9,6 +9,7 @@ import {
   SettingsManager,
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
+  type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
@@ -45,6 +46,8 @@ export interface OfflineProviderFixtureOptions {
   readonly setupFault?: "after-model-runtime" | "after-agent-runtime";
   /** Optional deterministic host-model responses. Controller routing remains governed by mode. */
   readonly hostScript?: readonly OfflineHostResponse[];
+  /** Use a real append-only Pi session JSONL that can be reopened from disk. */
+  readonly persistSession?: boolean;
 }
 
 export interface OfflineProviderCall {
@@ -63,9 +66,11 @@ export interface OfflineProviderCall {
 export interface OfflineProviderState {
   readonly calls: OfflineProviderCall[];
   readonly started: Promise<void>;
+  readonly extensionTurnStarts: Array<{ readonly sessionId: string; readonly turnIndex: number; readonly timestamp: number }>;
   fetchCalls: number;
   aborts: number;
   lateEmissionAttempts: number;
+  lateEmissionDispatchAttempts: number;
   lateEmissionAccepted: number;
   emitLate(): void;
 }
@@ -76,6 +81,8 @@ export interface OfflineProviderRuntimeFixture {
   readonly modelRuntime: ModelRuntime;
   readonly state: OfflineProviderState;
   readonly runRoot: string;
+  readonly sessionFile?: string;
+  reopenSession(): SessionManager;
   readEvents(): Promise<RlmEvent[]>;
   readJournalBytes(): Promise<Buffer>;
   restoreFetchTripwire(): void;
@@ -157,9 +164,11 @@ export const createOfflineProviderRuntimeFixture = async (
   const state: OfflineProviderState = {
     calls: [],
     started,
+    extensionTurnStarts: [],
     fetchCalls: 0,
     aborts: 0,
     lateEmissionAttempts: 0,
+    lateEmissionDispatchAttempts: 0,
     lateEmissionAccepted: 0,
     emitLate() { late?.(); },
   };
@@ -167,7 +176,6 @@ export const createOfflineProviderRuntimeFixture = async (
     state.fetchCalls += 1;
     throw new Error("offline provider fixture blocked fetch");
   }) as unknown as typeof fetch;
-  globalThis.fetch = installedFetch;
   const restoreFetchTripwire = (): void => {
     if (globalThis.fetch === installedFetch) globalThis.fetch = originalFetch;
   };
@@ -273,8 +281,16 @@ export const createOfflineProviderRuntimeFixture = async (
     else options?.signal?.addEventListener("abort", abort, { once: true });
     late = () => {
       state.lateEmissionAttempts += 1;
-      if (finish(message(model, "stop", [{ type: "text", text: controllerCell }])))
+      state.lateEmissionDispatchAttempts += 1;
+      const final = message(model, "stop", [{ type: "text", text: controllerCell }]);
+      try {
+        stream.push({ type: "start", partial: { ...final, content: [] } });
+        stream.push({ type: "done", reason: "stop", message: final });
         state.lateEmissionAccepted += 1;
+      } catch {
+        // A throwing stream is also a valid terminal rejection boundary.
+      }
+      try { stream.end(final); } catch { /* Already terminal. */ }
     };
     return stream;
   };
@@ -308,7 +324,11 @@ export const createOfflineProviderRuntimeFixture = async (
   const runRoot = join(root, "private-runs");
   await mkdir(runRoot, { recursive: true, mode: 0o700 });
   const settingsManager = SettingsManager.inMemory();
-  const sessionManager = SessionManager.inMemory(root);
+  const sessionDir = join(root, "pi-sessions");
+  if (options.persistSession) await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+  const sessionManager = options.persistSession
+    ? SessionManager.create(root, sessionDir, { id: "00000000-0000-7000-8000-000000000056" })
+    : SessionManager.inMemory(root);
   let id = 0;
   const extension = createRlmExtension({
     runtime: {
@@ -318,6 +338,16 @@ export const createOfflineProviderRuntimeFixture = async (
     },
     createId: () => `offline-fixture-${++id}`,
   });
+  const observedExtension = (pi: ExtensionAPI): void => {
+    pi.on("turn_start", (event, ctx) => {
+      state.extensionTurnStarts.push({
+        sessionId: ctx.sessionManager.getSessionId(),
+        turnIndex: event.turnIndex,
+        timestamp: event.timestamp,
+      });
+    });
+    extension(pi);
+  };
   const createRuntime: CreateAgentSessionRuntimeFactory = async (options) => {
     const services = await createAgentSessionServices({
       cwd: options.cwd,
@@ -325,7 +355,7 @@ export const createOfflineProviderRuntimeFixture = async (
       settingsManager,
       modelRuntime,
       resourceLoaderOptions: {
-        extensionFactories: [{ name: "pi-rlm-offline-provider", factory: extension }],
+        extensionFactories: [{ name: "pi-rlm-offline-provider", factory: observedExtension }],
       },
     });
     const created = await createAgentSessionFromServices({
@@ -340,12 +370,22 @@ export const createOfflineProviderRuntimeFixture = async (
   runtime = await createAgentSessionRuntime(createRuntime, { cwd: root, agentDir, sessionManager });
   if (options.setupFault === "after-agent-runtime") throw new Error("injected offline fixture setup fault");
   const readyRuntime = runtime;
+  const sessionFile = sessionManager.getSessionFile();
+  // Install only after all non-cancellable setup awaits have settled. Provider
+  // execution starts after this fixture is returned, so timeout cannot orphan
+  // process-global fetch replacement during setup.
+  globalThis.fetch = installedFetch;
   return {
     runtime: readyRuntime,
     sessionManager,
     modelRuntime,
     state,
     runRoot,
+    ...(sessionFile ? { sessionFile } : {}),
+    reopenSession() {
+      if (!sessionFile) throw new Error("offline fixture session is not persisted");
+      return SessionManager.open(sessionFile, sessionDir, root);
+    },
     async readEvents() {
       return new JournalStore(await findRunDirectory(runRoot)).readEvents().then((result) => {
         if (!result.ok) throw result.error;
