@@ -17,6 +17,11 @@ import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { persistAnswer } from "./answer-persistence.ts";
+import {
+  bindAgentDelegationRuntime,
+  prepareAgentDelegation,
+  type AgentDelegationConfig,
+} from "./agent-delegation.ts";
 import type { ControllerDriver } from "./controller.ts";
 import {
   buildExtractorModelRequest,
@@ -66,6 +71,7 @@ export interface RunInput {
   readonly clock?: Clock;
   readonly profile?: Profile;
   readonly extractor?: Extractor;
+  readonly agentDelegation?: AgentDelegationConfig;
   /** Non-secret authorization path that admitted this launch. */
   readonly authorizationMode?: LaunchAuthorizationMode;
   /** Cryptographically random by default; injectable only for deterministic tests. */
@@ -398,7 +404,14 @@ const finalize = async (
 };
 
 export const runProgram = async (input: RunInput): Promise<RunResult> => {
-  preflightRunComponents(input);
+  const preparedAgentDelegation = prepareAgentDelegation(input.agentDelegation);
+  preflightRunComponents({
+    backend: input.backend,
+    model: input.model,
+    controller: input.controller,
+    ...(input.extractor ? { extractor: input.extractor } : {}),
+    ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
+  });
   const clock = input.clock ?? systemClock;
   const profile = input.profile ?? DEFAULT_PROFILE;
   const startMs = clock.now();
@@ -412,6 +425,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     model: input.model,
     controller: input.controller,
     extractor: input.extractor,
+    ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
     authorizationMode: input.authorizationMode,
     createRunNonce: input.createRunNonce,
     dslVersion: RLM_DSL_VERSION,
@@ -507,6 +521,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     throwIfAborted(scope.signal);
 
     const controllerTurnObserver = resolveControllerTurnObserver(input.signal);
+    const agentDelegationRuntime = bindAgentDelegationRuntime(preparedAgentDelegation, scope.signal);
     const state: InternalRunState = {
       runId,
       startMs,
@@ -527,6 +542,8 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       scopeUsage: new Map(),
       semaphore: new Semaphore(profile.maxConcurrency),
       contextSemaphore: new Semaphore(1),
+      ...(agentDelegationRuntime ? { agentDelegation: agentDelegationRuntime } : {}),
+      agentAttempts: new Map(),
       frameSeq: { current: 1 },
     };
     const rootFrame: FrameRef = {

@@ -11,7 +11,7 @@ import type { JsonObject } from "./../core/json.ts";
 import { isJsonObject } from "./../core/json.ts";
 import type { FrameState } from "./controller.ts";
 
-export const CONTROLLER_PROMPT_VERSION = "2";
+export const CONTROLLER_PROMPT_VERSION = "3";
 export const CONTROLLER_TURN_VERSION = "2";
 export const CONTROLLER_TURN_CONFIGURATION = Object.freeze({ projection: "frame-state-v1" });
 
@@ -39,7 +39,8 @@ Available globals:
 - budget: read-only remaining calls, attempts, tokens, depth, deadline.
 - await llm({ key, prompt, context?, model?, schema? }) -> CallResult (r.ok, r.value | r.error).
 - await llm.batch({ key, items:[llmSpec...] }) -> CallResult[] in order.
-- await agent({ key, agent, task, context? }) -> CallResult (may be UNAVAILABLE in this build).
+- await agent({ key, agent, task, context?, model?:{tier,thinking?}, schema?, timeoutMs?,
+  piContext?:"fresh"|"fork", turnBudget?, toolBudget? }) -> CallResult. Unknown agents require host approval.
 - await recurse({ key, objective, context }) -> CallResult with the child's answer.
 - contexts.derive/concat/open, artifacts.write/open/asContext for host-backed data.
 - phase(name), emit({message}), console.log(...) for progress (synchronous).

@@ -18,7 +18,7 @@ it needs, and does the heavy joining, counting, and fan-out in code.
 This repository is an honest Phase 0 and Phase 1 foundation, not a finished
 product.
 
-What works and is tested (102 tests, run offline with no provider):
+What works and is tested offline with no provider credentials:
 
 - The pure functional core: program normalization, cell parsing and transform,
   the tree-wide budget ledger, launch grants, the trajectory projection, the
@@ -32,14 +32,17 @@ What works and is tested (102 tests, run offline with no provider):
   model, plus the durable event journal with torn-write recovery.
 - The Pi extension wiring: the `/rlm` command, the `rlm_run` tool, and a
   host-side launch gate that refuses unsolicited runs.
+- `agent()` through the public `pi-subagents` version 2 protocol, including
+  context-file references, approval, cancellation, accounting, caching, and
+  credential-free public `AgentSession` acceptance.
 
 What is not done yet:
 
 - The live provider path (real model calls through Pi) is implemented against
   the SDK and type-checks, but it needs configured model auth and has not been
   run end to end here. Treat it as interactive-use code pending live testing.
-- `agent()` delegation to pi-subagents, the TUI inspector, cross-process resume,
-  and the security-probe suite are designed but not built. See the roadmap.
+- The TUI inspector, cross-process resume, and the security-probe suite are
+  designed but not built. See the roadmap.
 
 ## Install
 
@@ -117,6 +120,16 @@ export PI_RLM_MODEL_MEDIUM="..."
 export PI_RLM_MODEL_LARGE="..."                      # controller uses the large tier
 ```
 
+Delegated agent names are denied unless the host approves them during the run
+or includes them in an exact comma-separated allowlist:
+
+```bash
+export PI_RLM_AGENT_ALLOWLIST="reviewer,worker"
+```
+
+The allowlist grants the configured Pi capabilities of those named agents.
+Forked Pi conversation context remains disabled in the standard extension.
+
 ## How it works
 
 pi-rlm is built as a functional core with an imperative shell.
@@ -136,7 +149,7 @@ The controller loop is deliberately strict. Each iteration reserves one
 controller turn separately from provider attempts, asks the driver for exactly one cell, transforms it (a trailing
 expression becomes an implicit return so the model sees a REPL-style value),
 runs it in a fresh QuickJS context, records an immutable trajectory entry, and
-appends an authoritative journal event. Every controller, leaf, repair, child,
+appends an authoritative journal event. Every controller, model leaf, delegated agent, repair, child,
 and fallback completion crosses one atomic accounting boundary; see the model
 invocation accounting matrix in `docs/ARCHITECTURE.md`. Lexical variables do not leak between
 cells; durable state goes in the `workspace` object, which is validated as JSON
@@ -157,9 +170,11 @@ per cell. Every run consumes one host-owned grant created by `/rlm` or an exact-
 request UI confirmation and bound to its Pi session, host turn identity,
 originating-input hash, normalized request hash, and exact tool call. The model
 cannot create authority with prompt wording, submit a grant ID, or reuse a
-consumed call. Do not rely on this
-to run untrusted code against secrets; it is a bounded capability layer, not a
-security boundary.
+consumed call. A delegated Pi agent runs outside QuickJS with the tools and
+filesystem access configured for that named agent. Unknown names require a
+separate per-run confirmation unless the host allowlists them. Do not rely on
+this to run untrusted code against secrets; it is a bounded capability layer,
+not a security boundary.
 
 ## Testing
 
@@ -178,8 +193,7 @@ from Pi settings without `-e`. Both require the exact bounded and durable
 
 ## Roadmap
 
-- Phase 2: `agent()` delegation through `pi-subagents`, background runs, and the
-  TUI inspector, widget, and approvals.
+- Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls.
 - Phase 3: checkpoints, cross-process resume, and the security probe suite.
 - Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
   compaction, and ordinary subagent fan-out.

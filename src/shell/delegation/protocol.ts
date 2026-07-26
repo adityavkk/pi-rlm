@@ -304,6 +304,57 @@ const TERMINAL_FIELDS = new Set([
   "thinking", "exitCode", "result", "usage",
 ]);
 
+const OUTCOME_FIELDS = new Set(["ok", "status", "value", "usage", "runId", "agent", "model", "code"]);
+const FAILURE_CODES = new Set<DelegationV2FailureCode>([
+  "CANCELLED", "TIMEOUT", "UNAVAILABLE_CONTEXT", "INVALID_REQUEST", "DUPLICATE_NODE",
+  "TURN_BUDGET_EXHAUSTED", "TOOL_BUDGET_EXHAUSTED", "INVALID_RESULT", "FAILED",
+]);
+
+/** Getter-free normalization for custom AgentDelegator implementations. */
+export const normalizeDelegationV2Outcome = (
+  input: unknown,
+  requestedResult: "text" | "structured",
+): DelegationV2Outcome | undefined => {
+  const cloned = cloneBoundedJson(input, DELEGATION_JSON_LIMITS(DELEGATION_V2_LIMITS.resultBytes + 64 * 1024));
+  if (!cloned.ok || !isPlainRecord(cloned.value) || !onlyKeys(cloned.value, OUTCOME_FIELDS)) return undefined;
+  const ok = dataProperty(cloned.value, "ok");
+  const status = dataProperty(cloned.value, "status");
+  if (typeof status !== "string" || !boundedString(status, DELEGATION_V2_LIMITS.shortTextBytes, true)) return undefined;
+  const usage = parseUsage(dataProperty(cloned.value, "usage"));
+  if (!usage.ok) return undefined;
+  if (ok === false) {
+    const code = dataProperty(cloned.value, "code");
+    if (typeof code !== "string" || !FAILURE_CODES.has(code as DelegationV2FailureCode)
+      || Object.hasOwn(cloned.value, "value") || Object.hasOwn(cloned.value, "runId")
+      || Object.hasOwn(cloned.value, "agent") || Object.hasOwn(cloned.value, "model")) return undefined;
+    return {
+      ok: false,
+      code: code as DelegationV2FailureCode,
+      status,
+      ...(usage.value ? { usage: usage.value } : {}),
+    };
+  }
+  if (ok !== true || status !== "completed" || !Object.hasOwn(cloned.value, "value")
+    || Object.hasOwn(cloned.value, "code")) return undefined;
+  const value = dataProperty(cloned.value, "value");
+  if (isMissing(value) || (requestedResult === "text" && typeof value !== "string")) return undefined;
+  const metadata: { runId?: string; agent?: string; model?: string } = {};
+  for (const key of ["runId", "agent", "model"] as const) {
+    const field = dataProperty(cloned.value, key);
+    if (!isMissing(field)) {
+      if (!boundedString(field, DELEGATION_V2_LIMITS.shortTextBytes, true)) return undefined;
+      metadata[key] = field;
+    }
+  }
+  return {
+    ok: true,
+    status: "completed",
+    value: value as JsonValue,
+    ...(usage.value ? { usage: usage.value } : {}),
+    ...metadata,
+  };
+};
+
 export interface DelegationIdentity {
   readonly requestId: string;
   readonly ownerRunId: string;
@@ -387,37 +438,52 @@ export const parseDelegationV2Terminal = (
 };
 
 const UPDATE_FIELDS = new Set([
-  "version", "requestId", "ownerRunId", "nodeId", "currentTool", "recentOutput", "model",
-  "toolCount", "durationMs", "tokens",
+  "version", "requestId", "ownerRunId", "nodeId", "currentTool", "currentToolArgs", "recentOutput",
+  "recentOutputLines", "recentTools", "model", "toolCount", "durationMs", "tokens",
 ]);
 const STARTED_FIELDS = new Set(["version", "requestId", "ownerRunId", "nodeId"]);
 
 export const parseDelegationV2Update = (input: unknown, expected: DelegationIdentity): DelegationV2Update | undefined => {
-  if (!isPlainRecord(input)
-    || !onlyKeys(input, UPDATE_FIELDS)
-    || dataProperty(input, "version") !== SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION
-    || dataProperty(input, "requestId") !== expected.requestId
-    || dataProperty(input, "ownerRunId") !== expected.ownerRunId
-    || dataProperty(input, "nodeId") !== expected.nodeId) return undefined;
+  const snapshot = cloneBoundedJson(input, DELEGATION_JSON_LIMITS(64 * 1024));
+  if (!snapshot.ok || !isPlainRecord(snapshot.value)) return undefined;
+  const update = snapshot.value;
+  if (!onlyKeys(update, UPDATE_FIELDS)
+    || dataProperty(update, "version") !== SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION
+    || dataProperty(update, "requestId") !== expected.requestId
+    || dataProperty(update, "ownerRunId") !== expected.ownerRunId
+    || dataProperty(update, "nodeId") !== expected.nodeId) return undefined;
+  for (const key of ["currentToolArgs"] as const) {
+    const value = dataProperty(update, key);
+    if (!isMissing(value) && !boundedString(value, DELEGATION_V2_LIMITS.updateBytes)) return undefined;
+  }
+  const recentOutputLines = dataProperty(update, "recentOutputLines");
+  if (!isMissing(recentOutputLines)
+    && (!Array.isArray(recentOutputLines) || recentOutputLines.length > 256
+      || recentOutputLines.some((line) => typeof line !== "string"))) return undefined;
+  const recentTools = dataProperty(update, "recentTools");
+  if (!isMissing(recentTools) && (!Array.isArray(recentTools) || recentTools.length > 256
+    || recentTools.some((item) => !isPlainRecord(item) || !onlyKeys(item, new Set(["tool", "args"]))
+      || !boundedString(dataProperty(item, "tool"), DELEGATION_V2_LIMITS.shortTextBytes, true)
+      || !boundedString(dataProperty(item, "args"), DELEGATION_V2_LIMITS.updateBytes)))) return undefined;
   const output: { currentTool?: string; recentOutput?: string; model?: string; toolCount?: number; durationMs?: number; tokens?: number } = {};
   for (const key of ["currentTool", "recentOutput", "model"] as const) {
-    const value = dataProperty(input, key);
-    if (Object.hasOwn(input, key) && isMissing(value)) return undefined;
+    const value = dataProperty(update, key);
+    if (Object.hasOwn(update, key) && isMissing(value)) return undefined;
     if (!isMissing(value)) {
       if (!boundedString(value, DELEGATION_V2_LIMITS.updateBytes)) return undefined;
       output[key] = value;
     }
   }
   for (const key of ["toolCount", "tokens"] as const) {
-    const value = dataProperty(input, key);
-    if (Object.hasOwn(input, key) && isMissing(value)) return undefined;
+    const value = dataProperty(update, key);
+    if (Object.hasOwn(update, key) && isMissing(value)) return undefined;
     if (!isMissing(value)) {
       if (!boundedInteger(value, DELEGATION_V2_LIMITS.maxUsageCount)) return undefined;
       output[key] = value;
     }
   }
-  const duration = dataProperty(input, "durationMs");
-  if (Object.hasOwn(input, "durationMs") && isMissing(duration)) return undefined;
+  const duration = dataProperty(update, "durationMs");
+  if (Object.hasOwn(update, "durationMs") && isMissing(duration)) return undefined;
   if (!isMissing(duration)) {
     if (!boundedInteger(duration, DELEGATION_V2_LIMITS.maxDurationMs)) return undefined;
     output.durationMs = duration;

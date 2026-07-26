@@ -30,7 +30,7 @@ const TOOL_CALL: OfflineHostResponse = {
 };
 const STOP: OfflineHostResponse = { type: "stop", text: "pi-rlm request finished" };
 const ANSWER_SHA = "a1962b5a13bb394a10d97d3c6acadac0d02bc24ddebe0f80d05a96b9b4dddf90";
-const CONTROLLER_REQUEST_SHA = "51e5f45a9a40a3fd4b4be02a6de2778f392f71e1f754cd135ebd09831e7a4646";
+const CONTROLLER_REQUEST_SHA = "c38466d718fbe055e7ab66195ab5e593c3900ffc5bc63471c295947f4440405a";
 
 interface Confirmation {
   readonly title: string;

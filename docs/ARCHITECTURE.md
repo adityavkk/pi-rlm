@@ -53,6 +53,7 @@ Shell (`src/shell`, effects):
 - `journal-store.ts` append-only `events.jsonl` with fsync and torn-write
   recovery, plus a rebuildable `status.json`.
 - `model/client.ts`, `model/mock.ts`, `model/pi-model.ts` the model boundary.
+- `delegation/` the bounded public `pi-subagents` version 2 event client.
 
 Runtime (`src/runtime`, coordinator):
 
@@ -61,6 +62,8 @@ Runtime (`src/runtime`, coordinator):
 - `call-result.ts` guest-facing result shapes.
 - `semaphore.ts` leaf-concurrency bound.
 - `broker.ts` the single trusted place guest calls become effects.
+- `agent-call.ts`, `agent-delegation.ts` delegated call normalization, approval,
+  context handoff, caching, and host policy identity.
 - `controller.ts`, `controller-prompt.ts`, `model-controller.ts` the driver.
 - `mock-controller.ts` a scripted driver for tests.
 - `frame.ts` the per-frame controller loop and recursion.
@@ -190,6 +193,7 @@ token overshoot remains charged and blocks later reservations.
 | Controller malformed primary + repair | 1 | 2 | combined on the same turn operation |
 | Leaf `llm`, valid primary | 1 | 1 | `CallResult`, `call_committed`, tree ledger |
 | Leaf structured repair | 1 | 2 | combined on the same leaf operation |
+| Delegated `agent`, uncached | 1 | 1 | `agent_approval`, reported child usage, `provider_attempted`, successful `call_committed`, tree ledger |
 | Provider fallback extractor | 1 | provider completions | extractor provider events and tree ledger |
 | External custom extractor | 1 | 1 explicit opaque operation | zero reported tokens/cost, measured host duration; no nested completion capability |
 | `recurse` | 1 frame operation | 0 itself | parent-lineage-scoped identity; subtree provider usage copied into its result, never re-settled |
@@ -200,6 +204,13 @@ Controller turns and provider attempts are independent limits. A controller
 turn is not entered when no attempt remains. `maxAttempts: 0` therefore invokes
 neither the controller nor a provider. A repair reserves its second attempt
 before spend.
+
+Delegated agents enter the same reservation and settlement boundary through
+`runExternalReported`. The adapter supplies bounded child usage and an exact
+hash of the version 2 request, including its attempt identity and context-file
+paths. Invalid reported usage settles measured host duration instead and marks
+the attempt `invalid_result`. The runtime never invents child tokens or cost
+when pi-subagents omits usage.
 
 Extractor implementations declare `accountingMode`. `provider` extractors must
 use the supplied completion capability and fail if they return without doing

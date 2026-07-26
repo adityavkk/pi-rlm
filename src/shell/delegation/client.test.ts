@@ -320,6 +320,34 @@ describe("DelegationV2Client", () => {
     expect(getters).toBe(0);
   });
 
+  test("accepts bounded public v2 update fields while projecting the stable subset", async () => {
+    const bus = new FakeEventBus();
+    const spec = baseSpec();
+    const updates: unknown[] = [];
+    bus.on(SUBAGENT_DELEGATION_REQUEST_EVENT, () => {
+      bus.emit(SUBAGENT_DELEGATION_STARTED_EVENT, identity(spec));
+      bus.emit(SUBAGENT_DELEGATION_UPDATE_EVENT, {
+        ...identity(spec),
+        currentTool: "read",
+        currentToolArgs: "{\"path\":\"source\"}",
+        recentOutput: "working",
+        recentOutputLines: ["one", "two"],
+        recentTools: [{ tool: "read", args: "source" }],
+        model: "provider/model",
+        toolCount: 1,
+        durationMs: 2,
+        tokens: 3,
+      });
+      bus.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, {
+        ...identity(spec), status: "completed", result: { kind: "text", text: "done" },
+      });
+    });
+    await new DelegationV2Client(bus).run(spec, { onUpdate: (update) => { updates.push(update); } });
+    expect(updates).toEqual([{
+      currentTool: "read", recentOutput: "working", model: "provider/model", toolCount: 1, durationMs: 2, tokens: 3,
+    }]);
+  });
+
   test("bounds updates and ignores hostile update payloads", async () => {
     const bus = new FakeEventBus();
     const spec = baseSpec();

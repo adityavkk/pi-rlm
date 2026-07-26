@@ -20,7 +20,7 @@ type PublicProviderRegistration = ModelRuntime["registerProvider"];
 const publicProviderRegistration: PublicProviderRegistration | undefined = undefined;
 void publicProviderRegistration;
 
-const EXPECTED_REQUEST_SHA = "c0989fab00392eca206590ba5b1c301ffa4d4410f9f8b1547f344caaa4cba823";
+const EXPECTED_REQUEST_SHA = "6ce97c7897be26cf1dc863e0451a06b55b2eef0b1be671788445168ee82fb8f4";
 const ANSWER_SHA = "a1962b5a13bb394a10d97d3c6acadac0d02bc24ddebe0f80d05a96b9b4dddf90";
 const ANSWER_REF = `ctx_${ANSWER_SHA}`;
 

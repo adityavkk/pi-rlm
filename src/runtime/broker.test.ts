@@ -15,6 +15,8 @@ import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/cl
 import { MockModelClient } from "../shell/model/mock.ts";
 import { PiModelClient, PiModelError } from "../shell/model/pi-model.ts";
 import { dispatchCall, retainCallResult, tokenReservation } from "./broker.ts";
+import { bindAgentDelegationRuntime, prepareAgentDelegation } from "./agent-delegation.ts";
+import type { DelegationV2CallSpec } from "../shell/delegation/index.ts";
 import { type GuestCallResult, okResult } from "./call-result.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
 import { Semaphore } from "./semaphore.ts";
@@ -66,6 +68,7 @@ const brokerState = async (model: ModelClient, runId: string, clock: Clock = sys
     scopeUsage: new Map(),
     semaphore: new Semaphore(1),
     contextSemaphore: new Semaphore(1),
+    agentAttempts: new Map(),
     frameSeq: { current: 1 },
   };
 };
@@ -173,6 +176,7 @@ describe("dispatchCall cancellation ownership", () => {
         () => { retentionAcquisitions += 1; },
         () => { retentionReleaseInvocations += 1; },
       ),
+      agentAttempts: new Map(),
       frameSeq: { current: 1 },
     };
     const frame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };
@@ -307,6 +311,7 @@ describe("dispatchCall cancellation ownership", () => {
       scopeUsage: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
+      agentAttempts: new Map(),
       frameSeq: { current: 1 },
     };
     const result = await dispatchCall(
@@ -613,6 +618,116 @@ describe("dispatchCall cancellation ownership", () => {
     await Promise.resolve();
     expect(state.callCache.size).toBe(0);
     expect(state.ledger.current.usage.storedBytes).toBe(retainedJsonBytes(result as never));
+  });
+
+  test("cancellation while agent key binding is durable returns a typed result", async () => {
+    const base = await brokerState(
+      new MockModelClient(() => "unused", modelIdentity("src/runtime/broker.test.ts:agent-key-abort")),
+      "run_agent_key_abort",
+    );
+    let delegations = 0;
+    const client = {
+      identity: { id: "test/delegator", version: "2", configuration: {} },
+      async run(_spec: DelegationV2CallSpec) {
+        delegations += 1;
+        return { ok: true as const, status: "completed" as const, value: "must-not-run" };
+      },
+    };
+    const prepared = prepareAgentDelegation({ client, cwd: "/tmp/project", allowedAgents: ["reviewer"] })!;
+    let markBindingStarted!: () => void;
+    let releaseBinding!: () => void;
+    const bindingStarted = new Promise<void>((resolve) => { markBindingStarted = resolve; });
+    const bindingRelease = new Promise<void>((resolve) => { releaseBinding = resolve; });
+    const realJournal = base.journal;
+    const state: RunState = {
+      ...base,
+      agentDelegation: bindAgentDelegationRuntime(prepared, new AbortController().signal),
+      journal: {
+        append: async (event: Parameters<JournalStore["append"]>[0]) => {
+          if (event.type === "key_bound" && event.kind === "agent") {
+            markBindingStarted();
+            await bindingRelease;
+          }
+          return realJournal.append(event);
+        },
+      } as JournalStore,
+    };
+    const owner = new AbortController();
+    const pending = dispatchCall(
+      state,
+      testFrame,
+      "agent",
+      { key: "review", agent: "reviewer", task: "Review." },
+      noRecurse,
+      owner.signal,
+      Date.now() + 5_000,
+    ) as Promise<GuestCallResult>;
+    await within(bindingStarted);
+    owner.abort();
+    releaseBinding();
+    await expect(within(pending)).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
+    expect(delegations).toBe(0);
+    expect(state.ledger.current.usage).toMatchObject({ logicalCalls: 0, attempts: 0, activeLeafCalls: 0 });
+  });
+
+  test("cancelled waiter cannot duplicate a delegation while durable retention reconciles", async () => {
+    const base = await brokerState(
+      new MockModelClient(() => "unused", modelIdentity("src/runtime/broker.test.ts:agent-retention")),
+      "run_agent_retention_abort",
+    );
+    let delegations = 0;
+    const client = {
+      identity: { id: "test/delegator", version: "2", configuration: {} },
+      async run(_spec: DelegationV2CallSpec) {
+        delegations += 1;
+        return { ok: true as const, status: "completed" as const, value: "delegated" };
+      },
+    };
+    const runOwner = new AbortController();
+    const prepared = prepareAgentDelegation({ client, cwd: "/tmp/project", allowedAgents: ["reviewer"] })!;
+    let markAppendStarted!: () => void;
+    let releaseAppend!: () => void;
+    const appendStarted = new Promise<void>((resolve) => { markAppendStarted = resolve; });
+    const appendRelease = new Promise<void>((resolve) => { releaseAppend = resolve; });
+    const realJournal = base.journal;
+    const state: RunState = {
+      ...base,
+      agentDelegation: bindAgentDelegationRuntime(prepared, runOwner.signal),
+      journal: {
+        append: async (event: Parameters<JournalStore["append"]>[0]) => {
+          if (event.type === "call_committed" && event.kind === "agent") {
+            markAppendStarted();
+            await appendRelease;
+          }
+          return realJournal.append(event);
+        },
+      } as JournalStore,
+    };
+    const firstOwner = new AbortController();
+    const spec = { key: "review", agent: "reviewer", task: "Review." } as const;
+    const first = dispatchCall(
+      state, testFrame, "agent", spec, noRecurse, firstOwner.signal, Date.now() + 5_000,
+    ) as Promise<GuestCallResult>;
+    await within(appendStarted);
+    firstOwner.abort();
+    await expect(within(first)).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
+    expect(delegations).toBe(1);
+    expect(state.inflight.size).toBe(1);
+
+    const second = dispatchCall(
+      state, testFrame, "agent", spec, noRecurse, new AbortController().signal, Date.now() + 5_000,
+    ) as Promise<GuestCallResult>;
+    releaseAppend();
+    await expect(within(second)).resolves.toMatchObject({ ok: true, value: "delegated", cached: true });
+    expect(delegations).toBe(1);
+    expect(state.callCache.size).toBe(1);
+    expect(state.inflight.size).toBe(0);
+
+    const third = await dispatchCall(
+      state, testFrame, "agent", spec, noRecurse, new AbortController().signal, Date.now() + 5_000,
+    ) as GuestCallResult;
+    expect(third).toMatchObject({ ok: true, value: "delegated", cached: true });
+    expect(delegations).toBe(1);
   });
 
   test("durable status refresh failure retains one cache charge and propagates once", async () => {

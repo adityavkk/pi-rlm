@@ -25,9 +25,9 @@ import {
 } from "./extractor.ts";
 import { validateProfile, type Profile } from "./profile.ts";
 
-export const RUN_MANIFEST_SCHEMA_VERSION = 1;
+export const RUN_MANIFEST_SCHEMA_VERSION = 2;
 export const RLM_RUNTIME_VERSION = "0.0.1";
-export const RLM_DSL_VERSION = "0.1.0";
+export const RLM_DSL_VERSION = "0.2.0";
 export { CONTROLLER_PROMPT_VERSION, CONTROLLER_TURN_VERSION, EXTRACTOR_PROMPT_VERSION };
 export const RUN_MANIFEST_FILE = "manifest.json";
 export const RUN_LOCK_FILE = ".pi-rlm-run.lock";
@@ -59,6 +59,7 @@ export interface RunManifest {
     readonly model: RuntimeComponentIdentity;
     readonly controller: RuntimeComponentIdentity;
     readonly extractor: RuntimeComponentIdentity | null;
+    readonly agentDelegation: RuntimeComponentIdentity | null;
   };
   readonly prompts: {
     readonly controller: {
@@ -93,6 +94,7 @@ export interface BuildRunManifestInput {
   readonly model: ModelClient;
   readonly controller: ControllerDriver;
   readonly extractor?: Extractor;
+  readonly agentDelegation?: { readonly identity: RuntimeComponentIdentity };
   readonly authorizationMode?: LaunchAuthorizationMode;
   readonly createRunNonce?: () => string;
   readonly dslVersion: string;
@@ -254,6 +256,7 @@ export interface RunComponentPreflightInput {
   readonly model: ModelClient;
   readonly controller: ControllerDriver;
   readonly extractor?: Extractor;
+  readonly agentDelegation?: { readonly identity: RuntimeComponentIdentity };
 }
 
 export interface RunComponentPreflight {
@@ -270,6 +273,7 @@ export const preflightRunComponents = (input: RunComponentPreflightInput): RunCo
         model: suppliedIdentity(input.model, "model"),
         controller: suppliedIdentity(input.controller, "controller"),
         extractor: input.extractor ? suppliedIdentity(input.extractor, "extractor") : null,
+        agentDelegation: input.agentDelegation ? suppliedIdentity(input.agentDelegation, "agentDelegation") : null,
       },
     };
   } catch (cause) {
@@ -523,13 +527,16 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const backend = record(manifest.backend, "manifest.backend", ["id", "version"]);
   string(backend.id, "manifest.backend.id");
   string(backend.version, "manifest.backend.version");
-  const rawComponents = record(manifest.components, "manifest.components", ["model", "controller", "extractor"]);
+  const rawComponents = record(manifest.components, "manifest.components", ["model", "controller", "extractor", "agentDelegation"]);
   const components: RunManifest["components"] = {
     model: runtimeIdentity(rawComponents.model, "manifest.components.model"),
     controller: runtimeIdentity(rawComponents.controller, "manifest.components.controller"),
     extractor: rawComponents.extractor === null
       ? null
       : runtimeIdentity(rawComponents.extractor, "manifest.components.extractor"),
+    agentDelegation: rawComponents.agentDelegation === null
+      ? null
+      : runtimeIdentity(rawComponents.agentDelegation, "manifest.components.agentDelegation"),
   };
   const prompts = record(manifest.prompts, "manifest.prompts", ["controller", "extractor"]);
   const controller = record(prompts.controller, "manifest.prompts.controller", [

@@ -48,6 +48,15 @@ export interface OfflineProviderFixtureOptions {
   readonly hostScript?: readonly OfflineHostResponse[];
   /** Use a real append-only Pi session JSONL that can be reopened from disk. */
   readonly persistSession?: boolean;
+  /** Override the deterministic controller code while retaining the public provider path. */
+  readonly controllerCode?: string;
+  /** Register another public extension event handler on the same Pi event bus. */
+  readonly extensionSetup?: (pi: ExtensionAPI) => void;
+  readonly agentPolicy?: {
+    readonly allowedAgents?: readonly string[];
+    readonly allowForkContext?: boolean;
+  };
+  readonly profileOverrides?: Partial<Profile>;
 }
 
 export interface OfflineProviderCall {
@@ -120,7 +129,7 @@ const controllerCell = JSON.stringify({
   code: `answer({ answer: ${JSON.stringify(OFFLINE_ANSWER)} })`,
 });
 
-const profile = (): Profile => ({
+const profile = (overrides: Partial<Profile> = {}): Profile => ({
   ...DEFAULT_PROFILE,
   name: "offline-provider-e2e",
   maxLogicalCalls: 1,
@@ -134,6 +143,7 @@ const profile = (): Profile => ({
     medium: OFFLINE_CONTROLLER_MODEL,
     large: OFFLINE_CONTROLLER_MODEL,
   },
+  ...overrides,
 });
 
 const findRunDirectory = async (root: string): Promise<string> => {
@@ -181,6 +191,9 @@ export const createOfflineProviderRuntimeFixture = async (
   };
   let runtime: AgentSessionRuntime | undefined;
   const hostScript = options.hostScript ? [...options.hostScript] : undefined;
+  const effectiveControllerCell = options.controllerCode === undefined
+    ? controllerCell
+    : JSON.stringify({ reasoning: "deterministic offline controller", code: options.controllerCode });
   let hostResponseIndex = 0;
 
   try {
@@ -265,7 +278,7 @@ export const createOfflineProviderRuntimeFixture = async (
       return stream;
     }
     if (mode === "success") {
-      queueMicrotask(() => finish(message(model, "stop", [{ type: "text", text: controllerCell }])));
+      queueMicrotask(() => finish(message(model, "stop", [{ type: "text", text: effectiveControllerCell }])));
       return stream;
     }
     if (mode === "error") {
@@ -282,7 +295,7 @@ export const createOfflineProviderRuntimeFixture = async (
     late = () => {
       state.lateEmissionAttempts += 1;
       state.lateEmissionDispatchAttempts += 1;
-      const final = message(model, "stop", [{ type: "text", text: controllerCell }]);
+      const final = message(model, "stop", [{ type: "text", text: effectiveControllerCell }]);
       try {
         stream.push({ type: "start", partial: { ...final, content: [] } });
         stream.push({ type: "done", reason: "stop", message: final });
@@ -332,13 +345,15 @@ export const createOfflineProviderRuntimeFixture = async (
   let id = 0;
   const extension = createRlmExtension({
     runtime: {
-      resolveProfile: profile,
+      resolveProfile: () => profile(options.profileOverrides),
       createModel: () => new PiModelClient(modelRuntime, OFFLINE_CONTROLLER_MODEL),
+      ...(options.agentPolicy ? { agentPolicy: options.agentPolicy } : {}),
       runRetention: { root: runRoot },
     },
     createId: () => `offline-fixture-${++id}`,
   });
   const observedExtension = (pi: ExtensionAPI): void => {
+    options.extensionSetup?.(pi);
     pi.on("turn_start", (event, ctx) => {
       state.extensionTurnStarts.push({
         sessionId: ctx.sessionManager.getSessionId(),
