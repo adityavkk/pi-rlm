@@ -1,6 +1,10 @@
 import { isProxy } from "node:util/types";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
-import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
+import {
+  AGENT_REQUEST_IDENTITY_VERSION,
+  PROVIDER_REQUEST_IDENTITY_VERSION,
+  type RlmEvent,
+} from "../core/journal.ts";
 import { err, ok, type Result } from "../core/result.ts";
 
 const MAX_EVENT_DEPTH = 5;
@@ -13,7 +17,8 @@ const CONTEXT_REF = /^ctx_[0-9a-f]{64}$/;
 const CALL_KINDS = new Set(["llm", "agent", "recurse", "tool", "artifact", "context"]);
 const COMPLETION_MODES = new Set(["answer", "fallback_extract"]);
 const FRAME_STATES = new Set(["open", "answered", "closed", "failed", "cancelled"]);
-const PROVIDER_KINDS = new Set(["controller", "llm", "extractor"]);
+const PROVIDER_KINDS = new Set(["controller", "llm", "extractor", "agent"]);
+const AGENT_APPROVAL_DECISIONS = new Set(["allowlisted", "approved", "denied"]);
 const PROVIDER_OUTCOMES = new Set(["ok", "error", "cancelled", "invalid_result"]);
 
 type RecordValue = Record<string, unknown>;
@@ -150,6 +155,10 @@ const validEvent = (event: RecordValue): boolean => {
     case "key_bound":
       return exact(event, ["type", "frameId", "kind", "key", "identityHash"])
         && string(event, "frameId", false) && oneOf(event, "kind", CALL_KINDS) && string(event, "key") && hash(event, "identityHash");
+    case "agent_approval":
+      return exact(event, ["type", "frameId", "callId", "agent", "policyId", "decision"])
+        && string(event, "frameId", false) && string(event, "callId", false) && string(event, "agent", false)
+        && string(event, "policyId", false) && oneOf(event, "decision", AGENT_APPROVAL_DECISIONS);
     case "cell_committed":
       return exact(event, ["type", "frameId", "iteration", "reasoning", "codeHash", "hasResult", "outputPreview"],
         ["outputBytes", "outputOmittedBytes", "usage", "outputRef", "outputRefSha256", "outputRefBytes", "error"])
@@ -180,8 +189,11 @@ const validEvent = (event: RecordValue): boolean => {
         || !string(event, "key") || !integer(event, "attempt", true) || !oneOf(event, "outcome", PROVIDER_OUTCOMES)
         || !validUsage(event["usage"]) || !optional(event, "errorCode", () => string(event, "errorCode", false))) return false;
       const requestIdentityFields = Number(own(event, "requestIdentityVersion")) + Number(own(event, "requestSha256"));
+      const expectedIdentityVersion = event["kind"] === "agent"
+        ? AGENT_REQUEST_IDENTITY_VERSION
+        : PROVIDER_REQUEST_IDENTITY_VERSION;
       return requestIdentityFields === 0 || (requestIdentityFields === 2
-        && event["requestIdentityVersion"] === PROVIDER_REQUEST_IDENTITY_VERSION && hash(event, "requestSha256"));
+        && event["requestIdentityVersion"] === expectedIdentityVersion && hash(event, "requestSha256"));
     }
     case "call_committed":
       return exact(event, ["type", "frameId", "callId", "kind", "key", "cached", "ok", "usage"],

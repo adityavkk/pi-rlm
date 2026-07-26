@@ -19,6 +19,7 @@ import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelRequest, ThinkingLevel } from "../shell/model/client.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
 import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
+import { agentCall } from "./agent-call.ts";
 import { createModelOperation, DEFAULT_MAX_OUTPUT_TOKENS, ModelInvocationError } from "./provider.ts";
 export { tokenReservation } from "./provider.ts";
 import type { FrameRef, KeyIdentityBinding, RunState } from "./state.ts";
@@ -262,11 +263,12 @@ export const dispatchCall = async (
       return llmBatch(state, frame, asObject(args), recurse, signal, deadlineMs);
     case "recurse":
       return recurse(args, signal, deadlineMs);
-    case "agent": {
-      const spec = asObject(args);
-      const callId = deriveCallId(state.hasher, { runId: state.runId, kind: "agent", key: reqStr(spec, "key"), identity: spec });
-      return errResult(callId, callError("UNAVAILABLE_CONTEXT", "agent() requires pi-subagents delegation (Phase 2)"), ZERO_CALL_USAGE, false) as unknown as JsonValue;
-    }
+    case "agent":
+      return agentCall(state, frame, asObject(args), signal, deadlineMs, {
+        bindIdentity: (key, identity) => bindKeys(state, [{ frame, kind: "agent", key, identity }]),
+        retain: (result, event, ownedSignal, ownedDeadlineMs) =>
+          retainCallResult(state, result, event, ownedSignal, ownedDeadlineMs),
+      });
     case "checkpoint":
       return "denied";
     case "context.read": {

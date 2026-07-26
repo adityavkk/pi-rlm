@@ -12,8 +12,9 @@ import type { BudgetLimits } from "./budget.ts";
 import type { CallKind } from "./ids.ts";
 import type { CallUsage } from "./usage.ts";
 
-export type ProviderOperationKind = "controller" | "llm" | "extractor";
+export type ProviderOperationKind = "controller" | "llm" | "extractor" | "agent";
 export const PROVIDER_REQUEST_IDENTITY_VERSION = "pi-rlm.provider-request.v1";
+export const AGENT_REQUEST_IDENTITY_VERSION = "pi-rlm.agent-request.v1";
 
 export type CompletionMode = "answer" | "fallback_extract";
 export type RunState = "running" | "completed" | "failed" | "cancelled";
@@ -42,6 +43,14 @@ export type RlmEvent =
       readonly kind: CallKind;
       readonly key: string;
       readonly identityHash: string;
+    }
+  | {
+      readonly type: "agent_approval";
+      readonly frameId: string;
+      readonly callId: string;
+      readonly agent: string;
+      readonly policyId: string;
+      readonly decision: "allowlisted" | "approved" | "denied";
     }
   | {
       readonly type: "cell_committed";
@@ -242,6 +251,7 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
         break;
       }
       case "workspace_committed":
+      case "agent_approval":
       case "fallback_evidence_projected":
       case "fallback_evidence_cited":
       case "provider_attempted":

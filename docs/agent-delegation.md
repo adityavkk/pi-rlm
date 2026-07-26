@@ -36,16 +36,48 @@ responses. Cancellation sends one version 2 cancellation event with the same
 identity.
 
 The adapter rejects accessors, proxies, cycles, non-JSON structured values,
-unknown terminal fields, unsafe accounting numbers, and oversized data. Result text
-is limited to 2 MiB. Structured results use the same encoded byte limit, plus
-node and depth limits. Update payloads are optional and bounded. Provider error
+unknown terminal fields, unsafe accounting numbers, and oversized data. The
+pinned pi-subagents bridge limits text and structured results to 1 MiB. The
+pi-rlm client keeps a separate 2 MiB defensive ceiling, plus node and depth
+limits. Update payloads are optional and bounded. Provider error
 text is not returned through the adapter.
+
+## Guest and host policy
+
+The controller calls `agent()` with a stable key, agent name, task, optional
+context handles, and optional model tier, result schema, timeout, Pi context,
+turn budget, or tool budget. Version 1 caps one delegated call at 40 turns, 4
+grace turns, 100 tool calls, the remaining run deadline, and the tree-wide run
+budgets. Guest values may only narrow these call limits.
+
+The standard extension denies an agent name unless either condition is true:
+
+- The host lists the exact name in `PI_RLM_AGENT_ALLOWLIST`.
+- The interactive host approves that opaque agent for the current run.
+
+Approval records contain the policy identity, bounded agent identifier, call
+identity, and decision. They do not record task or source payloads. Agent names
+must match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. Forked Pi conversation context is
+disabled by default. Custom embedders may enable it through the manifest-bound
+agent policy.
+
+Before launch, pi-rlm verifies every selected context payload and adds its
+absolute path, hash, size, MIME type, and context ID to a JSON manifest in the
+delegated task. The files remain private run-owned files with mode `0600`.
+Node has no `openat` capability, so this handoff does not prevent a same-user
+pathname swap after verification. The child and run directory must share the
+same trusted user boundary.
+
+Each uncached launch reserves one logical call, one attempt, and one leaf slot.
+Reported input, output, cache, cost, and duration usage settles through the
+central accounting boundary before the slot is released. The journal records
+the approval, exact request hash, attempt outcome, usage, and successful call
+commit. Only successful calls enter the durable call cache. Failed calls retain
+their key binding and may retry with a new request attempt ID.
 
 This event protocol is a coordination boundary, not an operating system
 sandbox. The delegated agent receives the capabilities configured in
-pi-subagents and Pi. Version 1 therefore requires a host policy for which agent
-names the guest may request. The broker integration owns that policy, budget
-settlement, caching, journaling, and context-file manifests.
+pi-subagents and Pi.
 
 ## Direct host tools
 

@@ -16,7 +16,11 @@ import {
   settleAttemptUsage,
 } from "../core/budget.ts";
 import { type CallError, callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
-import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
+import {
+  PROVIDER_REQUEST_IDENTITY_VERSION,
+  type ProviderOperationKind,
+  type RlmEvent,
+} from "../core/journal.ts";
 import { canonicalStringify, type JsonObject, type JsonValue } from "../core/json.ts";
 import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
 import {
@@ -130,7 +134,7 @@ export const providerRequestIdentity = (
   return { version: PROVIDER_REQUEST_IDENTITY_VERSION, sha256: sha256(prepared.canonicalIdentity) };
 };
 
-export type ModelOperationKind = "controller" | "llm" | "extractor";
+export type ModelOperationKind = ProviderOperationKind;
 
 export interface ModelOperationOptions {
   readonly operationId: string;
@@ -151,11 +155,27 @@ export class ModelInvocationError extends Error {
   }
 }
 
+export interface ExternalOperationResult<T> {
+  readonly value: T;
+  readonly usage?: CallUsage;
+  readonly outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"];
+  readonly errorCode?: string;
+}
+
+export interface ExternalRequestIdentity {
+  readonly version: string;
+  readonly sha256: string;
+}
+
 export interface ModelOperation {
   readonly usage: CallUsage;
   readonly attemptCount: number;
   complete(client: ModelClient, request: ModelRequest): Promise<ModelResponse>;
   runExternal<T>(effect: () => Promise<T> | T): Promise<T>;
+  runExternalReported<T>(
+    effect: () => Promise<ExternalOperationResult<T>> | ExternalOperationResult<T>,
+    requestIdentity: ExternalRequestIdentity,
+  ): Promise<T>;
 }
 
 type TokenReservationRequest = Pick<ModelRequest, "prompt" | "system" | "context" | "schema" | "maxOutputTokens">;
@@ -318,12 +338,14 @@ export const createModelOperation = (
   const addAccounting = (usage: CallUsage): CallError | undefined => {
     const combined = addUsage(aggregate, usage);
     if (!combined.ok) return callError("INVALID_RESULT", combined.error.message);
-    aggregate = combined.value;
+    const scopedUpdates: Array<{ scope: string; usage: CallUsage }> = [];
     for (const scope of frame.usageScopes ?? []) {
       const scoped = addUsage(state.scopeUsage.get(scope) ?? ZERO_CALL_USAGE, usage);
       if (!scoped.ok) return callError("INVALID_RESULT", scoped.error.message);
-      state.scopeUsage.set(scope, scoped.value);
+      scopedUpdates.push({ scope, usage: scoped.value });
     }
+    aggregate = combined.value;
+    for (const update of scopedUpdates) state.scopeUsage.set(update.scope, update.usage);
     return undefined;
   };
 
@@ -331,7 +353,7 @@ export const createModelOperation = (
     outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"],
     usage: CallUsage,
     errorCode?: string,
-    requestSha256?: string,
+    requestIdentity?: ExternalRequestIdentity,
   ): Promise<void> => {
     const appended = await state.journal.append({
       type: "provider_attempted",
@@ -342,9 +364,9 @@ export const createModelOperation = (
       attempt: attemptOrdinal,
       outcome,
       usage,
-      ...(requestSha256 ? {
-        requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
-        requestSha256,
+      ...(requestIdentity ? {
+        requestIdentityVersion: requestIdentity.version,
+        requestSha256: requestIdentity.sha256,
       } : {}),
       ...(errorCode ? { errorCode } : {}),
     });
@@ -411,7 +433,10 @@ export const createModelOperation = (
           : wasAborted(error, options.signal)
             ? callError("CANCELLED", "model completion cancelled")
             : callError("FAILED", "model completion failed"));
-        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code, requestSha256);
+        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code, {
+          version: PROVIDER_REQUEST_IDENTITY_VERSION,
+          sha256: requestSha256,
+        });
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -426,7 +451,10 @@ export const createModelOperation = (
         }
         pendingTokens = 0;
         const failure = addAccounting(usage) ?? callError("INVALID_RESULT", "model returned invalid usage");
-        await journal("invalid_result", usage, failure.code, requestSha256);
+        await journal("invalid_result", usage, failure.code, {
+          version: PROVIDER_REQUEST_IDENTITY_VERSION,
+          sha256: requestSha256,
+        });
         throw new ModelInvocationError(failure, aggregate);
       }
 
@@ -441,7 +469,10 @@ export const createModelOperation = (
       pendingTokens = 0;
       const accountingError = addAccounting(response.usage);
       if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-      await journal("ok", response.usage, undefined, requestSha256);
+      await journal("ok", response.usage, undefined, {
+        version: PROVIDER_REQUEST_IDENTITY_VERSION,
+        sha256: requestSha256,
+      });
       return response;
     } finally {
       if (pendingTokens > 0) {
@@ -467,12 +498,16 @@ export const createModelOperation = (
       if (settled)
         throw new ModelInvocationError(callError("INVALID_RESULT", "external model operation settled more than once"), aggregate);
       const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
-      const settlement = settleAttemptUsage(state.ledger.current, 0, usage);
+      const before = state.ledger.current;
+      const settlement = settleAttemptUsage(before, 0, usage);
       if (!settlement.ok) throw new ModelInvocationError(settlement.error, aggregate);
       state.ledger.current = settlement.value;
-      settled = true;
       const accountingError = addAccounting(usage);
-      if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
+      if (accountingError) {
+        state.ledger.current = before;
+        throw new ModelInvocationError(accountingError, aggregate);
+      }
+      settled = true;
       return usage;
     };
     try {
@@ -503,10 +538,93 @@ export const createModelOperation = (
     }
   };
 
+  const runExternalReported = async <T>(
+    effect: () => Promise<ExternalOperationResult<T>> | ExternalOperationResult<T>,
+    requestIdentity: ExternalRequestIdentity,
+  ): Promise<T> => {
+    if (typeof requestIdentity.version !== "string" || requestIdentity.version.length === 0
+      || !/^[0-9a-f]{64}$/.test(requestIdentity.sha256))
+      throw new ModelInvocationError(callError("INVALID_REQUEST", "external request identity is invalid"), aggregate);
+    checkpoint();
+    const release = await state.semaphore.acquire(options.signal);
+    if (!release) {
+      checkpoint();
+      throw new ModelInvocationError(callError("CANCELLED", "external operation cancelled"), aggregate);
+    }
+    let active = false;
+    let settled = false;
+    const startedMs = state.clock.now();
+    const measuredUsage = (): CallUsage => ({ attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) });
+    const settleReported = (usage: CallUsage): CallError | undefined => {
+      if (settled) return callError("INVALID_RESULT", "external operation settled more than once");
+      const before = state.ledger.current;
+      const settlement = settleAttemptUsage(before, 0, usage);
+      if (!settlement.ok) return settlement.error;
+      state.ledger.current = settlement.value;
+      const accountingError = addAccounting(usage);
+      if (accountingError) {
+        state.ledger.current = before;
+        return accountingError;
+      }
+      settled = true;
+      return undefined;
+    };
+    try {
+      checkpoint();
+      const reservationError = reserve(0);
+      if (reservationError) throw new ModelInvocationError(reservationError, aggregate);
+      const acquired = acquireLeaf(state.ledger.current);
+      if (acquired === "saturated")
+        throw new ModelInvocationError(callError("INVALID_RESULT", "model concurrency accounting diverged"), aggregate);
+      state.ledger.current = acquired;
+      active = true;
+
+      let result: ExternalOperationResult<T>;
+      try {
+        result = await waitForAbort(Promise.resolve(effect()), options.signal);
+      } catch (error) {
+        const usage = measuredUsage();
+        const accountingError = settleReported(usage);
+        const cancelled = wasAborted(error, options.signal);
+        const failure = accountingError ?? callError(cancelled ? "CANCELLED" : "FAILED", cancelled
+          ? "external operation cancelled"
+          : "external operation failed");
+        await journal(cancelled ? "cancelled" : "error", usage, failure.code, requestIdentity);
+        throw new ModelInvocationError(failure, aggregate);
+      }
+
+      let usage = measuredUsage();
+      if (result.usage !== undefined) {
+        const normalized = normalizeCallUsage(result.usage, usageLimits(state));
+        if (!normalized.ok) {
+          const accountingError = settleReported(usage);
+          const failure = accountingError ?? callError("INVALID_RESULT", "external operation returned invalid usage");
+          await journal("invalid_result", usage, failure.code, requestIdentity);
+          throw new ModelInvocationError(failure, aggregate);
+        }
+        usage = { ...normalized.value, attempts: 1 };
+      }
+      const accountingError = settleReported(usage);
+      if (accountingError) {
+        const fallbackUsage = measuredUsage();
+        const fallbackError = settleReported(fallbackUsage);
+        if (fallbackError) throw new ModelInvocationError(fallbackError, aggregate);
+        await journal("invalid_result", fallbackUsage, accountingError.code, requestIdentity);
+        throw new ModelInvocationError(accountingError, aggregate);
+      }
+      await journal(result.outcome, usage, result.errorCode, requestIdentity);
+      return result.value;
+    } finally {
+      if (active) state.ledger.current = releaseLeaf(state.ledger.current);
+      release();
+    }
+  };
+
   return {
     get usage() { return aggregate; },
     get attemptCount() { return attemptOrdinal; },
     complete,
     runExternal,
+    runExternalReported,
   };
 };

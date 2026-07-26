@@ -66,6 +66,15 @@ interface Entry {
   readonly bytesArray: Uint8Array;
 }
 
+export interface ContextFileReference {
+  readonly id: string;
+  readonly label: string;
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly mimeType: string;
+}
+
 interface OrphanEntry {
   readonly path: string;
   /** Physical bytes reachable through this path. Hard-link aliases may charge zero. */
@@ -972,6 +981,24 @@ export class ContextStore {
     const entry = this.entries.get(id);
     if (entry) return decoder.decode(entry.bytesArray);
     throw new ContextUnavailableError(id);
+  }
+
+  /** Verified absolute payload reference for a delegated same-user process. */
+  async fileReference(id: string): Promise<ContextFileReference> {
+    const entry = this.entryOrThrow(id);
+    const directory = await this.contentDirectory(id, false);
+    const path = this.payloadPath(directory, `${entry.descriptor.sha256}.bin`, id);
+    await this.revalidateDirectory(directory, id);
+    await this.verifyPayload(path, directory, entry.descriptor);
+    await this.revalidateDirectory(directory, id);
+    return {
+      id: entry.descriptor.id,
+      label: entry.descriptor.label,
+      path,
+      bytes: entry.descriptor.bytes,
+      sha256: entry.descriptor.sha256,
+      mimeType: entry.descriptor.mimeType,
+    };
   }
 
   async loadFromDisk(reference: ContextContentReference): Promise<Uint8Array> {

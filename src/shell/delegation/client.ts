@@ -1,4 +1,5 @@
 import type { SubagentDelegationV2Cancel } from "pi-subagents/delegation";
+import type { RuntimeComponentIdentity } from "../../core/identity.ts";
 import {
   DELEGATION_V2_LIMITS,
   SUBAGENT_DELEGATION_CANCEL_EVENT,
@@ -37,6 +38,16 @@ const validTimeout = (value: number | undefined, fallback: number): number =>
     : fallback;
 
 export class DelegationV2Client {
+  readonly identity: RuntimeComponentIdentity = {
+    id: "pi-subagents/delegation",
+    version: "2/client-v1",
+    configuration: {
+      protocolVersion: SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION,
+      startTimeoutMs: DELEGATION_V2_LIMITS.defaultStartTimeoutMs,
+      resultBytes: DELEGATION_V2_LIMITS.resultBytes,
+    },
+  };
+
   constructor(private readonly events: DelegationEventBus) {}
 
   run(spec: DelegationV2CallSpec, options: DelegationV2RunOptions = {}): Promise<DelegationV2Outcome> {

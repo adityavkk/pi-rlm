@@ -28,6 +28,8 @@ import {
   type LaunchAuthorizationMode,
   type Profile,
   preflightRunComponents,
+  prepareAgentDelegation,
+  type AgentDelegationConfig,
   runProgram,
   type RunResult,
   type RunWarning,
@@ -41,6 +43,7 @@ import { throwIfAborted, waitForAbort, wasAborted } from "./src/runtime/abort.ts
 import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { QuickJsBackend } from "./src/shell/interpreter/quickjs.ts";
+import { createExtensionAgentDelegation } from "./src/extension/agent-delegation.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient } from "./src/shell/model/client.ts";
 import { PiModelClient } from "./src/shell/model/pi-model.ts";
@@ -140,6 +143,10 @@ export interface RlmRuntimeDependencies {
   /** Custom directories retain the legacy caller-owned lifecycle and are never swept. */
   readonly createRunDirectory?: () => Promise<string>;
   readonly createRunNonce?: () => string;
+  readonly agentPolicy?: {
+    readonly allowedAgents?: readonly string[];
+    readonly allowForkContext?: boolean;
+  };
   readonly runRetention?: ManagedRunStoreOptions;
   /** Observer for detached cleanup after cancellation wins a directory-allocation race. */
   readonly onRetentionError?: (error: RunRetentionError) => void;
@@ -150,8 +157,10 @@ const executeRun = async (
   signal: AbortSignal,
   dependencies: RlmRuntimeDependencies = {},
   authorizationMode: LaunchAuthorizationMode = "direct",
+  agentDelegation?: AgentDelegationConfig,
 ): Promise<RunResult> => {
   throwIfAborted(signal);
+  const preparedAgentDelegation = prepareAgentDelegation(agentDelegation);
   const profile = (dependencies.resolveProfile ?? resolveProfile)();
   const backendWork = Promise.resolve((dependencies.createBackend ?? getBackend)());
   const modelWork = dependencies.createModel
@@ -161,7 +170,12 @@ const executeRun = async (
   throwIfAborted(signal);
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
-  preflightRunComponents({ backend, model, controller });
+  preflightRunComponents({
+    backend,
+    model,
+    controller,
+    ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
+  });
   if (dependencies.createRunDirectory) {
     const dirWork = dependencies.createRunDirectory();
     let dir: string;
@@ -177,6 +191,7 @@ const executeRun = async (
       const result = await runProgram({
         program: request.program, sources: request.sources, controller, model, backend, dir, profile, signal,
         authorizationMode, createRunNonce: dependencies.createRunNonce,
+        ...(agentDelegation ? { agentDelegation } : {}),
       });
       if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
       return result;
@@ -209,6 +224,7 @@ const executeRun = async (
     result = await runProgram({
       program: request.program, sources: request.sources, controller, model, backend, dir: lease.dir, profile, signal,
       authorizationMode, createRunNonce: dependencies.createRunNonce, runLifecycle: lease.lifecycle,
+      ...(agentDelegation ? { agentDelegation } : {}),
     });
   } catch (primary) {
     const cleanupFailures: unknown[] = [];
@@ -288,7 +304,7 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
-  const run = dependencies.executeRun ?? ((request, signal, mode) => executeRun(request, signal, dependencies.runtime, mode));
+  const extensionAgentDelegation = createExtensionAgentDelegation(pi);
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
@@ -400,6 +416,24 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     try { return ctx.sessionManager.getSessionId() === sessionId; }
     catch { return false; }
   };
+
+  const run = (
+    request: LaunchRequest,
+    signal: AbortSignal,
+    mode: LaunchAuthorizationMode,
+    ctx: ExtensionContext,
+    sessionId: string,
+    generation: number,
+  ): Promise<RunResult> => dependencies.executeRun
+    ? dependencies.executeRun(request, signal, mode)
+    : executeRun(
+        request,
+        signal,
+        dependencies.runtime,
+        mode,
+        extensionAgentDelegation(ctx, sessionId, generation, (id, gen, ownedSignal, ownedCtx) =>
+          sessionMatches(id, gen, ownedSignal, ownedCtx), dependencies.runtime?.agentPolicy),
+      );
 
   const deliverCommandResult = (
     projection: RlmResultProjection,
@@ -554,7 +588,14 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         let result: RunResult;
         try {
           if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
-          result = await run(built.value, commandController.signal, "slash_command");
+          result = await run(
+            built.value,
+            commandController.signal,
+            "slash_command",
+            ctx,
+            sessionId,
+            lifecycle.authorizationGeneration,
+          );
         } catch (error) {
           if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
           const cancelled = wasAborted(error, commandController.signal);
@@ -673,7 +714,14 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           if (confirmationGeneration !== authorizationGeneration
             || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
             return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch.");
-          const result = await run(built.value, toolSignal, "confirmed");
+          const result = await run(
+            built.value,
+            toolSignal,
+            "confirmed",
+            ctx,
+            initialBinding.sessionId,
+            confirmationGeneration,
+          );
           if (confirmationGeneration !== authorizationGeneration
             || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
             return denied("RLM_GRANT_GENERATION_MISMATCH: session changed while pi-rlm was running.");

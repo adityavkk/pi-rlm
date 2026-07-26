@@ -10,6 +10,7 @@ import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import type { JournalStore } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import type { GuestCallResult } from "./call-result.ts";
+import type { AgentDelegationRuntime } from "./agent-delegation.ts";
 import type { Profile } from "./profile.ts";
 import type { Semaphore } from "./semaphore.ts";
 
@@ -60,6 +61,8 @@ export interface RunState {
   readonly scopeUsage: Map<string, CallUsage>;
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
+  readonly agentDelegation?: AgentDelegationRuntime;
+  readonly agentAttempts: Map<string, number>;
   readonly frameSeq: { current: number };
 }
 

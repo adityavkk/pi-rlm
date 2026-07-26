@@ -118,7 +118,7 @@ describe("source-bound run identity and manifest", () => {
     expect((document.manifest.profile as unknown as typeof profile).models).toEqual(DEFAULT_PROFILE.models);
     expect(document.manifest.backend).toEqual({ id: "test-backend", version: "7.2.1" });
     expect(document.manifest.prompts.controller).toMatchObject({
-      staticVersion: "2",
+      staticVersion: "3",
       turnVersion: "2",
       staticRenderedSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       bindingInputsSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -188,6 +188,25 @@ describe("source-bound run identity and manifest", () => {
       controller: { configuration: { modelRoute: "provider/controller", maxOutputTokens: 64 } },
       extractor: { configuration: { mode: "external", configuration: { temperature: 0 } } },
     });
+  });
+
+  test("binds agent delegation policy identity into manifest and prompt hashes", () => {
+    const delegation = (allowedAgents: string[]) => ({
+      identity: {
+        id: "pi-rlm/agent-delegation",
+        version: "pi-rlm.agent-policy.v1",
+        configuration: { allowedAgents, cwdSha256: sha256("/tmp/project"), approvalPolicy: null },
+      },
+    });
+    const absent = manifest("alpha", "delegation");
+    const reviewer = manifest("alpha", "delegation", { agentDelegation: delegation(["reviewer"]) });
+    const worker = manifest("alpha", "delegation", { agentDelegation: delegation(["worker"]) });
+    expect(absent.manifest.components.agentDelegation).toBeNull();
+    expect(reviewer.manifest.components.agentDelegation).toEqual(delegation(["reviewer"]).identity);
+    expect(reviewer.manifestHash).not.toBe(absent.manifestHash);
+    expect(reviewer.manifestHash).not.toBe(worker.manifestHash);
+    expect(reviewer.manifest.prompts.controller.bindingInputsSha256)
+      .not.toBe(absent.manifest.prompts.controller.bindingInputsSha256);
   });
 
   test("missing opaque component identity fails before nonce or run effects", () => {

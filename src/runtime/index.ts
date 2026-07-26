@@ -5,6 +5,7 @@ export * from "./mock-controller.ts";
 export * from "./model-controller.ts";
 export * from "./controller-prompt.ts";
 export * from "./call-result.ts";
+export * from "./agent-delegation.ts";
 export * from "./extractor.ts";
 export * from "./extractor-evidence.ts";
 export { DEFAULT_MAX_OUTPUT_TOKENS, ModelInvocationError, tokenReservation } from "./provider.ts";
