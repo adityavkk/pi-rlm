@@ -90,6 +90,18 @@ runtime_network_denied() {
   esac
 }
 
+if [[ ${1:-} == "--isolation-probe" ]]; then
+  probe_dir="$tmp_dir/isolation-probe"
+  prepare_roots "$probe_dir"
+  runtime_network_denied "$probe_dir" "$env_bin" node -e '
+    if (process.env.NODE_OPTIONS !== undefined) throw new Error("caller NODE_OPTIONS crossed isolation");
+    if (Object.keys(process.env).some((key) => key.startsWith("BASH_FUNC_env")))
+      throw new Error("caller exported env function crossed isolation");
+  '
+  echo "packed smoke trusted-env and network-denial probe passed"
+  exit 0
+fi
+
 pack_dir="$tmp_dir/pack"
 prepare_roots "$pack_dir"
 pack_json="$pack_dir/pack.json"

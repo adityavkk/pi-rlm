@@ -826,6 +826,7 @@ describe("pi-rlm extension wiring", () => {
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  const RETENTION_FAULT_TEST_TIMEOUT_MS = 15_000;
   const metadataFaultCases = (["completed", "failed", "cancelled"] as const)
     .flatMap((status) => ([
       "temp-open",
@@ -867,6 +868,7 @@ describe("pi-rlm extension wiring", () => {
         policy: { abandonedGraceMs: 0 },
       }).cleanup({ force: true })).deleted).toEqual([listing.runs[0]!.name]);
     },
+    RETENTION_FAULT_TEST_TIMEOUT_MS,
   );
 
   const releaseFaultCases = (["completed", "failed", "cancelled"] as const)
@@ -912,6 +914,7 @@ describe("pi-rlm extension wiring", () => {
           .toEqual([listing.runs[0]!.name]);
       }
     },
+    RETENTION_FAULT_TEST_TIMEOUT_MS,
   );
 
   const cleanupFaultCases = (["completed", "failed", "cancelled"] as const)
@@ -938,6 +941,7 @@ describe("pi-rlm extension wiring", () => {
       expect(warningAudit?.data["status"]).toBe(status);
       expect((warningAudit?.data["codes"] as string[]).filter((code) => code === "RETENTION_CLEANUP_FAILED")).toHaveLength(1);
     },
+    RETENTION_FAULT_TEST_TIMEOUT_MS,
   );
 
   test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {

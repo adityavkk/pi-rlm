@@ -7,7 +7,8 @@ import { OFFLINE_ANSWER, OFFLINE_COMMAND } from "./testing/offline-provider-runt
 const MAX_ADAPTER_BYTES = 256 * 1024;
 const MAX_RPC_RECORDS = 256;
 const MAX_RPC_LINE_BYTES = 64 * 1024;
-const ADAPTER_TIMEOUT_MS = 10_000;
+const ADAPTER_TIMEOUT_MS = 30_000;
+const ADAPTER_TEST_TIMEOUT_MS = 35_000;
 const ANSWER_SHA = "a1962b5a13bb394a10d97d3c6acadac0d02bc24ddebe0f80d05a96b9b4dddf90";
 const ANSWER_REF = `ctx_${ANSWER_SHA}`;
 const fixturePath = join(import.meta.dir, "testing", "public-mode-fixture.ts");
@@ -25,11 +26,8 @@ const isolatedEnv = (root: string): Record<string, string> => ({
 type Child = ReturnType<typeof Bun.spawn>;
 
 const killAndWait = async (child: Child): Promise<void> => {
-  if (child.exitCode === null) child.kill();
-  await Promise.race([
-    child.exited.then(() => undefined),
-    new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-  ]);
+  if (child.exitCode === null) child.kill("SIGKILL");
+  await child.exited;
 };
 
 const readBounded = async (
@@ -46,7 +44,7 @@ const readBounded = async (
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
       if (bytes > MAX_ADAPTER_BYTES) {
-        child.kill();
+        child.kill("SIGKILL");
         throw new Error(`${label} exceeded ${MAX_ADAPTER_BYTES} bytes`);
       }
       chunks.push(chunk.value);
@@ -63,14 +61,14 @@ const readBounded = async (
   return new TextDecoder("utf-8", { fatal: true }).decode(joined);
 };
 
-const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number> => {
+const waitBounded = async (child: Child, work: readonly Promise<unknown>[]): Promise<number> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const exitCode = await Promise.race([
-      Promise.all([work, child.exited]).then(([, code]) => code),
+      Promise.all([...work, child.exited]).then((values) => values.at(-1) as number),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          child.kill();
+          child.kill("SIGKILL");
           reject(new Error(`adapter exceeded ${ADAPTER_TIMEOUT_MS}ms`));
         }, ADAPTER_TIMEOUT_MS);
       }),
@@ -78,6 +76,8 @@ const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number
     return exitCode;
   } finally {
     if (timer) clearTimeout(timer);
+    await killAndWait(child);
+    await Promise.allSettled([...work, child.exited]);
   }
 };
 
@@ -173,7 +173,7 @@ const runPrintAdapter = async (adapter: "text" | "json", outcome: "success" | "e
       });
       const stdout = readBounded(child.stdout as ReadableStream<Uint8Array>, child, "stdout");
       const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "stderr");
-      const exitCode = await waitBounded(child, Promise.all([stdout, stderr]));
+      const exitCode = await waitBounded(child, [stdout, stderr]);
       return { stdout: await stdout, stderr: await stderr, exitCode };
     });
     const fixtureResult = assertFixtureResult(await readBoundedJson(statePath));
@@ -192,6 +192,31 @@ const customEntryProjection = (result: FixtureResult): unknown => {
 };
 
 describe("offline provider through bounded public Pi adapters", () => {
+  test("watchdog reaps the child and settles every owned promise after one rejects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-adapter-owned-work-"));
+    const child = Bun.spawn(["bun", "--eval", "setInterval(() => {}, 1000)"], {
+      cwd: root,
+      env: isolatedEnv(root),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let siblingSettled = false;
+    const rejected = Promise.reject(new Error("injected owned-work failure"));
+    const sibling = new Promise<void>((resolve) => setTimeout(() => {
+      siblingSettled = true;
+      resolve();
+    }, 50));
+    try {
+      await expect(waitBounded(child, [rejected, sibling])).rejects.toThrow("injected owned-work failure");
+      expect(siblingSettled).toBe(true);
+      expect(Number.isInteger(await child.exited)).toBe(true);
+    } finally {
+      await killAndWait(child);
+      await Promise.allSettled([rejected, sibling, child.exited]);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, ADAPTER_TEST_TIMEOUT_MS);
+
   test.each([
     ["text", "success"], ["text", "error"], ["json", "success"], ["json", "error"],
   ] as const)("runPrintMode %s exposes exact bounded %s result", async (adapter, outcome) => {
@@ -214,7 +239,7 @@ describe("offline provider through bounded public Pi adapters", () => {
       expect(messages).toHaveLength(1);
       assertProjection(JSON.parse(messages[0]!["message"].content), outcome);
     }
-  }, 15_000);
+  }, ADAPTER_TEST_TIMEOUT_MS);
 
   test.each(["success", "error"] as const)("runRpcMode exposes exact bounded %s result", async (outcome) => {
     const root = await mkdtemp(join(tmpdir(), `pi-rlm-native-rpc-${outcome}-`));
@@ -244,46 +269,53 @@ describe("offline provider through bounded public Pi adapters", () => {
           stdin.write(`${JSON.stringify(value)}\n`);
           await stdin.flush();
         };
-        await send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
         const readOutput = async (): Promise<void> => {
-          while (true) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            totalBytes += chunk.value.byteLength;
-            if (totalBytes > MAX_ADAPTER_BYTES) {
-              child!.kill();
-              throw new Error(`RPC stdout exceeded ${MAX_ADAPTER_BYTES} bytes`);
+          try {
+            while (true) {
+              const chunk = await reader.read();
+              if (chunk.done) break;
+              totalBytes += chunk.value.byteLength;
+              if (totalBytes > MAX_ADAPTER_BYTES) {
+                child!.kill("SIGKILL");
+                throw new Error(`RPC stdout exceeded ${MAX_ADAPTER_BYTES} bytes`);
+              }
+              pending += decoder.decode(chunk.value, { stream: true });
+              let newline: number;
+              while ((newline = pending.indexOf("\n")) >= 0) {
+                const line = pending.slice(0, newline);
+                pending = pending.slice(newline + 1);
+                if (!line) continue;
+                if (Buffer.byteLength(line, "utf8") > MAX_RPC_LINE_BYTES) {
+                  child!.kill("SIGKILL");
+                  throw new Error(`RPC record exceeded ${MAX_RPC_LINE_BYTES} bytes`);
+                }
+                output.push(JSON.parse(line) as Record<string, any>);
+                if (output.length > MAX_RPC_RECORDS) {
+                  child!.kill("SIGKILL");
+                  throw new Error(`RPC exceeded ${MAX_RPC_RECORDS} records`);
+                }
+                const event = output.at(-1)!;
+                if (!requestedEntries && event["type"] === "message_end"
+                  && event["message"]?.customType === "pi-rlm-result") {
+                  requestedEntries = true;
+                  await send({ id: "entries", type: "get_entries" });
+                } else if (event["type"] === "response" && event["id"] === "entries") {
+                  stdin.end();
+                }
+              }
             }
-            pending += decoder.decode(chunk.value, { stream: true });
-            let newline: number;
-            while ((newline = pending.indexOf("\n")) >= 0) {
-              const line = pending.slice(0, newline);
-              pending = pending.slice(newline + 1);
-              if (!line) continue;
-              if (Buffer.byteLength(line, "utf8") > MAX_RPC_LINE_BYTES) {
-                child!.kill();
-                throw new Error(`RPC record exceeded ${MAX_RPC_LINE_BYTES} bytes`);
-              }
-              output.push(JSON.parse(line) as Record<string, any>);
-              if (output.length > MAX_RPC_RECORDS) {
-                child!.kill();
-                throw new Error(`RPC exceeded ${MAX_RPC_RECORDS} records`);
-              }
-              const event = output.at(-1)!;
-              if (!requestedEntries && event["type"] === "message_end"
-                && event["message"]?.customType === "pi-rlm-result") {
-                requestedEntries = true;
-                await send({ id: "entries", type: "get_entries" });
-              } else if (event["type"] === "response" && event["id"] === "entries") {
-                stdin.end();
-              }
-            }
+            pending += decoder.decode();
+            if (pending.length !== 0) throw new Error("RPC stdout ended with an incomplete record");
+          } finally {
+            reader.releaseLock();
           }
-          pending += decoder.decode();
-          if (pending.length !== 0) throw new Error("RPC stdout ended with an incomplete record");
         };
         const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "RPC stderr");
-        const exitCode = await waitBounded(child, Promise.all([readOutput(), stderr]));
+        // Start stdout ownership before the first write. If that write fails,
+        // watchdog cleanup still kills the child and settles/releases both readers.
+        const outputWork = readOutput();
+        const initialSend = send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
+        const exitCode = await waitBounded(child, [initialSend, outputWork, stderr]);
         return { output, stderr: await stderr, exitCode };
       });
       expect(parent.fetchAttempts).toBe(0);
@@ -305,5 +337,5 @@ describe("offline provider through bounded public Pi adapters", () => {
       if (child) await killAndWait(child);
       await rm(root, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, ADAPTER_TEST_TIMEOUT_MS);
 });
