@@ -44,14 +44,21 @@ What is not done yet:
 
 ## Install
 
-Requires [bun](https://bun.sh). Then, from a Pi session, load the extension:
+Requires [bun](https://bun.sh). Try the repository as a Pi package for one
+run:
 
 ```bash
 pi -e /path/to/pi-rlm/index.ts
 ```
 
-Or add it as a Pi package (see Pi's package docs) using the `pi.extensions`
-entry in `package.json`.
+Or install the local package through Pi's documented package mechanism. Pi
+records the directory in `~/.pi/agent/settings.json` under `packages` and reads
+the package's `pi.extensions` manifest on later runs:
+
+```bash
+pi install /path/to/pi-rlm
+pi
+```
 
 ## Usage
 
@@ -149,9 +156,17 @@ security boundary.
 ## Testing
 
 ```bash
-bun test          # full suite (offline, no provider needed)
-bun run typecheck # strict TypeScript
+bun test                     # full suite (offline, no provider needed)
+bun run typecheck            # strict TypeScript
+bun run smoke:packed         # packed imports plus both Pi package-loading paths
+bun run test:smoke-isolation # same smoke; caller environment and cleanup check
 ```
+
+The packed smoke uses clean, separate HOME/XDG/npm/Bun directories for two
+credential-free cases: the worktree entry loaded directly with
+`pi -e <worktree>/index.ts /rlm`, and an installed packed package discovered
+from Pi settings without `-e`. Both require the exact bounded and durable
+`RLM_SOURCE_REQUIRED` custom result lifecycle without an agent/provider turn.
 
 ## Roadmap
 
