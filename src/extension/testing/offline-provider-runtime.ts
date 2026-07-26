@@ -19,6 +19,7 @@ import {
   type Context,
   type Model,
   type SimpleStreamOptions,
+  type ToolCall,
 } from "@earendil-works/pi-ai";
 import { createRlmExtension } from "../../../index.ts";
 import type { RlmEvent } from "../../core/journal.ts";
@@ -35,6 +36,16 @@ export const OFFLINE_COMMAND =
 export const OFFLINE_ANSWER = "offline provider answer";
 
 export type OfflineProviderMode = "success" | "error" | "pending";
+
+export type OfflineHostResponse =
+  | { readonly type: "toolCall"; readonly id: string; readonly name: string; readonly arguments: Record<string, unknown> }
+  | { readonly type: "stop"; readonly text: string };
+
+export interface OfflineProviderFixtureOptions {
+  readonly setupFault?: "after-model-runtime" | "after-agent-runtime";
+  /** Optional deterministic host-model responses. Controller routing remains governed by mode. */
+  readonly hostScript?: readonly OfflineHostResponse[];
+}
 
 export interface OfflineProviderCall {
   readonly model: { readonly provider: string; readonly id: string; readonly api: string };
@@ -91,7 +102,7 @@ const message = (
   api: model.api,
   provider: model.provider,
   model: model.id,
-  usage: stopReason === "stop" ? usage(11, 7) : usage(11, 0),
+  usage: stopReason === "stop" || stopReason === "toolUse" ? usage(11, 7) : usage(11, 0),
   stopReason,
   ...(errorMessage ? { errorMessage } : {}),
   timestamp: Date.now(),
@@ -136,7 +147,7 @@ const findRunDirectory = async (root: string): Promise<string> => {
 export const createOfflineProviderRuntimeFixture = async (
   root: string,
   mode: OfflineProviderMode = "success",
-  options: { readonly setupFault?: "after-model-runtime" | "after-agent-runtime" } = {},
+  options: OfflineProviderFixtureOptions = {},
 ): Promise<OfflineProviderRuntimeFixture> => {
   const originalFetch = globalThis.fetch;
   let installedFetch: typeof fetch;
@@ -161,6 +172,8 @@ export const createOfflineProviderRuntimeFixture = async (
     if (globalThis.fetch === installedFetch) globalThis.fetch = originalFetch;
   };
   let runtime: AgentSessionRuntime | undefined;
+  const hostScript = options.hostScript ? [...options.hostScript] : undefined;
+  let hostResponseIndex = 0;
 
   try {
   const credentials = new InMemoryCredentialStore();
@@ -176,7 +189,11 @@ export const createOfflineProviderRuntimeFixture = async (
     const stream = createAssistantMessageEventStream();
     state.calls.push({
       model: { provider: model.provider, id: model.id, api: model.api },
-      context: structuredClone(context),
+      context: {
+        ...(context.systemPrompt !== undefined ? { systemPrompt: context.systemPrompt } : {}),
+        messages: structuredClone(context.messages),
+        ...(context.tools ? { tools: context.tools.map((tool) => ({ ...tool })) } : {}),
+      },
       options: {
         ...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
         ...(options?.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
@@ -186,7 +203,9 @@ export const createOfflineProviderRuntimeFixture = async (
       },
       ...(options?.signal ? { signal: options.signal } : {}),
     });
-    resolveStarted();
+    const controllerRoute = model.provider === OFFLINE_PROVIDER_ID && model.id === "controller";
+    const hostRoute = model.provider === OFFLINE_PROVIDER_ID && model.id === "host";
+    if (controllerRoute) resolveStarted();
 
     let settled = false;
     const finish = (final: AssistantMessage): boolean => {
@@ -202,6 +221,41 @@ export const createOfflineProviderRuntimeFixture = async (
       return true;
     };
 
+    const finishToolCall = (toolCall: ToolCall): void => {
+      if (settled) return;
+      settled = true;
+      const final = message(model, "toolUse", [toolCall]);
+      const empty = { ...toolCall, arguments: {} };
+      stream.push({ type: "start", partial: { ...final, content: [] } });
+      stream.push({ type: "toolcall_start", contentIndex: 0, partial: { ...final, content: [empty] } });
+      stream.push({
+        type: "toolcall_delta",
+        contentIndex: 0,
+        delta: JSON.stringify(toolCall.arguments),
+        partial: final,
+      });
+      stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: final });
+      stream.push({ type: "done", reason: "toolUse", message: final });
+      stream.end(final);
+    };
+
+    if (hostRoute && hostScript) {
+      const response = hostScript[hostResponseIndex++];
+      if (!response) {
+        queueMicrotask(() => finish(message(model, "error", [], "OFFLINE_HOST_SCRIPT_EXHAUSTED")));
+      } else if (response.type === "toolCall") {
+        const toolCall: ToolCall = {
+          type: "toolCall",
+          id: response.id,
+          name: response.name,
+          arguments: structuredClone(response.arguments),
+        };
+        queueMicrotask(() => finishToolCall(toolCall));
+      } else {
+        queueMicrotask(() => finish(message(model, "stop", [{ type: "text", text: response.text }])));
+      }
+      return stream;
+    }
     if (mode === "success") {
       queueMicrotask(() => finish(message(model, "stop", [{ type: "text", text: controllerCell }])));
       return stream;
@@ -247,6 +301,8 @@ export const createOfflineProviderRuntimeFixture = async (
     })),
   });
   await modelRuntime.refresh({ allowNetwork: false });
+  const hostModel = modelRuntime.getModel(OFFLINE_PROVIDER_ID, "host");
+  if (!hostModel) throw new Error(`offline host model not registered: ${OFFLINE_HOST_MODEL}`);
 
   const agentDir = join(root, "agent");
   const runRoot = join(root, "private-runs");
@@ -276,7 +332,8 @@ export const createOfflineProviderRuntimeFixture = async (
       services,
       sessionManager: options.sessionManager,
       sessionStartEvent: options.sessionStartEvent,
-      noTools: "all",
+      model: hostModel,
+      tools: ["rlm_run"],
     });
     return { ...created, services, diagnostics: services.diagnostics };
   };
