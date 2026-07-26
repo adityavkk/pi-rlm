@@ -61,11 +61,11 @@ const readBounded = async (
   return new TextDecoder("utf-8", { fatal: true }).decode(joined);
 };
 
-const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number> => {
+const waitBounded = async (child: Child, work: readonly Promise<unknown>[]): Promise<number> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const exitCode = await Promise.race([
-      Promise.all([work, child.exited]).then(([, code]) => code),
+      Promise.all([...work, child.exited]).then((values) => values.at(-1) as number),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           child.kill("SIGKILL");
@@ -77,7 +77,7 @@ const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number
   } finally {
     if (timer) clearTimeout(timer);
     await killAndWait(child);
-    await Promise.allSettled([work]);
+    await Promise.allSettled([...work, child.exited]);
   }
 };
 
@@ -173,7 +173,7 @@ const runPrintAdapter = async (adapter: "text" | "json", outcome: "success" | "e
       });
       const stdout = readBounded(child.stdout as ReadableStream<Uint8Array>, child, "stdout");
       const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "stderr");
-      const exitCode = await waitBounded(child, Promise.all([stdout, stderr]));
+      const exitCode = await waitBounded(child, [stdout, stderr]);
       return { stdout: await stdout, stderr: await stderr, exitCode };
     });
     const fixtureResult = assertFixtureResult(await readBoundedJson(statePath));
@@ -192,6 +192,31 @@ const customEntryProjection = (result: FixtureResult): unknown => {
 };
 
 describe("offline provider through bounded public Pi adapters", () => {
+  test("watchdog reaps the child and settles every owned promise after one rejects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-adapter-owned-work-"));
+    const child = Bun.spawn(["bun", "--eval", "setInterval(() => {}, 1000)"], {
+      cwd: root,
+      env: isolatedEnv(root),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let siblingSettled = false;
+    const rejected = Promise.reject(new Error("injected owned-work failure"));
+    const sibling = new Promise<void>((resolve) => setTimeout(() => {
+      siblingSettled = true;
+      resolve();
+    }, 50));
+    try {
+      await expect(waitBounded(child, [rejected, sibling])).rejects.toThrow("injected owned-work failure");
+      expect(siblingSettled).toBe(true);
+      expect(Number.isInteger(await child.exited)).toBe(true);
+    } finally {
+      await killAndWait(child);
+      await Promise.allSettled([rejected, sibling, child.exited]);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, ADAPTER_TEST_TIMEOUT_MS);
+
   test.each([
     ["text", "success"], ["text", "error"], ["json", "success"], ["json", "error"],
   ] as const)("runPrintMode %s exposes exact bounded %s result", async (adapter, outcome) => {
@@ -286,11 +311,11 @@ describe("offline provider through bounded public Pi adapters", () => {
           }
         };
         const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "RPC stderr");
-        const interaction = (async () => {
-          await send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
-          await readOutput();
-        })();
-        const exitCode = await waitBounded(child, Promise.all([interaction, stderr]));
+        // Start stdout ownership before the first write. If that write fails,
+        // watchdog cleanup still kills the child and settles/releases both readers.
+        const outputWork = readOutput();
+        const initialSend = send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
+        const exitCode = await waitBounded(child, [initialSend, outputWork, stderr]);
         return { output, stderr: await stderr, exitCode };
       });
       expect(parent.fetchAttempts).toBe(0);
