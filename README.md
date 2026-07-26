@@ -59,6 +59,15 @@ pi install /path/to/pi-rlm
 pi
 ```
 
+Version 1 agent delegation also requires the separately active, pinned bridge:
+
+```bash
+pi install npm:pi-subagents@0.36.0
+```
+
+The optional package peer provides public protocol types but does not activate
+that extension. See [agent delegation](docs/agent-delegation.md).
+
 ## Usage
 
 Start a run explicitly. pi-rlm never escalates an ordinary task on its own.

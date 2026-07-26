@@ -8,7 +8,8 @@
   "exports": {
     ".": "./index.ts",
     "./core": "./src/core/index.ts",
-    "./runtime": "./src/runtime/index.ts"
+    "./runtime": "./src/runtime/index.ts",
+    "./delegation": "./src/shell/delegation/index.ts"
   },
   "repository": {
     "type": "git",
@@ -58,6 +59,7 @@
     "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
     "@earendil-works/pi-tui": "0.80.10",
+    "pi-subagents": "0.36.0",
     "typebox": "1.1.38"
   },
   "peerDependenciesMeta": {
@@ -72,6 +74,9 @@
     },
     "@earendil-works/pi-tui": {
       "optional": true
+    },
+    "pi-subagents": {
+      "optional": true
     }
   },
   "devDependencies": {
@@ -81,6 +86,7 @@
     "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
     "@earendil-works/pi-tui": "0.80.10",
+    "pi-subagents": "0.36.0",
     "typebox": "1.1.38"
   }
 }
