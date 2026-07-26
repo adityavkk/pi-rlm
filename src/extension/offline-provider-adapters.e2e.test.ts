@@ -26,11 +26,8 @@ const isolatedEnv = (root: string): Record<string, string> => ({
 type Child = ReturnType<typeof Bun.spawn>;
 
 const killAndWait = async (child: Child): Promise<void> => {
-  if (child.exitCode === null) child.kill();
-  await Promise.race([
-    child.exited.then(() => undefined),
-    new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-  ]);
+  if (child.exitCode === null) child.kill("SIGKILL");
+  await child.exited;
 };
 
 const readBounded = async (
@@ -47,7 +44,7 @@ const readBounded = async (
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
       if (bytes > MAX_ADAPTER_BYTES) {
-        child.kill();
+        child.kill("SIGKILL");
         throw new Error(`${label} exceeded ${MAX_ADAPTER_BYTES} bytes`);
       }
       chunks.push(chunk.value);
@@ -71,7 +68,7 @@ const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number
       Promise.all([work, child.exited]).then(([, code]) => code),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          child.kill();
+          child.kill("SIGKILL");
           reject(new Error(`adapter exceeded ${ADAPTER_TIMEOUT_MS}ms`));
         }, ADAPTER_TIMEOUT_MS);
       }),
