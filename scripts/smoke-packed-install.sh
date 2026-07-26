@@ -5,6 +5,12 @@ root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/smoke-packed-install-args.sh
 source "$root_dir/scripts/smoke-packed-install-args.sh"
 host_path=${PATH:?}
+env_bin=/usr/bin/env
+uname_bin=/usr/bin/uname
+if [[ ! -x "$env_bin" || ! -x "$uname_bin" ]]; then
+  echo "packed smoke requires trusted /usr/bin/env and /usr/bin/uname" >&2
+  exit 1
+fi
 tmp_dir=""
 cleanup() {
   if [[ -n "$tmp_dir" ]]; then
@@ -31,7 +37,7 @@ prepare_roots() {
 isolated() {
   local base=$1
   shift
-  env -i \
+  "$env_bin" -i \
     HOME="$base/home" \
     PATH="$host_path" \
     XDG_CONFIG_HOME="$base/config" \
@@ -57,7 +63,7 @@ isolated() {
 runtime_network_denied() {
   local base=$1
   shift
-  case "$(uname -s)" in
+  case "$("$uname_bin" -s)" in
     Darwin)
       if [[ ! -x /usr/bin/sandbox-exec ]]; then
         echo "packed smoke requires sandbox-exec for runtime network denial" >&2
@@ -78,7 +84,7 @@ runtime_network_denied() {
       fi
       ;;
     *)
-      echo "packed smoke has no network-denial backend for $(uname -s)" >&2
+      echo "packed smoke has no network-denial backend for $("$uname_bin" -s)" >&2
       return 1
       ;;
   esac
@@ -152,7 +158,7 @@ NODE
 
   if ! (
     cd "$fixture"
-    runtime_network_denied "$case_dir" env \
+    runtime_network_denied "$case_dir" "$env_bin" \
       NO_COLOR=1 \
       PI_OFFLINE=1 \
       PI_TELEMETRY=0 \

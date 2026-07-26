@@ -3,6 +3,12 @@ set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 host_path=${PATH:?}
+env_bin=/usr/bin/env
+bash_bin=/bin/bash
+if [[ ! -x "$env_bin" || ! -x "$bash_bin" ]]; then
+  echo "packed isolation test requires trusted /usr/bin/env and /bin/bash" >&2
+  exit 1
+fi
 wrapper_tmp=""
 cleanup() {
   if [[ -n "$wrapper_tmp" ]]; then
@@ -37,14 +43,14 @@ mkdir -p \
 chmod -R a-w "$sentinel"
 
 snapshot() {
-  env -i PATH="$host_path" HOME="$wrapper_tmp" \
+  "$env_bin" -i PATH="$host_path" HOME="$wrapper_tmp" \
     node "$root_dir/scripts/smoke-packed-install-parser.mjs" snapshot "$sentinel"
 }
 before="$wrapper_tmp/before.txt"
 after="$wrapper_tmp/after.txt"
 snapshot > "$before"
 
-env -i \
+"$env_bin" -i \
   HOME="$sentinel/home" \
   PATH="$host_path" \
   XDG_CONFIG_HOME="$sentinel/config" \
@@ -65,7 +71,24 @@ env -i \
   BUN_RUNTIME_TRANSPILER_CACHE_PATH="$sentinel/bun-transpiler-cache" \
   TMPDIR="$smoke_tmp" \
   NODE_OPTIONS=--pi-rlm-smoke-must-strip-caller-node-options \
-  bash "$root_dir/scripts/smoke-packed-install.sh"
+  "$bash_bin" "$root_dir/scripts/smoke-packed-install.sh"
+
+# A caller-exported function must never intercept the isolation executable.
+hostile_marker="$wrapper_tmp/hostile-env-intercepted"
+env() {
+  : > "$HOSTILE_ENV_MARKER"
+  /usr/bin/env "$@"
+}
+export -f env
+export HOSTILE_ENV_MARKER="$hostile_marker"
+NODE_OPTIONS=--pi-rlm-smoke-must-strip-caller-node-options \
+  "$bash_bin" "$root_dir/scripts/smoke-packed-install.sh"
+unset -f env
+unset HOSTILE_ENV_MARKER
+if [[ -e "$hostile_marker" ]]; then
+  echo "packed smoke invoked a caller-exported env function" >&2
+  exit 1
+fi
 
 snapshot > "$after"
 if ! cmp -s "$before" "$after"; then
