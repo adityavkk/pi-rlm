@@ -164,6 +164,12 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
   return ok({ events, verifiedBytes, batchIds });
 };
 
+/** Parse one bounded journal snapshot without repairing or writing it. */
+export const parseJournalBytes = (raw: Uint8Array): Result<readonly RlmEvent[], InterpreterError> => {
+  const scanned = scanJournal(raw);
+  return scanned.ok ? ok(scanned.value.events) : scanned;
+};
+
 const isMissing = (error: unknown): boolean =>
   typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 

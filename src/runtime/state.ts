@@ -59,6 +59,8 @@ export interface RunState {
   readonly inflight: Map<string, Promise<GuestCallResult>>;
   readonly keyIdentities: Map<string, KeyIdentityBinding>;
   readonly scopeUsage: Map<string, CallUsage>;
+  /** Highest durable-attempt ordinal reserved for each frame and operation identity. */
+  readonly operationAttempts: Map<string, number>;
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
   readonly agentDelegation?: AgentDelegationRuntime;

@@ -544,17 +544,20 @@ describe("bounded fallback extraction", () => {
       program: program(), sources: { context: "represented source" }, backend, dir,
       controller: new MockController([]), model: new MockModelClient(() => "unused", modelIdentity("src/runtime/fallback-extraction.test.ts:533")),
       signal: new AbortController().signal,
-      profile: boundedProfile({ maxControllerTurns: 0, storedByteLimit: 1 }),
+      profile: boundedProfile({ maxControllerTurns: 0, storedByteLimit: Buffer.byteLength("represented source") + 1 }),
       extractor: new FunctionExtractor((evidence) => ({
         ok: true,
         value: { answer: "too large" },
         evidenceRefs: [evidence.handles[0]!.evidenceId!],
       }), "external", extractorIdentity("src/runtime/fallback-extraction.test.ts:536")),
     });
-    expect(result).toMatchObject({ status: "failed", error: { code: "BUDGET_BYTES" }, ledger: { usage: { storedBytes: 0 } } });
+    expect(result).toMatchObject({
+      status: "failed", error: { code: "BUDGET_BYTES" },
+      ledger: { usage: { storedBytes: Buffer.byteLength("represented source") } },
+    });
     const journal = await events(dir);
     expect(journal.filter((event) => event.type === "answer_committed")).toHaveLength(0);
     expect(terminals(journal)).toHaveLength(1);
-    expect(await readdir(dir)).not.toContain("contexts");
+    expect((await readdir(join(dir, "contexts"))).filter((name) => name.endsWith(".bin"))).toHaveLength(1);
   });
 });

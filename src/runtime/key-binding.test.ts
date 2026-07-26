@@ -50,6 +50,7 @@ const makeState = async (append: (event: RlmEvent) => Promise<unknown>, model?: 
     inflight: new Map(),
     keyIdentities: new Map(),
     scopeUsage: new Map(),
+    operationAttempts: new Map(),
     semaphore: new Semaphore(DEFAULT_PROFILE.maxConcurrency),
     contextSemaphore: new Semaphore(1),
     agentAttempts: new Map(),

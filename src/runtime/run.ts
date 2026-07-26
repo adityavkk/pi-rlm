@@ -448,6 +448,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
   let phase: Phase = "journal";
   let planned: PlannedResult | undefined;
+  let runStartedDurable = false;
 
   const sourceControl = (): ContextOperationControl => ({
     checkpoint: () => {
@@ -492,8 +493,10 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
           })),
         });
         sourceDurable = outcome.event === "committed";
+        runStartedDurable = sourceDurable;
       } catch (error) {
         sourceDurable = error instanceof JournalAppendError && error.eventDurable;
+        runStartedDurable = sourceDurable;
         throw error;
       }
       if (!sourceDurable) throw new Error("run start ignored after terminal");
@@ -540,6 +543,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       inflight: new Map(),
       keyIdentities: new Map(),
       scopeUsage: new Map(),
+      operationAttempts: new Map(),
       semaphore: new Semaphore(profile.maxConcurrency),
       contextSemaphore: new Semaphore(1),
       ...(agentDelegationRuntime ? { agentDelegation: agentDelegationRuntime } : {}),
@@ -667,5 +671,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     scope.dispose();
   }
 
-  return finalize(journal, rootFrameId, planned ?? failure(runId, "FAILED", "run failed"), ledgerRef);
+  const result = planned ?? failure(runId, "FAILED", "run failed");
+  if (!runStartedDurable) return { ...result, ledger: ledgerRef.current };
+  return finalize(journal, rootFrameId, result, ledgerRef);
 };

@@ -14,4 +14,5 @@ export type { FrameResult } from "./frame.ts";
 export type { RunState, FrameRef, ArtifactDescriptor } from "./state.ts";
 export * from "./run-manifest.ts";
 export * from "./run-retention.ts";
+export * from "./run-recovery.ts";
 export { runProgram, RLM_DSL_VERSION, type RunInput, type RunLifecycleHooks, type RunResult, type RunWarning } from "./run.ts";

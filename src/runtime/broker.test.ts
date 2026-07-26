@@ -66,6 +66,7 @@ const brokerState = async (model: ModelClient, runId: string, clock: Clock = sys
     inflight: new Map(),
     keyIdentities: new Map(),
     scopeUsage: new Map(),
+    operationAttempts: new Map(),
     semaphore: new Semaphore(1),
     contextSemaphore: new Semaphore(1),
     agentAttempts: new Map(),
@@ -166,6 +167,7 @@ describe("dispatchCall cancellation ownership", () => {
       inflight: new Map(),
       keyIdentities: new Map(),
       scopeUsage: new Map(),
+      operationAttempts: new Map(),
       semaphore: new ObservedSemaphore(1, () => {
         leafAcquireRequests += 1;
         if (leafAcquireRequests === 2) markWaiterQueued();
@@ -309,6 +311,7 @@ describe("dispatchCall cancellation ownership", () => {
       inflight: new Map(),
       keyIdentities: new Map(),
       scopeUsage: new Map(),
+      operationAttempts: new Map(),
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       agentAttempts: new Map(),
