@@ -76,6 +76,8 @@ const waitBounded = async (child: Child, work: Promise<unknown>): Promise<number
     return exitCode;
   } finally {
     if (timer) clearTimeout(timer);
+    await killAndWait(child);
+    await Promise.allSettled([work]);
   }
 };
 
@@ -242,46 +244,53 @@ describe("offline provider through bounded public Pi adapters", () => {
           stdin.write(`${JSON.stringify(value)}\n`);
           await stdin.flush();
         };
-        await send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
         const readOutput = async (): Promise<void> => {
-          while (true) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            totalBytes += chunk.value.byteLength;
-            if (totalBytes > MAX_ADAPTER_BYTES) {
-              child!.kill();
-              throw new Error(`RPC stdout exceeded ${MAX_ADAPTER_BYTES} bytes`);
+          try {
+            while (true) {
+              const chunk = await reader.read();
+              if (chunk.done) break;
+              totalBytes += chunk.value.byteLength;
+              if (totalBytes > MAX_ADAPTER_BYTES) {
+                child!.kill("SIGKILL");
+                throw new Error(`RPC stdout exceeded ${MAX_ADAPTER_BYTES} bytes`);
+              }
+              pending += decoder.decode(chunk.value, { stream: true });
+              let newline: number;
+              while ((newline = pending.indexOf("\n")) >= 0) {
+                const line = pending.slice(0, newline);
+                pending = pending.slice(newline + 1);
+                if (!line) continue;
+                if (Buffer.byteLength(line, "utf8") > MAX_RPC_LINE_BYTES) {
+                  child!.kill("SIGKILL");
+                  throw new Error(`RPC record exceeded ${MAX_RPC_LINE_BYTES} bytes`);
+                }
+                output.push(JSON.parse(line) as Record<string, any>);
+                if (output.length > MAX_RPC_RECORDS) {
+                  child!.kill("SIGKILL");
+                  throw new Error(`RPC exceeded ${MAX_RPC_RECORDS} records`);
+                }
+                const event = output.at(-1)!;
+                if (!requestedEntries && event["type"] === "message_end"
+                  && event["message"]?.customType === "pi-rlm-result") {
+                  requestedEntries = true;
+                  await send({ id: "entries", type: "get_entries" });
+                } else if (event["type"] === "response" && event["id"] === "entries") {
+                  stdin.end();
+                }
+              }
             }
-            pending += decoder.decode(chunk.value, { stream: true });
-            let newline: number;
-            while ((newline = pending.indexOf("\n")) >= 0) {
-              const line = pending.slice(0, newline);
-              pending = pending.slice(newline + 1);
-              if (!line) continue;
-              if (Buffer.byteLength(line, "utf8") > MAX_RPC_LINE_BYTES) {
-                child!.kill();
-                throw new Error(`RPC record exceeded ${MAX_RPC_LINE_BYTES} bytes`);
-              }
-              output.push(JSON.parse(line) as Record<string, any>);
-              if (output.length > MAX_RPC_RECORDS) {
-                child!.kill();
-                throw new Error(`RPC exceeded ${MAX_RPC_RECORDS} records`);
-              }
-              const event = output.at(-1)!;
-              if (!requestedEntries && event["type"] === "message_end"
-                && event["message"]?.customType === "pi-rlm-result") {
-                requestedEntries = true;
-                await send({ id: "entries", type: "get_entries" });
-              } else if (event["type"] === "response" && event["id"] === "entries") {
-                stdin.end();
-              }
-            }
+            pending += decoder.decode();
+            if (pending.length !== 0) throw new Error("RPC stdout ended with an incomplete record");
+          } finally {
+            reader.releaseLock();
           }
-          pending += decoder.decode();
-          if (pending.length !== 0) throw new Error("RPC stdout ended with an incomplete record");
         };
         const stderr = readBounded(child.stderr as ReadableStream<Uint8Array>, child, "RPC stderr");
-        const exitCode = await waitBounded(child, Promise.all([readOutput(), stderr]));
+        const interaction = (async () => {
+          await send({ id: "prompt", type: "prompt", message: OFFLINE_COMMAND });
+          await readOutput();
+        })();
+        const exitCode = await waitBounded(child, Promise.all([interaction, stderr]));
         return { output, stderr: await stderr, exitCode };
       });
       expect(parent.fetchAttempts).toBe(0);
