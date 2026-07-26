@@ -70,6 +70,7 @@ const brokerState = async (model: ModelClient, runId: string, clock: Clock = sys
     semaphore: new Semaphore(1),
     contextSemaphore: new Semaphore(1),
     agentAttempts: new Map(),
+    recurseExecutions: new Map(),
     frameSeq: { current: 1 },
   };
 };
@@ -179,6 +180,7 @@ describe("dispatchCall cancellation ownership", () => {
         () => { retentionReleaseInvocations += 1; },
       ),
       agentAttempts: new Map(),
+    recurseExecutions: new Map(),
       frameSeq: { current: 1 },
     };
     const frame: FrameRef = { frameId: "frame", depth: 0, objective: "test", inputs: {}, outputs: [] };
@@ -315,6 +317,7 @@ describe("dispatchCall cancellation ownership", () => {
       semaphore: new Semaphore(1),
       contextSemaphore: new Semaphore(1),
       agentAttempts: new Map(),
+    recurseExecutions: new Map(),
       frameSeq: { current: 1 },
     };
     const result = await dispatchCall(

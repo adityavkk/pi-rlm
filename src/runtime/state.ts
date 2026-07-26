@@ -65,6 +65,8 @@ export interface RunState {
   readonly contextSemaphore: Semaphore;
   readonly agentDelegation?: AgentDelegationRuntime;
   readonly agentAttempts: Map<string, number>;
+  /** Stable per-call recurse execution ordinal. Retries must not reopen one frame identity. */
+  readonly recurseExecutions: Map<string, number>;
   readonly frameSeq: { current: number };
 }
 
