@@ -49,6 +49,12 @@ describe("QuickJsBackend", () => {
     }
   });
 
+  test("does not expose direct host tools in the version 1 guest", async () => {
+    const out = await run("[typeof agent, typeof tools]");
+    expect(out.kind).toBe("value");
+    if (out.kind === "value") expect(out.result).toEqual(["function", "undefined"]);
+  });
+
   test("round-trips and mutates workspace", async () => {
     const out = await run("workspace.n = (workspace.n ?? 0) + 1;\nworkspace.n", { workspace: { n: 4 } });
     expect(out.kind).toBe("value");
