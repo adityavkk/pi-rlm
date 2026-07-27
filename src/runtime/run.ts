@@ -548,6 +548,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       contextSemaphore: new Semaphore(1),
       ...(agentDelegationRuntime ? { agentDelegation: agentDelegationRuntime } : {}),
       agentAttempts: new Map(),
+      recurseExecutions: new Map(),
       frameSeq: { current: 1 },
     };
     const rootFrame: FrameRef = {

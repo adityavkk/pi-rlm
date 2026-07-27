@@ -101,7 +101,7 @@ export const validateRecoveryJournal = (
   const program = normalized.value;
   const frames = new Map<string, FrameRecord>();
   const cells = new Map<string, Extract<RlmEvent, { type: "cell_committed" }>>();
-  const calls = new Map<string, CallEvent>();
+  const calls = new Map<string, CallEvent[]>();
   const keys = new Map<string, Extract<RlmEvent, { type: "key_bound" }>>();
   const approvals = new Map<string, Extract<RlmEvent, { type: "agent_approval" }>>();
   const attemptEvents = new Map<string, Extract<RlmEvent, { type: "provider_attempted" }>>();
@@ -203,8 +203,14 @@ export const validateRecoveryJournal = (
       case "call_committed": {
         const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
         if (!binding || event.cached) semanticError("committed call lacks one prior key binding");
-        if (rememberExact(calls, event.callId, event, "call"))
-          content.push(reference("call", event.outputRef, event.outputSha256, event.outputBytes, event));
+        const executions = calls.get(event.callId) ?? [];
+        const prior = executions.at(-1);
+        if (prior && same(prior, event)) break;
+        if (prior && (prior.frameId !== event.frameId || prior.kind !== event.kind || prior.key !== event.key
+          || prior.ok)) semanticError("invalid repeated call execution");
+        executions.push(event);
+        calls.set(event.callId, executions);
+        content.push(reference("call", event.outputRef, event.outputSha256, event.outputBytes, event));
         break;
       }
       case "answer_committed":
@@ -273,14 +279,32 @@ export const validateRecoveryJournal = (
   if (terminal) {
     for (const frame of frames.values()) if (!frame.closed) semanticError("terminal run has an open frame");
     if (terminal.type === "run_completed") {
+      const childExecutions = new Map<string, Array<{ ordinal: number; frame: FrameRecord }>>();
       for (const frame of frames.values()) {
         if (frame.opened.parentFrameId === null) continue;
         const prefix = `${runId}:frame:`;
-        const callId = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
-        const call = calls.get(callId);
-        if (!call || call.kind !== "recurse" || call.frameId !== frame.opened.parentFrameId)
-          semanticError("completed child frame lacks its parent recurse call");
+        const suffix = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
+        const match = /^(call_recurse_[a-f0-9]{64}):e([1-9][0-9]*)$/.exec(suffix);
+        if (!match)
+          throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "completed child frame has an invalid execution identity");
+        const grouped = childExecutions.get(match[1]!) ?? [];
+        grouped.push({ ordinal: Number(match[2]), frame });
+        childExecutions.set(match[1]!, grouped);
       }
+      for (const [callId, executions] of calls) {
+        const last = executions.at(-1)!;
+        if (last.kind !== "recurse") continue;
+        const children = (childExecutions.get(callId) ?? []).sort((left, right) => left.ordinal - right.ordinal);
+        if (children.length !== executions.length) semanticError("recurse call executions do not match child frames");
+        children.forEach((child, index) => {
+          const call = executions[index]!;
+          if (child.ordinal !== index + 1 || call.frameId !== child.frame.opened.parentFrameId
+            || call.kind !== "recurse" || call.ok !== (child.frame.closed?.state === "answered"))
+            semanticError("recurse call execution does not match its child frame");
+        });
+        childExecutions.delete(callId);
+      }
+      if (childExecutions.size > 0) semanticError("completed child frame lacks its recurse call execution");
       if (!root?.answer || root.closed?.state !== "answered" || root.answer.completionMode !== terminal.completionMode
         || terminal.outputRef === undefined || terminal.outputRef !== root.answer.outputRef)
         throw new RunRecoveryError("RECOVERY_TERMINAL_INCONSISTENT", "completed terminal lacks one matching root answer");

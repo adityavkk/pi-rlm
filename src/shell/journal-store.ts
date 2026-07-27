@@ -164,10 +164,22 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
   return ok({ events, verifiedBytes, batchIds });
 };
 
+export interface ParsedJournalSnapshot {
+  readonly events: readonly RlmEvent[];
+  /** Complete, checksummed JSONL prefix. A torn final record is excluded. */
+  readonly verifiedBytes: number;
+}
+
 /** Parse one bounded journal snapshot without repairing or writing it. */
-export const parseJournalBytes = (raw: Uint8Array): Result<readonly RlmEvent[], InterpreterError> => {
+export const parseJournalSnapshotBytes = (raw: Uint8Array): Result<ParsedJournalSnapshot, InterpreterError> => {
   const scanned = scanJournal(raw);
-  return scanned.ok ? ok(scanned.value.events) : scanned;
+  return scanned.ok ? ok({ events: scanned.value.events, verifiedBytes: scanned.value.verifiedBytes }) : scanned;
+};
+
+/** Compatibility projection for callers which only need committed events. */
+export const parseJournalBytes = (raw: Uint8Array): Result<readonly RlmEvent[], InterpreterError> => {
+  const parsed = parseJournalSnapshotBytes(raw);
+  return parsed.ok ? ok(parsed.value.events) : parsed;
 };
 
 const isMissing = (error: unknown): boolean =>

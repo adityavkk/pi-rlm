@@ -54,6 +54,7 @@ const makeState = async (append: (event: RlmEvent) => Promise<unknown>, model?: 
     semaphore: new Semaphore(DEFAULT_PROFILE.maxConcurrency),
     contextSemaphore: new Semaphore(1),
     agentAttempts: new Map(),
+    recurseExecutions: new Map(),
     frameSeq: { current: 1 },
   };
 };

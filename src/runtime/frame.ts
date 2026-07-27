@@ -412,7 +412,9 @@ const runChild = async (
       logicalReserved = true;
 
       state.scopeUsage.set(callId, ZERO_CALL_USAGE);
-      const childFrameId = `${state.runId}:frame:${callId}`;
+      const execution = (state.recurseExecutions.get(callId) ?? 0) + 1;
+      state.recurseExecutions.set(callId, execution);
+      const childFrameId = `${state.runId}:frame:${callId}:e${execution}`;
       await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
       if (signal.aborted) return cancelled();
 

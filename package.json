@@ -1,6 +1,6 @@
 {
   "name": "pi-rlm",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Recursive Language Model runtime for Pi: a controller model writes bounded JavaScript cells over host-backed long context, calling models, agents, and child RLM frames.",
   "author": "Aditya Kishore",
   "license": "MIT",
