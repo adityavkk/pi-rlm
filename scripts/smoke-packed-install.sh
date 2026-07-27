@@ -12,7 +12,20 @@ if [[ ! -x "$env_bin" || ! -x "$uname_bin" ]]; then
   exit 1
 fi
 tmp_dir=""
+active_group_pid=""
+terminate_active_group() {
+  if [[ -z "$active_group_pid" ]]; then return; fi
+  /bin/kill -TERM "-$active_group_pid" 2>/dev/null || true
+  for _ in {1..50}; do
+    if ! /bin/kill -0 "-$active_group_pid" 2>/dev/null; then break; fi
+    /bin/sleep 0.1
+  done
+  /bin/kill -KILL "-$active_group_pid" 2>/dev/null || true
+  wait "$active_group_pid" 2>/dev/null || true
+  active_group_pid=""
+}
 cleanup() {
+  terminate_active_group
   if [[ -n "$tmp_dir" ]]; then
     chmod -R u+w "$tmp_dir" 2>/dev/null || true
     rm -rf "$tmp_dir"
@@ -126,8 +139,13 @@ process.stdout.write(JSON.stringify({
   private: true,
   type: "module",
   dependencies: {
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "typebox": "1.1.38",
     "pi-rlm": `file:${tarball}`,
+    "pi-subagents": "0.36.0",
   },
 }, null, 2));
 NODE
@@ -221,3 +239,27 @@ process.stdout.write(JSON.stringify({
 }, null, 2));
 NODE
 run_pi installed
+
+prepare_case active-subagents
+set -m
+(
+  cd "$tmp_dir/active-subagents/fixture"
+  runtime_network_denied "$tmp_dir/active-subagents" "$env_bin" \
+    NO_COLOR=1 \
+    PI_OFFLINE=1 \
+    PI_TELEMETRY=0 \
+    PI_SKIP_VERSION_CHECK=1 \
+    PI_RLM_TEST_PI_BIN="$tmp_dir/active-subagents/fixture/node_modules/.bin/pi" \
+    bun test "$tmp_dir/active-subagents/fixture/node_modules/pi-rlm/src/extension/active-subagents.integration.test.ts"
+) &
+active_group_pid=$!
+set +e
+wait "$active_group_pid"
+active_status=$?
+set -e
+terminate_active_group
+set +m
+if [[ $active_status -ne 0 ]]; then
+  echo "active pi-subagents packed fixture failed" >&2
+  exit "$active_status"
+fi
