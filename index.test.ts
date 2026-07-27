@@ -33,6 +33,8 @@ interface CapturedTool {
   name: string;
   promptSnippet?: string;
   promptGuidelines?: string[];
+  renderCall?: (...args: unknown[]) => { render(width: number): string[] };
+  renderResult?: (...args: unknown[]) => { render(width: number): string[] };
   execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<ToolResult>;
 }
 
@@ -62,6 +64,7 @@ const harness = (options: {
   const resultMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const notifications: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
+  const widgets: Array<{ key: string; content: unknown; options?: unknown }> = [];
   const runs: unknown[] = [];
   const initializationAuditCounts: number[] = [];
   const runSignals: AbortSignal[] = [];
@@ -69,6 +72,8 @@ const harness = (options: {
   let clock = 100;
   let nextId = 0;
   let hasUI = true;
+  let mode: "tui" | "rpc" | "print" | "json" = "tui";
+  let widgetFault = false;
   let confirm: (title: string, message: string) => boolean | Promise<boolean> = () => true;
   let appendFaultType: string | undefined;
 
@@ -76,7 +81,7 @@ const harness = (options: {
     get hasUI() {
       return hasUI;
     },
-    mode: "tui",
+    get mode() { return mode; },
     cwd: process.cwd(),
     isProjectTrusted: () => true,
     sessionManager: {
@@ -90,6 +95,10 @@ const harness = (options: {
       },
       notify: (message: string) => notifications.push(message),
       setStatus: () => {},
+      setWidget: (key: string, content: unknown, options?: unknown) => {
+        if (widgetFault) throw new Error("widget fault");
+        widgets.push({ key, content, options });
+      },
     },
   };
 
@@ -140,6 +149,7 @@ const harness = (options: {
     resultMessages,
     notifications,
     confirmations,
+    widgets,
     runs,
     initializationAuditCounts,
     runSignals,
@@ -154,8 +164,10 @@ const harness = (options: {
     },
     setHasUI: (value: boolean) => {
       hasUI = value;
-      ctx.mode = value ? "tui" : "print";
+      mode = value ? "tui" : "print";
     },
+    setMode: (value: typeof mode) => { mode = value; },
+    setWidgetFault: (value: boolean) => { widgetFault = value; },
     setConfirm: (value: typeof confirm) => {
       confirm = value;
     },
@@ -432,6 +444,45 @@ describe("pi-rlm extension wiring", () => {
     expect(LAUNCH_SNIPPET).toContain("always requires exact-request host confirmation");
     expect(tool.promptSnippet).toContain("explicitly requested");
     expect(tool.promptGuidelines?.every((guideline) => guideline.includes("rlm_run"))).toBe(true);
+  });
+
+  test("tool render adapters never expose raw content when details are hostile", () => {
+    const h = harness();
+    const tool = rlmTool(h);
+    expect(tool.renderCall!({}, {}, {}).render(40)).toEqual(["RLM run"]);
+    const hostile = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error("raw answer"); } });
+    const result = new Proxy({ content: [{ type: "text", text: "RAW SECRET" }] }, {
+      getOwnPropertyDescriptor: () => { throw new Error("raw result"); },
+    });
+    expect(() => tool.renderResult!(result, {}, {}, {}).render(80)).not.toThrow();
+    expect(tool.renderResult!(result, {}, {}, {}).render(80)).toEqual(["RLM failed · RLM_RESULT_INVALID"]);
+    expect(tool.renderResult!({ details: hostile }, {}, {}, {}).render(80).join("\n")).not.toContain("RAW");
+  });
+
+  test("widget installs only in TUI mode and disposes on session replacement", async () => {
+    const rpc = harness();
+    rpc.setMode("rpc");
+    await rpc.emit("session_start", { reason: "startup" });
+    expect(rpc.widgets).toHaveLength(0);
+
+    const coordinator = createRunCoordinator();
+    const tui = harness({ runCoordinator: coordinator });
+    await tui.emit("session_start", { reason: "startup" });
+    expect(tui.widgets).toHaveLength(1);
+    let renders = 0;
+    const factory = tui.widgets[0]?.content as (tui: { requestRender(): void }) => { render(width: number): string[] };
+    const widget = factory({ requestRender: () => { renders += 1; } });
+    coordinator.setSession("session-1", 1);
+    coordinator.create({ sessionId: "session-1", authorizationGeneration: 1, objective: "active" });
+    expect(renders).toBe(1);
+    expect(widget.render(80)[0]).toContain("RLM running");
+    await tui.emit("session_before_switch");
+    expect(widget.render(80)).toEqual([]);
+    expect(tui.widgets.at(-1)?.content).toBeUndefined();
+    expect(renders).toBe(3);
+
+    tui.setWidgetFault(true);
+    await expect(tui.emit("session_start", { reason: "resume" })).resolves.toBeUndefined();
   });
 
   test("positive prompt wording still requires confirmation of exact normalized identity", async () => {
