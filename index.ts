@@ -65,6 +65,11 @@ import {
   type RlmResultMetadata,
   type RlmResultProjection,
 } from "./src/extension/result.ts";
+import { RunWidget } from "./src/extension/tui/run-widget.ts";
+import {
+  renderRlmRunCallComponent,
+  renderRlmToolResultComponent,
+} from "./src/extension/tui/result-renderer.ts";
 
 export const LAUNCH_SNIPPET =
   "pi-rlm runs long-context recursive model/agent workflows in a sandboxed JS controller. " +
@@ -555,12 +560,48 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   pi.on("agent_end", () => {
     inputCorrelation = undefined;
   });
-  pi.on("session_before_switch", invalidateAuthorization);
-  pi.on("session_before_fork", invalidateAuthorization);
-  pi.on("session_start", (event) => {
+  let runWidget: RunWidget | undefined;
+  let widgetContext: ExtensionContext | undefined;
+  const unsubscribeWidget = runCoordinator.subscribe((runs) => runWidget?.update(runs));
+  const clearWidget = (): void => {
+    const current = widgetContext;
+    const widget = runWidget;
+    widgetContext = undefined;
+    runWidget = undefined;
+    try { widget?.dispose(); } catch { /* Component disposal is best-effort and idempotent. */ }
+    if (current?.mode === "tui") {
+      try { current.ui.setWidget("pi-rlm-runs", undefined); } catch { /* Best-effort UI cleanup. */ }
+    }
+  };
+  const installWidget = (ctx: ExtensionContext): void => {
+    clearWidget();
+    if (ctx.mode !== "tui") return;
+    widgetContext = ctx;
+    try {
+      ctx.ui.setWidget("pi-rlm-runs", (tui) => {
+        const widget = new RunWidget(runCoordinator.list(), () => tui.requestRender());
+        runWidget = widget;
+        return widget;
+      }, { placement: "aboveEditor" });
+    } catch {
+      const widget = runWidget;
+      widgetContext = undefined;
+      runWidget = undefined;
+      try { widget?.dispose(); } catch { /* Best-effort failed-install cleanup. */ }
+    }
+  };
+
+  pi.on("session_before_switch", () => { invalidateAuthorization(); clearWidget(); });
+  pi.on("session_before_fork", () => { invalidateAuthorization(); clearWidget(); });
+  pi.on("session_start", (event, ctx) => {
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") invalidateAuthorization();
+    installWidget(ctx);
   });
-  pi.on("session_shutdown", invalidateAuthorization);
+  pi.on("session_shutdown", () => {
+    invalidateAuthorization();
+    clearWidget();
+    unsubscribeWidget();
+  });
 
   pi.registerCommand("rlm", {
     description: "Start a host-authorized pi-rlm run with an explicit source.",
@@ -738,6 +779,8 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       "Do not use rlm_run for routine tasks one agent can complete directly.",
     ],
     parameters: RlmRunParams,
+    renderCall: () => renderRlmRunCallComponent(),
+    renderResult: (result) => renderRlmToolResultComponent(result),
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<RlmResultMetadata>> {
       const toolSignal = signal ?? new AbortController().signal;
       const callKey = `${ctx.sessionManager.getSessionId()}:${toolCallId}`;
