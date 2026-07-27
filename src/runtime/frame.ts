@@ -9,7 +9,7 @@
  * tree-wide ledger.
  */
 
-import { budgetView, openFrame, releaseLogicalCall, reserveControllerTurn, reserveLogicalCall } from "../core/budget.ts";
+import { budgetView, openFrame, reserveControllerTurn, reserveLogicalCall } from "../core/budget.ts";
 import { type CallError, callError, type InterpreterError, interpreterError } from "../core/errors.ts";
 import { deriveCallId } from "../core/ids.ts";
 import type { RlmEvent } from "../core/journal.ts";
@@ -400,22 +400,25 @@ const runChild = async (
     inputs[i === 0 ? "context" : `context${i + 1}`] = context;
   });
 
+  let logicalCallReserved = false;
   let task!: Promise<GuestCallResult>;
   task = (async (): Promise<GuestCallResult> => {
-    let logicalReserved = false;
+    let frameActive = false;
     try {
       const reserved = reserveLogicalCall(state.ledger.current, state.clock.now());
       if (!reserved.ok) return errResult(callId, reserved.error, ZERO_CALL_USAGE, false);
       const opened = openFrame(reserved.value, parentFrame.depth + 1);
       if (!opened.ok) return errResult(callId, opened.error, ZERO_CALL_USAGE, false);
       state.ledger.current = opened.value;
-      logicalReserved = true;
+      logicalCallReserved = true;
 
       state.scopeUsage.set(callId, ZERO_CALL_USAGE);
       const execution = (state.recurseExecutions.get(callId) ?? 0) + 1;
       state.recurseExecutions.set(callId, execution);
       const childFrameId = `${state.runId}:frame:${callId}:e${execution}`;
       await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
+      state.progress?.frameOpened();
+      frameActive = true;
       if (signal.aborted) return cancelled();
 
       const childFrame: FrameRef = {
@@ -433,6 +436,8 @@ const runChild = async (
 
       const finalState = result.answer !== undefined ? "answered" : result.terminal ? "failed" : "closed";
       await state.journal.append({ type: "frame_closed", frameId: childFrameId, state: finalState });
+      state.progress?.frameClosed();
+      frameActive = false;
       if (signal.aborted) return cancelled();
 
       const usage = recurseUsage();
@@ -456,23 +461,33 @@ const runChild = async (
         ok: callResult.ok,
         usage,
       }, signal, deadlineMs, callResult.ok);
-      logicalReserved = false;
       return retained;
     } catch (error) {
       if (wasAborted(error, signal)) return cancelled();
-      logicalReserved = false;
       if (error instanceof JournalAppendError) throw error;
       return errResult(callId, callError("FAILED", "child frame failed"), recurseUsage(), false);
     } finally {
-      if (logicalReserved && signal.aborted) state.ledger.current = releaseLogicalCall(state.ledger.current);
+      if (frameActive) state.progress?.frameClosed();
       state.scopeUsage.delete(callId);
+      state.progress?.publish();
     }
-  })();
+  })().then(
+    (result) => {
+      if (logicalCallReserved && !result.ok) state.progress?.callFailed(callId);
+      return result;
+    },
+    (error: unknown) => {
+      if (logicalCallReserved) state.progress?.callFailed(callId);
+      throw error;
+    },
+  );
 
   state.inflight.set(callId, task);
+  state.progress?.publish();
   try {
     return await task;
   } finally {
     if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+    state.progress?.publish();
   }
 };

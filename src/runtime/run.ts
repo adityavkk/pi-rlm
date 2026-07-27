@@ -37,6 +37,12 @@ import { runFrame } from "./frame.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import { createModelOperation, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
+import {
+  createRunProgressTracker,
+  type RunProgressObserver,
+  type RunProgressPhase,
+  type RunProgressSource,
+} from "./run-progress.ts";
 import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, InternalRunState } from "./state.ts";
 import {
@@ -82,6 +88,9 @@ export interface RunInput {
   readonly runLifecycle?: RunLifecycleHooks;
   /** Optional store injection for fault testing and embedded runtimes. */
   readonly journal?: JournalStore;
+  /** Bounded live snapshots. Observer and source-capture failures are ignored. */
+  readonly onProgress?: RunProgressObserver;
+  readonly onProgressSource?: (source: RunProgressSource) => void;
 }
 
 export interface RunError {
@@ -431,22 +440,46 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     dslVersion: RLM_DSL_VERSION,
   });
   const ledgerRef = { current: createLedger(limits) };
+  const progress = createRunProgressTracker({
+    startMs,
+    limits,
+    ledger: () => ledgerRef.current,
+    now: () => clock.now(),
+    ...(input.onProgress ? { observer: input.onProgress } : {}),
+  });
   const runId = document.manifest.run.id;
+  const rootFrameId = `${runId}:f0`;
+  let rootProgressActive = true;
+  const closeRootProgress = (): void => {
+    if (!rootProgressActive) return;
+    rootProgressActive = false;
+    progress.frameClosed();
+  };
+  progress.bindRunId(runId);
+  progress.setPhase("manifest");
+  try { input.onProgressSource?.(progress.source); } catch { /* Progress observers have no run authority. */ }
   try {
-    await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem, input.runLifecycle?.claimEntries);
+    try {
+      await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem, input.runLifecycle?.claimEntries);
   } catch (error) {
     const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
     const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
-    if (code === "ENOENT" || code === "ENOTDIR")
-      return { ...failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error), ledger: ledgerRef.current };
-    throw error;
-  }
-  await input.runLifecycle?.onManifest(runId);
-  const rootFrameId = `${runId}:f0`;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        closeRootProgress();
+        progress.finish("failed");
+        return { ...failure(runId, "JOURNAL_FAILED", "failed to persist run journal", error), ledger: ledgerRef.current };
+      }
+      throw error;
+    }
+    await input.runLifecycle?.onManifest(runId);
   const journal = input.journal ?? new JournalStore(input.dir);
   const store = new ContextStore(input.dir, contextStoreLimits(profile));
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
   let phase: Phase = "journal";
+  const setPhase = (value: Phase): void => {
+    phase = value;
+    progress.setPhase(value as RunProgressPhase);
+  };
   let planned: PlannedResult | undefined;
   let runStartedDurable = false;
 
@@ -466,7 +499,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
 
   try {
     const manifestHash = document.manifestHash;
-    phase = "source";
+    setPhase("source");
     const sourceTransaction = await store.beginIngestTexts(
       input.program.inputs.map((declared) => ({
         label: declared.name,
@@ -478,7 +511,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     let sourceDurable = false;
     try {
       throwIfAborted(scope.signal);
-      phase = "journal";
+      setPhase("journal");
       try {
         const outcome = await journal.append({
           type: "run_started",
@@ -513,7 +546,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       inputs[declared.name] = sourceTransaction.value[index] as ContextDescriptor;
     });
 
-    phase = "journal";
+    setPhase("journal");
     await journal.append({
       type: "frame_opened",
       frameId: rootFrameId,
@@ -521,6 +554,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       depth: 0,
       objective: input.program.objective,
     });
+    progress.publish();
     throwIfAborted(scope.signal);
 
     const controllerTurnObserver = resolveControllerTurnObserver(input.signal);
@@ -550,7 +584,9 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       agentAttempts: new Map(),
       recurseExecutions: new Map(),
       frameSeq: { current: 1 },
+      progress,
     };
+    progress.setRuntimeGetter(() => ({ activeCalls: state.inflight.size }));
     const rootFrame: FrameRef = {
       frameId: rootFrameId,
       lineage: rootFrameId,
@@ -560,7 +596,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       outputs: input.program.outputs,
     };
 
-    phase = "controller";
+    setPhase("controller");
     const result = await runFrame(state, rootFrame, input.controller, scope.signal, limits.deadlineMs);
     throwIfAborted(scope.signal);
     if (result.deadline) {
@@ -579,7 +615,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
         answer: result.answer,
       };
     } else if (input.extractor) {
-      phase = "extractor";
+      setPhase("extractor");
       const built = await buildExtractorEvidence({
         program: input.program,
         variables: inputs,
@@ -630,7 +666,7 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
           if (outputErrors.length > 0) {
             planned = failure(runId, "INVALID_RESULT", outputContractErrorMessage(outputErrors));
           } else {
-            phase = "context";
+            setPhase("context");
             await persistAnswer(
               state,
               `fallback:${rootFrameId}`,
@@ -673,6 +709,19 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   }
 
   const result = planned ?? failure(runId, "FAILED", "run failed");
-  if (!runStartedDurable) return { ...result, ledger: ledgerRef.current };
-  return finalize(journal, rootFrameId, result, ledgerRef);
+  progress.setPhase("finalizing");
+    if (!runStartedDurable) {
+      closeRootProgress();
+      progress.finish(result.status);
+      return { ...result, ledger: ledgerRef.current };
+    }
+    const finalized = await finalize(journal, rootFrameId, result, ledgerRef);
+    closeRootProgress();
+    progress.finish(finalized.status);
+    return finalized;
+  } catch (error) {
+    closeRootProgress();
+    progress.finish(input.signal.aborted || wasAborted(error, input.signal) ? "cancelled" : "failed");
+    throw error;
+  }
 };

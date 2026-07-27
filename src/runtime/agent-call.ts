@@ -377,10 +377,10 @@ export const agentCall = async (
     }
   }
 
+  let operation: ReturnType<typeof createModelOperation> | undefined;
   let task!: Promise<GuestCallResult>;
   task = (async (): Promise<GuestCallResult> => {
     const runtime = state.agentDelegation;
-    let operation: ReturnType<typeof createModelOperation> | undefined;
     try {
       if (!runtime)
         return errResult(callId, callError("UNAVAILABLE_CONTEXT", "pi-subagents delegation is unavailable"), ZERO_CALL_USAGE, false);
@@ -472,18 +472,36 @@ export const agentCall = async (
       if (error instanceof JournalAppendError) throw error;
       return errResult(callId, callError("FAILED", "delegated agent failed"), usage, false);
     }
-  })();
+  })().then(
+    (result) => {
+      if (operation?.logicalCallReserved && !result.ok) state.progress?.callFailed(callId);
+      return result;
+    },
+    (error: unknown) => {
+      if (operation?.logicalCallReserved) state.progress?.callFailed(callId);
+      throw error;
+    },
+  );
 
   state.inflight.set(callId, task);
+  state.progress?.publish();
   void task.then(
-    () => { if (state.inflight.get(callId) === task) state.inflight.delete(callId); },
-    () => { if (state.inflight.get(callId) === task) state.inflight.delete(callId); },
+    () => {
+      if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+      state.progress?.publish();
+    },
+    () => {
+      if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+      state.progress?.publish();
+    },
   );
   try {
     return await waitForAbort(task, signal);
   } catch (error) {
-    if (wasAborted(error, signal))
+    if (wasAborted(error, signal)) {
+      if (operation?.logicalCallReserved) state.progress?.callFailed(callId);
       return errResult(callId, callError("CANCELLED", "cell epoch closed"), ZERO_CALL_USAGE, false);
+    }
     throw error;
   }
 };

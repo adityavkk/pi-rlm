@@ -170,6 +170,8 @@ export interface ExternalRequestIdentity {
 export interface ModelOperation {
   readonly usage: CallUsage;
   readonly attemptCount: number;
+  /** True only after this distinct operation consumed logical-call capacity. */
+  readonly logicalCallReserved: boolean;
   complete(client: ModelClient, request: ModelRequest): Promise<ModelResponse>;
   runExternal<T>(effect: () => Promise<T> | T): Promise<T>;
   runExternalReported<T>(
@@ -625,6 +627,7 @@ export const createModelOperation = (
   return {
     get usage() { return aggregate; },
     get attemptCount() { return attemptOrdinal; },
+    get logicalCallReserved() { return logicalReserved; },
     complete,
     runExternal,
     runExternalReported,
