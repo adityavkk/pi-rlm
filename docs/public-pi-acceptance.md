@@ -56,3 +56,11 @@ The actual public `runPrintMode()` adapter is exercised in both text and JSON mo
 - Full credential-free execution: public host `AgentSession` through production controller, QuickJS, managed journal, and Pi tool-result history reopened from the persisted session file.
 - Cancellation: public `AgentSession.abort()`, one provider abort/accounting attempt/managed terminal, durable current-session cancellation, and no late mutation.
 - Mode boundary: real headless TUI-mode binding is distinguished from terminal `InteractiveMode`; print/JSON/RPC denial behavior remains explicit.
+
+## Active pi-subagents package fixture
+
+The packed smoke installs `pi-rlm`, pinned Pi 0.80.10, and `pi-subagents` 0.36.0 in a third isolated package root. It dynamically loads the public `pi-subagents` extension entry on the same public Pi event bus as pi-rlm. The real bridge launches a real child Pi CLI through a signal-forwarding helper.
+
+The child helper passes only isolated HOME, XDG, npm, and Bun roots, the trusted executable path, fixture paths, and required `PI_SUBAGENT_*` routing capabilities. It does not pass provider API keys or caller credentials. The child provider records only credential-key names and requires that list to be empty. A process-local fetch tripwire and the packed smoke operating system network boundary deny child transport.
+
+Text and structured delegation require the exact request, started, and response tuple and the expected projected result. Public tool abort requires the exact v2 cancel tuple followed by the bridge's settled `cancelled` terminal. Session replacement requires the exact cancel tuple and no terminal from the disposed bridge. Both paths require reaped helper and child processes, no pi-rlm result contamination, and no late provider work. The fixture uses no private Pi or pi-subagents API.
