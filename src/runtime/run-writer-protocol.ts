@@ -218,7 +218,9 @@ export interface ArbitrationScanFileSystem {
   load(path: string): Promise<{ readonly bytes: Uint8Array; readonly stat: ArbitrationEntryStat }>;
 }
 export interface ArbitrationOrphan {
-  readonly name: string; readonly recordType: "generation" | "release"; readonly validity: "canonical" | "malformed";
+  readonly name: string;
+  readonly recordType: "generation" | "release";
+  readonly validity: "canonical" | "malformed" | "unverifiable";
 }
 export interface ArbitrationChain {
   readonly generations: readonly GenerationRecord[];
@@ -354,16 +356,22 @@ export const inspectArbitrationDirectory = (input: readonly ArbitrationDirectory
     if (nextName.test(entry.name) || releasedName.test(entry.name) || referenced.has(entry.name)) continue;
     const kind = intentKind(entry.name);
     if (!kind) corrupt(`unexpected arbitration entry ${entry.name}`);
-    let validity: ArbitrationOrphan["validity"] = "malformed";
+    let validity: ArbitrationOrphan["validity"] = entry.load.status === "failed" ? "unverifiable" : "malformed";
     if (entry.load.status === "loaded") {
       const { bytes: content, stat } = entry.load;
-      try {
-        const expectedName = kind === "generation"
-          ? generationIntentFilename(decodeGenerationRecord(content).token)
-          : releaseIntentFilename(decodeReleaseRecord(content).token);
-        if (expectedName === entry.name && stat.isFile && (stat.mode & 0o7777) === 0o600
-          && stat.nlink === 1n && stat.size === BigInt(content.byteLength)) validity = "canonical";
-      } catch { /* An unreferenced malformed intent is explicitly non-authoritative. */ }
+      if (stat.nlink !== 1n) {
+        // A slot or external link may be hidden from this listing snapshot. Never rotate this token.
+        validity = "unverifiable";
+      } else {
+        try {
+          const expectedName = kind === "generation"
+            ? generationIntentFilename(decodeGenerationRecord(content).token)
+            : releaseIntentFilename(decodeReleaseRecord(content).token);
+          const canonicalMetadata = expectedName === entry.name && stat.isFile && (stat.mode & 0o7777) === 0o600
+            && stat.size === BigInt(content.byteLength);
+          if (canonicalMetadata && stat.nlink === 1n) validity = "canonical";
+        } catch { /* Positively loaded malformed one-link intent bytes are non-authoritative. */ }
+      }
     }
     orphans.push({ name: entry.name, recordType: kind!, validity });
   }
