@@ -17,6 +17,11 @@ import {
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
+import {
+  createRunCoordinator,
+  RUN_COORDINATOR_MAX_ACTIVE,
+  type RunCoordinator,
+} from "./src/extension/run-coordinator.ts";
 import register, { createRlmExtension, LAUNCH_SNIPPET, type RlmRuntimeDependencies } from "./index.ts";
 
 interface ToolResult {
@@ -47,6 +52,7 @@ const harness = (options: {
   ttl?: number;
   runtime?: RlmRuntimeDependencies;
   executeRun?: (request: unknown, signal: AbortSignal) => Promise<RunResult>;
+  runCoordinator?: RunCoordinator;
 } = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
@@ -115,6 +121,7 @@ const harness = (options: {
     now: () => clock,
     createId: () => `host-${++nextId}`,
     grantTtlMs: options.ttl,
+    runCoordinator: options.runCoordinator,
   })(pi as never);
 
   const emit = async (name: string, event: Record<string, unknown> = {}) => {
@@ -677,29 +684,63 @@ describe("pi-rlm extension wiring", () => {
     expect(h.resultMessages).toHaveLength(0);
   });
 
-  test("a command transition during a long run retains the run result without cross-delivery", async () => {
+  test("a command transition locally settles an abort-ignoring seam before its late result", async () => {
     let resolveRun!: (result: RunResult) => void;
     const pendingRun = new Promise<RunResult>((resolve) => { resolveRun = resolve; });
-    const h = harness({ executeRun: async () => pendingRun });
+    const coordinator = createRunCoordinator();
+    const h = harness({ executeRun: async () => pendingRun, runCoordinator: coordinator });
     const pending = h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
     while (h.runs.length === 0) await Promise.resolve();
     await h.emit("session_before_fork", { entryId: "entry-1", position: "at" });
     h.setSessionId("session-2");
-    resolveRun(failedRun);
     await pending;
+    const cancelled = coordinator.list()[0];
+    expect(cancelled?.terminal).toMatchObject({ status: "cancelled", errorCode: "CANCELLED" });
+    resolveRun({ ...failedRun, runId: `run_${"a".repeat(64)}` });
+    await Promise.resolve();
+    expect(coordinator.list()[0]).toEqual(cancelled);
     expect(h.runs).toHaveLength(1);
     expect(h.resultEntries).toHaveLength(0);
     expect(h.resultMessages).toHaveLength(0);
   });
 
+  test("command active-run limit returns one bounded structured result", async () => {
+    const coordinator = createRunCoordinator();
+    coordinator.setSession("session-1", 0);
+    for (let index = 0; index < RUN_COORDINATOR_MAX_ACTIVE; index++) {
+      coordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: `active ${index}` });
+    }
+    const h = harness({ runCoordinator: coordinator });
+    await h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
+    expect(h.runs).toHaveLength(0);
+    expect(h.resultEntries).toHaveLength(1);
+    expect(h.resultMessages).toHaveLength(1);
+    expect(h.resultMessages[0]?.message["content"]).toContain("RLM_RUN_LIMIT");
+  });
+
   test("launch audit failure is bounded, launches no run, and does not expose raw errors", async () => {
-    const h = harness();
+    const coordinator = createRunCoordinator();
+    const h = harness({ runCoordinator: coordinator });
     h.setAppendFaultType("pi-rlm-launch-grant");
     await h.commands.get("rlm")!.handler('{"objective":"Review","context":"source"}', h.ctx);
     expect(h.runs).toHaveLength(0);
     expect(h.resultMessages).toHaveLength(1);
     expect(h.resultMessages[0]?.message["content"]).toContain("RLM_AUDIT_FAILED");
     expect(JSON.stringify(h.resultMessages)).not.toContain("/private/host/path");
+    expect(coordinator.list()[0]?.terminal?.errorCode).toBe("RLM_AUDIT_FAILED");
+  });
+
+  test("command source failure retains its exact early phase and terminal code", async () => {
+    const coordinator = createRunCoordinator();
+    const phases: string[] = [];
+    coordinator.subscribe((runs) => {
+      const phase = runs[0]?.progress?.phase;
+      if (phase) phases.push(phase);
+    });
+    const h = harness({ runCoordinator: coordinator });
+    await h.commands.get("rlm")!.handler("--file /definitely/missing -- Review", h.ctx);
+    expect(phases).toContain("source_capture");
+    expect(coordinator.list()[0]?.terminal?.errorCode).toBe("RLM_SOURCE_INVALID");
   });
 
   test("confirmation and tool audit exceptions return structured results without launch", async () => {
@@ -790,7 +831,13 @@ describe("pi-rlm extension wiring", () => {
   test("tool signal cancels the production executeRun path with one closed terminal and no late commit", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-rlm-extension-tool-"));
     const offline = pendingOfflineRuntime(dir);
-    const h = harness({ runtime: offline.dependencies });
+    const coordinator = createRunCoordinator();
+    const phases: string[] = [];
+    coordinator.subscribe((runs) => {
+      const phase = runs[0]?.progress?.phase;
+      if (phase) phases.push(phase);
+    });
+    const h = harness({ runtime: offline.dependencies, runCoordinator: coordinator });
     await h.startTurn("Use pi-rlm for this offline run");
     const owner = new AbortController();
     const pending = rlmTool(h).execute("call-real-cancel", { objective: "Wait offline" }, owner.signal, undefined, h.ctx);
@@ -799,6 +846,7 @@ describe("pi-rlm extension wiring", () => {
     const result = await pending;
 
     expect(result.details?.status).toBe("cancelled");
+    expect(phases).toEqual(expect.arrayContaining(["initializing", "allocating", "manifest"]));
     await expect(readFile(join(dir, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     offline.resolveLate({ reasoning: "late", code: "answer({ answer: 'late' })" });
     await new Promise((resolve) => setTimeout(resolve, 20));

@@ -537,6 +537,7 @@ export const retainCallResult = async (
 
     checkpointCall(state, signal, deadlineMs);
     state.callCache.set(result.callId, retained);
+    state.progress?.publish();
     if (journalFailure) throw journalFailure;
     return retained;
   } finally {
@@ -640,13 +641,24 @@ ${first.text}`;
       if (error instanceof JournalAppendError) throw error;
       return errResult(callId, callError("FAILED", "model completion failed"), operation.usage, false);
     }
-  })();
+  })().then(
+    (result) => {
+      if (operation.logicalCallReserved && !result.ok) state.progress?.callFailed(callId);
+      return result;
+    },
+    (error: unknown) => {
+      if (operation.logicalCallReserved) state.progress?.callFailed(callId);
+      throw error;
+    },
+  );
 
   state.inflight.set(callId, task);
+  state.progress?.publish();
   try {
     return await task;
   } finally {
     if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+    state.progress?.publish();
   }
 };
 

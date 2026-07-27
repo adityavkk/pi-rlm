@@ -12,6 +12,7 @@ import type { ModelClient } from "../shell/model/client.ts";
 import type { GuestCallResult } from "./call-result.ts";
 import type { AgentDelegationRuntime } from "./agent-delegation.ts";
 import type { Profile } from "./profile.ts";
+import type { RunProgressTracker } from "./run-progress.ts";
 import type { Semaphore } from "./semaphore.ts";
 
 export interface ArtifactDescriptor {
@@ -68,6 +69,7 @@ export interface RunState {
   /** Stable per-call recurse execution ordinal. Retries must not reopen one frame identity. */
   readonly recurseExecutions: Map<string, number>;
   readonly frameSeq: { current: number };
+  readonly progress?: RunProgressTracker;
 }
 
 /** Runtime-private state used only by the top-level and frame runners. */

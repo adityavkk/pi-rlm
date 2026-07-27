@@ -44,6 +44,11 @@ import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { QuickJsBackend } from "./src/shell/interpreter/quickjs.ts";
 import { createExtensionAgentDelegation } from "./src/extension/agent-delegation.ts";
+import {
+  createRunCoordinator,
+  type OwnedRunHandle,
+  type RunCoordinator,
+} from "./src/extension/run-coordinator.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient } from "./src/shell/model/client.ts";
 import { PiModelClient } from "./src/shell/model/pi-model.ts";
@@ -152,13 +157,26 @@ export interface RlmRuntimeDependencies {
   readonly onRetentionError?: (error: RunRetentionError) => void;
 }
 
+const requireCoordinatorMutation = (
+  result: ReturnType<OwnedRunHandle["bindRunId"]>,
+  operation: string,
+): void => {
+  if (result.ok) return;
+  throw Object.assign(new Error(`local run ${operation} failed`), {
+    name: "RunCoordinatorBindingError",
+    code: result.code ?? "RLM_RUN_IDENTITY_FAILED",
+  });
+};
+
 const executeRun = async (
   request: LaunchRequest,
-  signal: AbortSignal,
+  ownership: OwnedRunHandle,
   dependencies: RlmRuntimeDependencies = {},
   authorizationMode: LaunchAuthorizationMode = "direct",
   agentDelegation?: AgentDelegationConfig,
 ): Promise<RunResult> => {
+  const signal = ownership.signal;
+  requireCoordinatorMutation(ownership.setPhase("initializing"), "initialization");
   throwIfAborted(signal);
   const preparedAgentDelegation = prepareAgentDelegation(agentDelegation);
   const profile = (dependencies.resolveProfile ?? resolveProfile)();
@@ -176,6 +194,7 @@ const executeRun = async (
     controller,
     ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
   });
+  requireCoordinatorMutation(ownership.setPhase("allocating"), "allocation");
   if (dependencies.createRunDirectory) {
     const dirWork = dependencies.createRunDirectory();
     let dir: string;
@@ -191,6 +210,8 @@ const executeRun = async (
       const result = await runProgram({
         program: request.program, sources: request.sources, controller, model, backend, dir, profile, signal,
         authorizationMode, createRunNonce: dependencies.createRunNonce,
+        onProgress: ownership.observe,
+        onProgressSource: ownership.attachProgress,
         ...(agentDelegation ? { agentDelegation } : {}),
       });
       if (result.status !== "completed") await rm(dir, { recursive: true, force: true });
@@ -220,10 +241,21 @@ const executeRun = async (
 
   let result: RunResult;
   try {
+    requireCoordinatorMutation(ownership.bindRunName(lease.name), "run-name binding");
     throwIfAborted(signal);
     result = await runProgram({
       program: request.program, sources: request.sources, controller, model, backend, dir: lease.dir, profile, signal,
-      authorizationMode, createRunNonce: dependencies.createRunNonce, runLifecycle: lease.lifecycle,
+      authorizationMode,
+      createRunNonce: dependencies.createRunNonce,
+      onProgress: ownership.observe,
+      onProgressSource: ownership.attachProgress,
+      runLifecycle: {
+        claimEntries: lease.lifecycle.claimEntries,
+        onManifest: async (runId) => {
+          requireCoordinatorMutation(ownership.bindRunId(runId), "run-id binding");
+          await lease.lifecycle.onManifest(runId);
+        },
+      },
       ...(agentDelegation ? { agentDelegation } : {}),
     });
   } catch (primary) {
@@ -255,6 +287,8 @@ export interface RlmExtensionDependencies {
   readonly now?: () => number;
   readonly createId?: () => string;
   readonly grantTtlMs?: number;
+  /** Pi-neutral ownership registry injection for deterministic tests/hosts. */
+  readonly runCoordinator?: RunCoordinator;
 }
 
 interface LaunchReservation {
@@ -277,7 +311,7 @@ interface LaunchBinding {
 }
 
 interface CommandLifecycle {
-  readonly controller: AbortController;
+  readonly ownership: OwnedRunHandle;
   readonly sessionId: string;
   readonly authorizationGeneration: number;
 }
@@ -308,17 +342,17 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
+  const runCoordinator = dependencies.runCoordinator ?? createRunCoordinator();
   let inputCorrelation: InputCorrelation | undefined;
   let grantStore = emptyGrantStore();
   let authorizationGeneration = 0;
   const pendingToolCalls = new Set<string>();
   const consumedToolCalls = new Set<string>();
-  const activeCommandRuns = new Set<AbortController>();
+  const activeCommandRuns = new Set<OwnedRunHandle>();
 
   const invalidateAuthorization = (): void => {
     authorizationGeneration += 1;
-    for (const controller of activeCommandRuns) controller.abort(new Error("command lifecycle ended"));
-    activeCommandRuns.clear();
+    runCoordinator.invalidateSession();
     inputCorrelation = undefined;
     grantStore = emptyGrantStore();
     pendingToolCalls.clear();
@@ -417,27 +451,39 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     catch { return false; }
   };
 
-  const run = (
+  const run = async (
     request: LaunchRequest,
-    signal: AbortSignal,
+    ownership: OwnedRunHandle,
     mode: LaunchAuthorizationMode,
     ctx: ExtensionContext,
     sessionId: string,
     generation: number,
-  ): Promise<RunResult> => dependencies.executeRun
-    ? dependencies.executeRun(request, signal, mode)
-    : executeRun(
+  ): Promise<RunResult> => {
+    if (!dependencies.executeRun)
+      return executeRun(
         request,
-        signal,
+        ownership,
         dependencies.runtime,
         mode,
         extensionAgentDelegation(ctx, sessionId, generation, (id, gen, ownedSignal, ownedCtx) =>
           sessionMatches(id, gen, ownedSignal, ownedCtx), dependencies.runtime?.agentPolicy),
       );
+    requireCoordinatorMutation(ownership.setPhase("initializing"), "initialization");
+    const work = Promise.resolve(dependencies.executeRun(request, ownership.signal, mode));
+    void work.then(() => {}, () => {});
+    try {
+      return await waitForAbort(work, ownership.signal);
+    } catch (error) {
+      if (wasAborted(error, ownership.signal)) ownership.fail("cancelled", "CANCELLED");
+      throw error;
+    }
+  };
 
-  const deliverCommandResult = (
+  const deliverBoundCommandResult = (
     projection: RlmResultProjection,
-    lifecycle: CommandLifecycle,
+    sessionId: string,
+    generation: number,
+    signal: AbortSignal | undefined,
     ctx: ExtensionContext,
   ): void => {
     let metadata: RlmResultMetadata;
@@ -452,9 +498,9 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     }
 
     // Each effect has its own boundary. Re-check immediately before each one.
-    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+    if (!sessionMatches(sessionId, generation, signal, ctx)) return;
     try { pi.appendEntry("pi-rlm-result", metadata); } catch { /* Message delivery remains independently useful. */ }
-    if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+    if (!sessionMatches(sessionId, generation, signal, ctx)) return;
     try {
       pi.sendMessage({
         customType: "pi-rlm-result",
@@ -463,8 +509,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         display: true,
       }, { triggerTurn: false });
     } catch {
-      // One bounded, non-recursive diagnostic attempt. Never retry delivery.
-      if (!sessionMatches(lifecycle.sessionId, lifecycle.authorizationGeneration, lifecycle.controller.signal, ctx)) return;
+      if (!sessionMatches(sessionId, generation, signal, ctx)) return;
       try {
         pi.appendEntry("pi-rlm-result-delivery-failed", {
           runId: metadata.runId,
@@ -474,6 +519,18 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       } catch { /* No further audit attempt: audit failures cannot recurse. */ }
     }
   };
+
+  const deliverCommandResult = (
+    projection: RlmResultProjection,
+    lifecycle: CommandLifecycle,
+    ctx: ExtensionContext,
+  ): void => deliverBoundCommandResult(
+    projection,
+    lifecycle.sessionId,
+    lifecycle.authorizationGeneration,
+    lifecycle.ownership.signal,
+    ctx,
+  );
 
   pi.on("input", (event, ctx) => {
     inputCorrelation = {
@@ -509,16 +566,37 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     description: "Start a host-authorized pi-rlm run with an explicit source.",
     handler: async (args, ctx) => {
       // Bind ownership before the first asynchronous source-capture checkpoint.
-      const commandController = new AbortController();
       let sessionId: string;
       try { sessionId = ctx.sessionManager.getSessionId(); }
       catch { return; }
+      let commandController: OwnedRunHandle;
+      try {
+        runCoordinator.setSession(sessionId, authorizationGeneration);
+        commandController = runCoordinator.create({
+          sessionId,
+          authorizationGeneration,
+          objective: "",
+        });
+      } catch {
+        deliverBoundCommandResult(
+          failureProjection("RLM_RUN_LIMIT", "pi-rlm could not allocate a local run handle."),
+          sessionId,
+          authorizationGeneration,
+          undefined,
+          ctx,
+        );
+        return;
+      }
       const lifecycle: CommandLifecycle = {
-        controller: commandController,
+        ownership: commandController,
         sessionId,
         authorizationGeneration,
       };
       activeCommandRuns.add(commandController);
+      requireCoordinatorMutation(commandController.setPhase("source_capture"), "source capture");
+      const failCommand = (code: string, status: "failed" | "cancelled" = "failed"): void => {
+        commandController.fail(status, code);
+      };
 
       try {
         let built: Awaited<ReturnType<typeof captureCommandRequest>>;
@@ -527,6 +605,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         } catch (error) {
           if (wasAborted(error, commandController.signal)
             || !sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          failCommand("RLM_SOURCE_FAILED");
           deliverCommandResult(
             failureProjection("RLM_SOURCE_FAILED", "pi-rlm source capture failed."),
             lifecycle,
@@ -536,9 +615,11 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         }
         if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         if (!built.ok) {
+          failCommand(built.error.code);
           deliverCommandResult(failureProjection(built.error.code, built.error.message), lifecycle, ctx);
           return;
         }
+        commandController.setObjective(built.value.program.objective);
 
         let authorization: ReturnType<typeof mintAndConsume>;
         try {
@@ -559,6 +640,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
             `command:${grantId}`,
           );
         } catch {
+          failCommand("RLM_GRANT_FAILED");
           deliverCommandResult(
             failureProjection("RLM_GRANT_FAILED", "pi-rlm launch authorization failed."),
             lifecycle,
@@ -568,6 +650,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         }
         if (!authorization.ok) {
           const code = denialCode(authorization.denial);
+          failCommand(code);
           deliverCommandResult(failureProjection(code, "pi-rlm launch was denied."), lifecycle, ctx);
           return;
         }
@@ -575,6 +658,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         try { audit(authorization.grant); }
         catch {
+          failCommand("RLM_AUDIT_FAILED");
           deliverCommandResult(
             failureProjection("RLM_AUDIT_FAILED", "pi-rlm launch audit failed; no run was started."),
             lifecycle,
@@ -590,7 +674,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
           result = await run(
             built.value,
-            commandController.signal,
+            commandController,
             "slash_command",
             ctx,
             sessionId,
@@ -599,6 +683,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         } catch (error) {
           if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
           const cancelled = wasAborted(error, commandController.signal);
+          commandController.fail(cancelled ? "cancelled" : "failed", cancelled ? "CANCELLED" : "RLM_RUN_FAILED");
           deliverCommandResult(failureProjection(
             cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
             cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
@@ -607,12 +692,29 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           ), lifecycle, ctx);
           return;
         }
+        const finished = commandController.finish(result);
+        if (!finished.ok) {
+          failCommand("RLM_RUN_IDENTITY_FAILED");
+          if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
+          deliverCommandResult(
+            failureProjection("RLM_RUN_IDENTITY_FAILED", "pi-rlm returned an invalid run identity."),
+            lifecycle,
+            ctx,
+          );
+          return;
+        }
         if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         auditWarnings(result);
         if (!sessionMatches(sessionId, lifecycle.authorizationGeneration, commandController.signal, ctx)) return;
         deliverCommandResult(projectRunResult(result), lifecycle, ctx);
       } finally {
         activeCommandRuns.delete(commandController);
+        const current = runCoordinator.resolve(commandController.control.localId);
+        if (current?.state === "running" || current?.state === "cancelling")
+          commandController.fail(
+            commandController.signal.aborted ? "cancelled" : "failed",
+            commandController.signal.aborted ? "CANCELLED" : "RLM_RUN_FAILED",
+          );
         if (sessionMatches(sessionId, lifecycle.authorizationGeneration, undefined, ctx)) {
           try { ctx.ui.setStatus("pi-rlm", ""); } catch { /* Best-effort transient status. */ }
         }
@@ -710,25 +812,49 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
             "pi-rlm launch audit failed; no run was started.",
           ));
         }
+        let ownership: OwnedRunHandle;
         try {
           if (confirmationGeneration !== authorizationGeneration
             || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
             return denied("RLM_GRANT_GENERATION_MISMATCH: session changed before launch.");
+          runCoordinator.setSession(initialBinding.sessionId, confirmationGeneration);
+          ownership = runCoordinator.create({
+            sessionId: initialBinding.sessionId,
+            authorizationGeneration: confirmationGeneration,
+            objective: built.value.program.objective,
+            ownerSignal: toolSignal,
+          });
+        } catch {
+          return projectedToolResult(failureProjection(
+            "RLM_RUN_LIMIT",
+            "pi-rlm could not allocate a local run handle.",
+          ));
+        }
+        try {
           const result = await run(
             built.value,
-            toolSignal,
+            ownership,
             "confirmed",
             ctx,
             initialBinding.sessionId,
             confirmationGeneration,
           );
+          const finished = ownership.finish(result);
+          if (!finished.ok) {
+            ownership.fail("failed", "RLM_RUN_IDENTITY_FAILED");
+            return projectedToolResult(failureProjection(
+              "RLM_RUN_IDENTITY_FAILED",
+              "pi-rlm returned an invalid run identity.",
+            ));
+          }
           if (confirmationGeneration !== authorizationGeneration
             || ctx.sessionManager.getSessionId() !== initialBinding.sessionId)
             return denied("RLM_GRANT_GENERATION_MISMATCH: session changed while pi-rlm was running.");
           auditWarnings(result);
           return projectedToolResult(projectRunResult(result));
         } catch (error) {
-          const cancelled = wasAborted(error, toolSignal);
+          const cancelled = wasAborted(error, ownership.signal);
+          ownership.fail(cancelled ? "cancelled" : "failed", cancelled ? "CANCELLED" : "RLM_RUN_FAILED");
           return projectedToolResult(failureProjection(
             cancelled ? "CANCELLED" : "RLM_RUN_FAILED",
             cancelled ? "pi-rlm was cancelled." : "pi-rlm failed before producing a result.",
