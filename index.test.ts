@@ -14,6 +14,8 @@ import {
   type RunResult,
   type RunRetentionMetadataFileSystem,
 } from "./src/runtime/index.ts";
+import type { ManagedRunListing } from "./src/runtime/run-retention.ts";
+import type { RunInspectionPage, RunInspectionRequest } from "./src/runtime/run-inspection-types.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
 import type { ModelClient, ModelResponse } from "./src/shell/model/client.ts";
@@ -43,6 +45,17 @@ interface CapturedCommand {
   handler: (args: string, ctx: unknown) => Promise<void>;
 }
 
+interface CustomComponent {
+  handleInput?(data: string): void;
+  dispose?(): void;
+}
+type CustomBehavior = (
+  component: CustomComponent,
+  done: (value: unknown) => void,
+  reject: (error: unknown) => void,
+  call: number,
+) => void;
+
 type EventHandler = (event: any, ctx: any) => unknown;
 
 const failedRun = {
@@ -55,6 +68,8 @@ const harness = (options: {
   runtime?: RlmRuntimeDependencies;
   executeRun?: (request: unknown, signal: AbortSignal) => Promise<RunResult>;
   runCoordinator?: RunCoordinator;
+  listManagedRuns?: () => Promise<ManagedRunListing>;
+  inspectManagedRunPage?: (request: RunInspectionRequest) => Promise<RunInspectionPage>;
 } = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
@@ -68,6 +83,9 @@ const harness = (options: {
   const runs: unknown[] = [];
   const initializationAuditCounts: number[] = [];
   const runSignals: AbortSignal[] = [];
+  const customComponents: CustomComponent[] = [];
+  let customCalls = 0;
+  let customBehavior: CustomBehavior = (component) => { component.handleInput?.("\u001b"); };
   let sessionId = "session-1";
   let clock = 100;
   let nextId = 0;
@@ -99,6 +117,16 @@ const harness = (options: {
         if (widgetFault) throw new Error("widget fault");
         widgets.push({ key, content, options });
       },
+      custom: <T>(factory: (
+        tui: { requestRender(): void }, theme: unknown, keys: unknown, done: (value: T) => void,
+      ) => CustomComponent) => new Promise<T>((resolve, reject) => {
+        customCalls += 1;
+        try {
+          const component = factory({ requestRender() {} }, {}, {}, resolve);
+          customComponents.push(component);
+          customBehavior(component, resolve as (value: unknown) => void, reject, customCalls);
+        } catch (error) { reject(error); }
+      }),
     },
   };
 
@@ -131,6 +159,8 @@ const harness = (options: {
     createId: () => `host-${++nextId}`,
     grantTtlMs: options.ttl,
     runCoordinator: options.runCoordinator,
+    ...(options.listManagedRuns ? { listManagedRuns: options.listManagedRuns } : {}),
+    ...(options.inspectManagedRunPage ? { inspectManagedRunPage: options.inspectManagedRunPage } : {}),
   })(pi as never);
 
   const emit = async (name: string, event: Record<string, unknown> = {}) => {
@@ -153,6 +183,8 @@ const harness = (options: {
     runs,
     initializationAuditCounts,
     runSignals,
+    customComponents,
+    get customCalls() { return customCalls; },
     ctx,
     emit,
     startTurn,
@@ -171,6 +203,7 @@ const harness = (options: {
     setConfirm: (value: typeof confirm) => {
       confirm = value;
     },
+    setCustomBehavior: (value: CustomBehavior) => { customBehavior = value; },
     setAppendFaultType: (value: string | undefined) => {
       appendFaultType = value;
     },
@@ -429,6 +462,35 @@ afterEach(() => {
   else process.env["PI_RLM_ALLOW_UNSOLICITED"] = oldAmbientBypass;
 });
 
+const MANAGED_NAME = `run-${"a".repeat(32)}`;
+const MANAGED_ID = `run_${"b".repeat(64)}`;
+const MANAGED_HASH = "c".repeat(64);
+const managementListing = (runName = MANAGED_NAME): ManagedRunListing => ({
+  root: "/private/root",
+  runs: [{
+    name: runName, path: "/private/run", bytes: 10, activity: "inactive",
+    metadata: {
+      schemaVersion: 1, status: "completed", owner: "d".repeat(32), createdAtMs: 1, updatedAtMs: 2,
+      runId: MANAGED_ID, terminalAtMs: 2,
+    },
+  }],
+  issues: [], scannedBytes: 10, scannedEntries: 1,
+}) as ManagedRunListing;
+const managementPage = (request: RunInspectionRequest): RunInspectionPage => ({
+  version: 1,
+  runName: request.runName,
+  runId: MANAGED_ID,
+  manifestHash: MANAGED_HASH,
+  journalPrefixSha256: "e".repeat(64),
+  eventCount: 1,
+  view: request.view,
+  items: request.view === "summary" ? [{
+    kind: "summary", status: "completed", rootFrameId: `${MANAGED_ID}:f0`, eventCount: 1,
+    frames: 1, cells: 0, committedCalls: 0, observedProviderAttempts: 0, completionMode: "answer",
+  }] : [],
+  serializedBytes: 1,
+});
+
 describe("pi-rlm extension wiring", () => {
   test("registers separated launcher guidance and launch surfaces", () => {
     const tools: CapturedTool[] = [];
@@ -483,6 +545,113 @@ describe("pi-rlm extension wiring", () => {
 
     tui.setWidgetFault(true);
     await expect(tui.emit("session_start", { reason: "resume" })).resolves.toBeUndefined();
+  });
+
+  test("management handlers integrate runs, inspect, and exact current local cancellation authority", async () => {
+    const coordinator = createRunCoordinator({ createLocalId: () => "rlm_local", createControlToken: () => "t".repeat(32) });
+    coordinator.setSession("session-1", 0);
+    const owned = coordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: "current" });
+    owned.bindRunName(MANAGED_NAME);
+    owned.bindRunId(MANAGED_ID);
+    let listings = 0;
+    const requests: RunInspectionRequest[] = [];
+    const h = harness({
+      runCoordinator: coordinator,
+      listManagedRuns: async () => { listings += 1; return managementListing(); },
+      inspectManagedRunPage: async (request) => { requests.push(request); return managementPage(request); },
+    });
+    h.setCustomBehavior((component, _done, _reject, call) => {
+      component.handleInput?.(call === 1 ? "\r" : "\u001b");
+    });
+    await h.commands.get("rlm")!.handler("runs", h.ctx);
+    expect(listings).toBe(2);
+    expect(requests).toEqual([{ version: 1, runName: MANAGED_NAME, view: "summary", pageSize: 50 }]);
+    expect(h.customCalls).toBe(3);
+    expect(h.runs).toHaveLength(0);
+
+    await h.commands.get("rlm")!.handler(`cancel ${MANAGED_NAME}`, h.ctx);
+    await h.commands.get("rlm")!.handler(`cancel ${MANAGED_ID}`, h.ctx);
+    expect(owned.signal.aborted).toBe(false);
+    await h.commands.get("rlm")!.handler("cancel rlm_local", h.ctx);
+    expect(owned.signal.aborted).toBe(true);
+
+    await h.emit("session_before_switch", { reason: "resume" });
+    const before = requests.length;
+    await h.commands.get("rlm")!.handler("inspect rlm_local", h.ctx);
+    expect(requests).toHaveLength(before);
+    expect(h.notifications.at(-1)).toContain("exact managed name or bound local alias");
+  });
+
+  test("navigator refresh authorizes selection against the refreshed bounded snapshot", async () => {
+    const refreshedName = `run-${"f".repeat(32)}`;
+    let listings = 0;
+    const requests: RunInspectionRequest[] = [];
+    const h = harness({
+      listManagedRuns: async () => managementListing(++listings === 1 ? MANAGED_NAME : refreshedName),
+      inspectManagedRunPage: async (request) => { requests.push(request); return managementPage(request); },
+    });
+    h.setCustomBehavior((component, _done, _reject, call) => {
+      if (call !== 1) { component.handleInput?.("\u001b"); return; }
+      component.handleInput?.("r");
+      void (async () => {
+        for (let index = 0; index < 8; index += 1) await Promise.resolve();
+        component.handleInput?.("\r");
+      })();
+    });
+    await h.commands.get("rlm")!.handler("runs", h.ctx);
+    expect(requests[0]?.runName).toBe(refreshedName);
+    expect(h.customCalls).toBe(3);
+  });
+
+  test("management mode, routing, hostile custom results, and UI failures fail closed without launch fallback", async () => {
+    let listings = 0;
+    let inspections = 0;
+    const h = harness({
+      listManagedRuns: async () => { listings += 1; return managementListing(); },
+      inspectManagedRunPage: async (request) => { inspections += 1; return managementPage(request); },
+    });
+    h.setMode("print");
+    await h.commands.get("rlm")!.handler("runs", h.ctx);
+    await h.commands.get("rlm")!.handler(`inspect ${MANAGED_NAME}`, h.ctx);
+    expect(listings).toBe(0);
+    expect(inspections).toBe(0);
+    expect(h.customCalls).toBe(0);
+
+    h.setMode("tui");
+    for (const malformed of ["runs/extra", "inspect:bad", "cancel\u200b rlm_local", "launch\u0000payload"])
+      await h.commands.get("rlm")!.handler(malformed, h.ctx);
+    expect(h.runs).toHaveLength(0);
+
+    h.setCustomBehavior((_component, done) => { done(undefined); });
+    await expect(h.commands.get("rlm")!.handler("runs", h.ctx)).resolves.toBeUndefined();
+    h.setCustomBehavior((_component, done) => {
+      done(new Proxy({ type: "inspect", runName: MANAGED_NAME }, { get() { throw new Error("trap"); } }));
+    });
+    await expect(h.commands.get("rlm")!.handler("runs", h.ctx)).resolves.toBeUndefined();
+    h.setCustomBehavior((_component, _done, reject) => { reject(new Error("custom rejected")); });
+    await expect(h.commands.get("rlm")!.handler("runs", h.ctx)).resolves.toBeUndefined();
+    expect(inspections).toBe(0);
+    expect(h.runs).toHaveLength(0);
+  });
+
+  test("management listing and open custom are aborted across late session transitions", async () => {
+    let resolveListing!: (listing: ManagedRunListing) => void;
+    const lateListing = new Promise<ManagedRunListing>((resolve) => { resolveListing = resolve; });
+    const listingHarness = harness({ listManagedRuns: () => lateListing });
+    const pendingListing = listingHarness.commands.get("rlm")!.handler("runs", listingHarness.ctx);
+    await Promise.resolve();
+    await listingHarness.emit("session_before_switch", { reason: "resume" });
+    resolveListing(managementListing());
+    await expect(pendingListing).resolves.toBeUndefined();
+    expect(listingHarness.customCalls).toBe(0);
+
+    const customHarness = harness({ listManagedRuns: async () => managementListing() });
+    customHarness.setCustomBehavior(() => {});
+    const pendingCustom = customHarness.commands.get("rlm")!.handler("runs", customHarness.ctx);
+    while (customHarness.customCalls === 0) await Promise.resolve();
+    await customHarness.emit("session_before_fork", { entryId: "entry", position: "at" });
+    await expect(pendingCustom).resolves.toBeUndefined();
+    expect(customHarness.customComponents).toHaveLength(1);
   });
 
   test("positive prompt wording still requires confirmation of exact normalized identity", async () => {
