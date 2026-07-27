@@ -140,11 +140,23 @@ describe("writer arbitration canonical protocol", () => {
     expect(inspectArbitrationDirectory([
       entry(generationIntentFilename(record.token), content, 1n, 2n),
     ]).orphans).toEqual([{
-      name: generationIntentFilename(record.token), recordType: "generation", validity: "malformed",
+      name: generationIntentFilename(record.token), recordType: "generation", validity: "unverifiable",
     }]);
     expect(inspectArbitrationDirectory([
       entry(generationIntentFilename(record.token), content, 1n, 1n, 0o104600),
     ]).orphans[0]?.validity).toBe("malformed");
+    for (const links of [0n, 2n, 3n]) {
+      expect(inspectArbitrationDirectory([
+        entry(generationIntentFilename(record.token), Buffer.from("{partial"), 1n, links),
+      ]).orphans[0]?.validity).toBe("unverifiable");
+    }
+    expect(inspectArbitrationDirectory([
+      failedEntry(generationIntentFilename(record.token), new Error("listing race")),
+      failedEntry(releaseIntentFilename(release().token), new Error("transient load failure")),
+    ]).orphans).toEqual([
+      { name: generationIntentFilename(record.token), recordType: "generation", validity: "unverifiable" },
+      { name: releaseIntentFilename(release().token), recordType: "release", validity: "unverifiable" },
+    ]);
     expect(() => inspectArbitrationDirectory([
       entry(generationIntentFilename(record.token), content, 1n, 2n, 0o104600),
       entry(successorSlotFilename(null), content, 1n, 2n, 0o104600),
