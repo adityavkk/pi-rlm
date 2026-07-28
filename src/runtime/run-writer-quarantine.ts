@@ -1,7 +1,7 @@
 /** Dedicated terminal retention rename and deterministic quarantine reconciliation. */
 
-import { constants } from "node:fs";
-import { lstat, open, rename, type FileHandle } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open, rename } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   ARBITRATION_DIRECTORY,
@@ -17,10 +17,15 @@ export interface RunQuarantineResult {
   readonly path: string;
 }
 
+export interface RunQuarantineDirectoryHandle {
+  stat(options: { readonly bigint: true }): Promise<BigIntStats>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
 export interface RunQuarantineFileSystem {
   lstat(path: string): ReturnType<typeof lstat>;
   rename(oldPath: string, newPath: string): Promise<void>;
-  openDirectory(path: string): Promise<FileHandle>;
+  openDirectory(path: string): Promise<RunQuarantineDirectoryHandle>;
 }
 
 const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
@@ -159,6 +164,14 @@ export const scavengeRunQuarantine = async (
     || (tip.role !== "retention" && tip.role !== "retirement" && !(tip.role === "writer" && tip.ordinal === 1))
     || !sameRun(stat, tip))
     throw new Error("quarantine name, inode, and terminal arbitration disagree");
-  await input.remove(path);
+  try { await input.remove(path); }
+  catch (removal) {
+    let residual: Awaited<ReturnType<typeof lstat>> | undefined;
+    try { residual = await statAttempt(path, fileSystem); }
+    catch (inspection) {
+      throw new AggregateError([removal, inspection], "quarantine removal and residual inspection both failed");
+    }
+    if (residual) throw removal;
+  }
   if (input.syncAfterRemove !== false) await syncRoot(input.root, tip, fileSystem);
 };

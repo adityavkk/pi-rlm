@@ -426,14 +426,25 @@ export class ManagedRunLease {
 
   async finish(status: Exclude<RunLifecycleStatus, "active">, runId?: string): Promise<void> {
     if (this.closed) return;
+    if (!this.manifestBound) {
+      let primary: unknown = new RunRetentionError(
+        "RUN_RETENTION_METADATA_FAILED",
+        "terminal lifecycle requires the bound manifest run identity",
+      );
+      try { await this.discard(); }
+      catch (discard) { primary = new AggregateError([primary, discard], "invalid terminal lifecycle and genesis discard both failed"); }
+      if (primary instanceof RunRetentionError) throw primary;
+      throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed terminal finalization failed", primary);
+    }
     let primary: unknown;
     try {
       const identity = runId ?? this.runId;
-      if (identity === undefined || !RUN_ID.test(identity) || (this.runId !== undefined && identity !== this.runId))
+      if (identity === undefined || !RUN_ID.test(identity) || identity !== this.runId)
         throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "terminal lifecycle requires the bound manifest run identity");
       this.metadata = await this.store.finishLease(this.dir, this.metadata, status, identity, this.persistence);
     } catch (error) { primary = error; }
     primary = await this.releaseOwned(primary);
+    if (primary instanceof RunRetentionError) throw primary;
     if (primary !== undefined)
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed terminal finalization failed", primary);
   }
@@ -446,6 +457,7 @@ export class ManagedRunLease {
     try { this.metadata = await this.store.abandonLease(this.dir, this.metadata, this.persistence); }
     catch (error) { primary = error; }
     primary = await this.releaseOwned(primary);
+    if (primary instanceof RunRetentionError) throw primary;
     if (primary !== undefined)
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed abandonment failed", primary);
   }
