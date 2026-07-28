@@ -2,6 +2,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { CoordinatedRun, CoordinatedRunState } from "./run-coordinator.ts";
+import type { PendingAgentApprovalProjection } from "./agent-approval-coordinator.ts";
 import type { RunProgressSnapshot } from "../runtime/index.ts";
 
 export const DISPLAY_TEXT_MAX_BYTES = 4 * 1024;
@@ -103,12 +104,14 @@ export interface RunDisplayItem {
   readonly runId?: string;
   readonly state: Extract<CoordinatedRunState, "running" | "cancelling">;
   readonly progress?: RunProgressSnapshot;
+  readonly pendingApproval?: PendingAgentApprovalProjection;
 }
 
 const safeInteger = (value: number | undefined): number =>
   Number.isSafeInteger(value) && (value ?? -1) >= 0 ? value! : 0;
 
 const priority = (left: RunDisplayItem, right: RunDisplayItem): number => {
+  if (!!left.pendingApproval !== !!right.pendingApproval) return left.pendingApproval ? -1 : 1;
   if (left.state !== right.state) return left.state === "cancelling" ? -1 : 1;
   const sequence = safeInteger(right.progress?.sequence) - safeInteger(left.progress?.sequence);
   return sequence || left.localId.localeCompare(right.localId);
@@ -123,6 +126,15 @@ export const projectRunDisplayItems = (runs: readonly CoordinatedRun[]): readonl
       ...(run.runId ? { runId: run.runId } : {}),
       state: run.state as RunDisplayItem["state"],
       ...(run.progress ? { progress: run.progress } : {}),
+      ...(run.pendingApproval ? { pendingApproval: Object.freeze({
+        requestSha256: sanitizeDisplayText(run.pendingApproval.requestSha256, 64),
+        agent: sanitizeDisplayText(run.pendingApproval.agent, 128),
+        taskSha256: sanitizeDisplayText(run.pendingApproval.taskSha256, 64),
+        context: run.pendingApproval.context,
+        ...(run.pendingApproval.model ? { model: sanitizeDisplayText(run.pendingApproval.model, 256) } : {}),
+        ...(run.pendingApproval.thinking ? { thinking: sanitizeDisplayText(run.pendingApproval.thinking, 256) } : {}),
+        count: safeInteger(run.pendingApproval.count),
+      }) } : {}),
     }))
     .sort(priority)
     .slice(0, RUN_DISPLAY_MAX_INPUTS));
@@ -145,6 +157,19 @@ const elapsed = (elapsedMs: number | undefined): string => {
 };
 
 const row = (run: RunDisplayItem, width: number): string => {
+  const approval = run.pendingApproval;
+  if (approval) {
+    const count = safeInteger(approval.count);
+    const segments = [
+      `RLM approval #${displayIdentitySuffix(run.localId, run.runId)}`,
+      `agent ${sanitizeDisplayText(approval.agent, 128) || "unknown"}`,
+      approval.context,
+      ...(approval.model ? [`model ${sanitizeDisplayText(approval.model, 256)}`] : []),
+      `task #${displayIdentitySuffix(approval.taskSha256)}`,
+      `${count} pending`,
+    ];
+    return truncateDisplayLine(segments.join(" · "), width);
+  }
   const progress = run.progress;
   const segments = [
     `RLM ${run.state} #${displayIdentitySuffix(run.localId, run.runId)}`,
@@ -173,8 +198,12 @@ export const renderRunDisplay = (runs: readonly RunDisplayItem[], width: number)
     .slice(0, RUN_DISPLAY_MAX_INPUTS);
   if (active.length === 0 || limit === 0) return [];
   const cancelling = active.filter((run) => run.state === "cancelling").length;
+  const approval = active.find((run) => run.pendingApproval)?.pendingApproval;
+  const approvalCount = active.reduce((total, run) => total + safeInteger(run.pendingApproval?.count), 0);
   if (limit < RUN_DISPLAY_COMPACT_WIDTH) {
-    const summary = `RLM: ${active.length} active${cancelling ? `, ${cancelling} cancelling` : ""} · /rlm runs`;
+    const summary = approval
+      ? `RLM approval: ${sanitizeDisplayText(approval.agent, 128) || "unknown"} · ${approvalCount} pending`
+      : `RLM: ${active.length} active${cancelling ? `, ${cancelling} cancelling` : ""} · /rlm runs`;
     return [truncateDisplayLine(summary, limit)];
   }
   const shown = active.slice(0, RUN_DISPLAY_MAX_ROWS);

@@ -3,6 +3,12 @@
 import { randomBytes } from "node:crypto";
 import type { RunProgressSnapshot, RunProgressSource } from "../runtime/run-progress.ts";
 import type { RunResult } from "../runtime/run.ts";
+import {
+  createPendingAgentApprovalRegistry,
+  type PendingAgentApprovalInput,
+  type PendingAgentApprovalProjection,
+} from "./agent-approval-coordinator.ts";
+export { RUN_COORDINATOR_MAX_PENDING_APPROVALS } from "./agent-approval-coordinator.ts";
 
 export const RUN_COORDINATOR_MAX_ACTIVE = 16;
 export const RUN_COORDINATOR_MAX_RECENT = 32;
@@ -32,6 +38,7 @@ export interface CoordinatedRun {
   readonly objectivePreview: string;
   readonly state: CoordinatedRunState;
   readonly progress?: RunProgressSnapshot;
+  readonly pendingApproval?: PendingAgentApprovalProjection;
   readonly terminal?: RunTerminalProjection;
 }
 
@@ -41,10 +48,15 @@ export interface LocalRunControl {
   readonly token: string;
 }
 
+export interface OwnedAgentApprovalHandle {
+  settle(): void;
+}
+
 export interface OwnedRunHandle {
   readonly control: LocalRunControl;
   readonly signal: AbortSignal;
   setObjective(objective: string): void;
+  beginAgentApproval(request: PendingAgentApprovalInput): OwnedAgentApprovalHandle | undefined;
   setPhase(phase: "source_capture" | "initializing" | "allocating"): CoordinatorMutationResult;
   bindRunName(runName: string): CoordinatorMutationResult;
   bindRunId(runId: string): CoordinatorMutationResult;
@@ -176,6 +188,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
   const active = new Map<string, RecordState>();
   const recent: RecordState[] = [];
   const aliases = new Map<string, RecordState>();
+  const approvals = createPendingAgentApprovalRegistry();
   const subscribers = new Set<(runs: readonly CoordinatedRun[]) => void>();
   let currentSession: { sessionId: string; generation: number } | undefined;
   let minimumGeneration = 0;
@@ -204,6 +217,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
     refresh(record);
     const state: CoordinatedRunState = record.terminal?.status
       ?? (record.cancelRequested ? "cancelling" : "running");
+    const pendingApproval = approvals.project(record.localId);
     return Object.freeze({
       localId: record.localId,
       ...(record.runId ? { runId: record.runId } : {}),
@@ -213,6 +227,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
       objectivePreview: record.objectivePreview,
       state,
       ...(record.progress ? { progress: record.progress } : {}),
+      ...(pendingApproval ? { pendingApproval } : {}),
       ...(record.terminal ? { terminal: record.terminal } : {}),
     });
   };
@@ -249,6 +264,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
     if (refreshProgress) refresh(record);
     record.progressSource = undefined;
     record.terminal = terminal;
+    approvals.clear(record.localId);
     active.delete(record.localId);
     detachOwner(record);
     recent.unshift(record);
@@ -289,6 +305,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
     if (record.terminal) return { ok: false, code: "RUN_TERMINAL" };
     if (record.cancelRequested) return { ok: true, alreadyRequested: true };
     record.cancelRequested = true;
+    approvals.clear(record.localId);
     record.controller.abort(new Error("locally owned run cancelled"));
     notify();
     return { ok: true, requested: true };
@@ -310,6 +327,7 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
     },
     invalidateSession: () => {
       for (const record of active.values()) cancel({ localId: record.localId, token: record.controlToken });
+      approvals.clearAll();
       if (currentSession) minimumGeneration = Math.max(minimumGeneration, currentSession.generation + 1);
       currentSession = undefined;
     },
@@ -354,6 +372,21 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
       const handle: OwnedRunHandle = Object.freeze({
         control,
         signal: controller.signal,
+        beginAgentApproval: (request: PendingAgentApprovalInput) => {
+          const current = owned(control);
+          if (!current || current.terminal || current.cancelRequested || current.controller.signal.aborted) return undefined;
+          const registration = approvals.begin(current.localId, request);
+          if (!registration) return undefined;
+          notify();
+          let settled = false;
+          return Object.freeze({
+            settle: () => {
+              if (settled) return;
+              settled = true;
+              if (registration.settle()) notify();
+            },
+          });
+        },
         setObjective: (value: string) => { mutate((current) => {
           if (current.terminal) return { ok: false, code: "RUN_TERMINAL" };
           current.objectivePreview = objectivePreview(value); notify(); return { ok: true };

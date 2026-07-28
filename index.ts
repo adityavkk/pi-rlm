@@ -172,6 +172,7 @@ export interface RlmRuntimeDependencies {
   readonly agentPolicy?: {
     readonly allowedAgents?: readonly string[];
     readonly allowForkContext?: boolean;
+    readonly approvalTimeoutMs?: number;
   };
   readonly runRetention?: ManagedRunStoreOptions;
   /** Observer for detached cleanup after cancellation wins a directory-allocation race. */
@@ -503,8 +504,23 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         ownership,
         dependencies.runtime,
         mode,
-        extensionAgentDelegation(ctx, sessionId, generation, (id, gen, ownedSignal, ownedCtx) =>
-          sessionMatches(id, gen, ownedSignal, ownedCtx), dependencies.runtime?.agentPolicy),
+        extensionAgentDelegation(
+          ctx,
+          sessionId,
+          generation,
+          (id, gen, ownedSignal, ownedCtx) => sessionMatches(id, gen, ownedSignal, ownedCtx),
+          {
+            begin: (request, requestSha256) => ownership.beginAgentApproval({
+              requestSha256,
+              agent: request.agent,
+              taskSha256: request.taskSha256,
+              context: request.context,
+              ...(request.model ? { model: request.model } : {}),
+              ...(request.thinking ? { thinking: request.thinking } : {}),
+            }),
+          },
+          dependencies.runtime?.agentPolicy,
+        ),
       );
     requireCoordinatorMutation(ownership.setPhase("initializing"), "initialization");
     const work = Promise.resolve(dependencies.executeRun(request, ownership.signal, mode));

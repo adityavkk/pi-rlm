@@ -53,7 +53,7 @@ budgets. Guest values may only narrow these call limits.
 The standard extension denies an agent name unless either condition is true:
 
 - The host lists the exact name in `PI_RLM_AGENT_ALLOWLIST`.
-- The interactive host approves that opaque agent for the current run.
+- In TUI mode, the host may approve one exact immutable request. The approval binds the run, frame, call, agent, task hash, context, model, and thinking route. It expires after the configured bounded timeout, is never reused by agent name, and is dismissed on run or session cancellation. RPC, print, and JSON modes deny opaque agents without prompting.
 
 Approval records contain the policy identity, bounded agent identifier, call
 identity, and decision. They do not record task or source payloads. Agent names

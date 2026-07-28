@@ -194,7 +194,7 @@ describe("source-bound run identity and manifest", () => {
     const delegation = (allowedAgents: string[]) => ({
       identity: {
         id: "pi-rlm/agent-delegation",
-        version: "pi-rlm.agent-policy.v1",
+        version: "pi-rlm.agent-policy.v2",
         configuration: { allowedAgents, cwdSha256: sha256("/tmp/project"), approvalPolicy: null },
       },
     });
