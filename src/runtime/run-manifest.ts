@@ -25,7 +25,7 @@ import {
 } from "./extractor.ts";
 import { validateProfile, type Profile } from "./profile.ts";
 
-export const RUN_MANIFEST_SCHEMA_VERSION = 2;
+export const RUN_MANIFEST_SCHEMA_VERSION = 3;
 export const RLM_RUNTIME_VERSION = "0.0.2";
 export const RLM_DSL_VERSION = "0.2.0";
 export { CONTROLLER_PROMPT_VERSION, CONTROLLER_TURN_VERSION, EXTRACTOR_PROMPT_VERSION };

@@ -17,10 +17,17 @@ import {
 } from "../core/budget.ts";
 import { type CallError, callError, ERROR_DETAIL_MAX_LENGTH } from "../core/errors.ts";
 import {
+  deriveOperationIntentId,
+  EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION,
+  OPERATION_JOURNAL_SCHEMA_VERSION,
+  operationRequestVersionAllowed,
   PROVIDER_REQUEST_IDENTITY_VERSION,
-  type ProviderOperationKind,
-  type RlmEvent,
-} from "../core/journal.ts";
+  type OperationIntendedEvent,
+  type OperationKind,
+  type OperationOutcome,
+  type OperationRequestIdentityVersion,
+  type OperationReservation,
+} from "../core/operation.ts";
 import { canonicalStringify, type JsonObject, type JsonValue } from "../core/json.ts";
 import type { CallUsage, CallUsageLimits } from "../core/usage.ts";
 import {
@@ -33,6 +40,7 @@ import {
   ZERO_CALL_USAGE,
 } from "../core/usage.ts";
 import { sha256 } from "../shell/hash.ts";
+import { JournalAppendError } from "../shell/journal-store.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 import { PiModelError } from "../shell/model/pi-model.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./abort.ts";
@@ -129,12 +137,32 @@ const prepareModelRequest = (client: ModelClient, input: ModelRequest): Prepared
 export const providerRequestIdentity = (
   client: ModelClient,
   request: ModelRequest,
-): { readonly version: string; readonly sha256: string } => {
+): ExternalRequestIdentity => {
   const prepared = prepareModelRequest(client, request);
   return { version: PROVIDER_REQUEST_IDENTITY_VERSION, sha256: sha256(prepared.canonicalIdentity) };
 };
 
-export type ModelOperationKind = ProviderOperationKind;
+/** Hash-only identity for the exact immutable projection passed to an opaque extractor. */
+export const externalExtractorRequestIdentity = (
+  manifestHash: string,
+  projectionVersion: string,
+  projectionSha256: string,
+): ExternalRequestIdentity => {
+  if (!/^[0-9a-f]{64}$/.test(manifestHash) || !/^[0-9a-f]{64}$/.test(projectionSha256)
+    || typeof projectionVersion !== "string" || projectionVersion.length === 0)
+    throw new TypeError("external extractor request identity is invalid");
+  return {
+    version: EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION,
+    sha256: sha256(canonicalStringify({
+      version: EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION,
+      manifestHash,
+      projectionVersion,
+      projectionSha256,
+    })),
+  };
+};
+
+export type ModelOperationKind = OperationKind;
 
 export interface ModelOperationOptions {
   readonly operationId: string;
@@ -158,12 +186,12 @@ export class ModelInvocationError extends Error {
 export interface ExternalOperationResult<T> {
   readonly value: T;
   readonly usage?: CallUsage;
-  readonly outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"];
+  readonly outcome: OperationOutcome;
   readonly errorCode?: string;
 }
 
 export interface ExternalRequestIdentity {
-  readonly version: string;
+  readonly version: OperationRequestIdentityVersion;
   readonly sha256: string;
 }
 
@@ -172,8 +200,15 @@ export interface ModelOperation {
   readonly attemptCount: number;
   /** True only after this distinct operation consumed logical-call capacity. */
   readonly logicalCallReserved: boolean;
+  /** True only when no launched external effect remains in flight. */
+  readonly idle: boolean;
+  /** Resolves only after every launched external effect reaches a terminal outcome. */
+  waitForIdle(): Promise<void>;
   complete(client: ModelClient, request: ModelRequest): Promise<ModelResponse>;
-  runExternal<T>(effect: () => Promise<T> | T): Promise<T>;
+  runExternal<T>(
+    effect: () => Promise<T> | T,
+    requestIdentity: ExternalRequestIdentity,
+  ): Promise<T>;
   runExternalReported<T>(
     effect: () => Promise<ExternalOperationResult<T>> | ExternalOperationResult<T>,
     requestIdentity: ExternalRequestIdentity,
@@ -317,26 +352,59 @@ export const createModelOperation = (
 ): ModelOperation => {
   let logicalReserved = false;
   let aggregate: CallUsage = ZERO_CALL_USAGE;
+  let poisoned = false;
+  let poisonCause: unknown;
+  const pendingFinalizers = new Set<Promise<unknown>>();
   const attemptKey = `${frame.frameId}\0${options.operationId}`;
   let attemptOrdinal = state.operationAttempts.get(attemptKey) ?? 0;
 
+  const ensureUsable = (): void => {
+    if (poisoned) throw poisonCause;
+  };
+  const poison = (error: unknown): void => {
+    if (poisoned) return;
+    poisoned = true;
+    poisonCause = error;
+  };
+  const trackFinalizer = <T>(work: Promise<T>): Promise<T> => {
+    pendingFinalizers.add(work);
+    void work.then(
+      () => { pendingFinalizers.delete(work); },
+      () => { pendingFinalizers.delete(work); },
+    );
+    // The caller-facing abort race may detach. Always observe the authoritative finalizer.
+    void work.catch(() => {});
+    return work;
+  };
+  const waitForIdle = async (): Promise<void> => {
+    while (pendingFinalizers.size > 0) await Promise.allSettled([...pendingFinalizers]);
+  };
+  const hasAuthority = (): boolean => state.operationAuthority?.active !== false;
+
   const checkpoint = (): void => {
+    ensureUsable();
     throwIfAborted(options.signal);
     if (state.clock.now() >= options.deadlineMs)
       throw new ModelInvocationError(callError("BUDGET_DEADLINE", "run deadline reached"), aggregate);
   };
 
-  const reserve = (tokens: number): CallError | undefined => {
+  const reserve = (
+    tokens: number,
+  ): { readonly ok: true; readonly value: OperationReservation } | { readonly ok: false; readonly error: CallError } => {
     const base = state.ledger.current;
+    const reservesLogicalCall = !logicalReserved;
     const logical = logicalReserved ? { ok: true as const, value: base } : reserveLogicalCall(base, state.clock.now());
-    if (!logical.ok) return logical.error;
+    if (!logical.ok) return { ok: false, error: logical.error };
     const attempt = reserveAttempt(logical.value, state.clock.now(), tokens);
-    if (!attempt.ok) return attempt.error;
+    if (!attempt.ok) return { ok: false, error: attempt.error };
     state.ledger.current = attempt.value;
     logicalReserved = true;
     attemptOrdinal += 1;
     state.operationAttempts.set(attemptKey, attemptOrdinal);
-    return undefined;
+    return {
+      ok: true,
+      value: { logicalCalls: reservesLogicalCall ? 1 : 0, attempts: 1, tokens },
+    };
   };
 
   const addAccounting = (usage: CallUsage): CallError | undefined => {
@@ -353,28 +421,77 @@ export const createModelOperation = (
     return undefined;
   };
 
-  const journal = async (
-    outcome: Extract<RlmEvent, { type: "provider_attempted" }>["outcome"],
-    usage: CallUsage,
-    errorCode?: string,
-    requestIdentity?: ExternalRequestIdentity,
-  ): Promise<void> => {
-    const appended = await state.journal.append({
-      type: "provider_attempted",
+  const appendIntent = async (
+    requestIdentity: ExternalRequestIdentity,
+    reservation: OperationReservation,
+  ): Promise<OperationIntendedEvent> => {
+    if (!operationRequestVersionAllowed(options.kind, requestIdentity.version)
+      || !/^[0-9a-f]{64}$/.test(requestIdentity.sha256))
+      throw new ModelInvocationError(callError("INVALID_REQUEST", "external request identity is invalid"), aggregate);
+    const identity = {
+      schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+      runId: state.runId,
       frameId: frame.frameId,
       operationId: options.operationId,
       kind: options.kind,
       key: options.key,
       attempt: attemptOrdinal,
-      outcome,
-      usage,
-      ...(requestIdentity ? {
-        requestIdentityVersion: requestIdentity.version,
-        requestSha256: requestIdentity.sha256,
-      } : {}),
-      ...(errorCode ? { errorCode } : {}),
-    });
-    if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
+      requestIdentityVersion: requestIdentity.version,
+      requestSha256: requestIdentity.sha256,
+      reservation,
+    } as const;
+    const event: OperationIntendedEvent = {
+      type: "operation_intended",
+      ...identity,
+      intentId: deriveOperationIntentId(state.hasher, identity),
+    };
+    try {
+      const appended = await state.journal.append(event);
+      if (appended?.event !== undefined && appended.event !== "committed")
+        throw new JournalAppendError("event", appended.event === "deduplicated", new Error("operation intent was not newly committed"));
+      if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
+      return event;
+    } catch (error) {
+      poison(error);
+      throw error;
+    }
+  };
+
+  const appendSettlement = async (
+    intent: OperationIntendedEvent,
+    outcome: OperationOutcome,
+    usage: CallUsage,
+    errorCode?: string,
+  ): Promise<void> => {
+    try {
+      const appended = await state.journal.append({
+        type: "operation_settled",
+        schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+        runId: state.runId,
+        frameId: frame.frameId,
+        intentId: intent.intentId,
+        outcome,
+        usage,
+        ...(errorCode ? { errorCode } : {}),
+      });
+      if (appended?.event !== undefined && appended.event !== "committed")
+        throw new JournalAppendError("event", appended.event === "deduplicated", new Error("operation settlement was not newly committed"));
+      if (appended?.statusCache?.state === "failed") throw appended.statusCache.error;
+    } catch (error) {
+      poison(error);
+      throw error;
+    }
+  };
+
+  const accountUsage = (reservedTokens: number, usage: CallUsage): CallError | undefined => {
+    const settled = settleAttemptUsage(state.ledger.current, reservedTokens, usage);
+    if (!settled.ok) {
+      const released = settleAttempt(state.ledger.current, reservedTokens, 0);
+      if (released.ok) state.ledger.current = released.value;
+      return settled.error;
+    }
+    state.ledger.current = settled.value;
+    return addAccounting(usage);
   };
 
   const complete = async (client: ModelClient, request: ModelRequest): Promise<ModelResponse> => {
@@ -399,96 +516,100 @@ export const createModelOperation = (
     }
     let pendingTokens = 0;
     let active = false;
+    let intent: OperationIntendedEvent;
     try {
       checkpoint();
-      const reservationError = reserve(reservedTokens);
-      if (reservationError) throw new ModelInvocationError(reservationError, aggregate);
+      const reserved = reserve(reservedTokens);
+      if (!reserved.ok) throw new ModelInvocationError(reserved.error, aggregate);
       pendingTokens = reservedTokens;
       const acquired = acquireLeaf(state.ledger.current);
       if (acquired === "saturated")
         throw new ModelInvocationError(callError("INVALID_RESULT", "model concurrency accounting diverged"), aggregate);
       state.ledger.current = acquired;
       active = true;
-
       checkpoint();
-      const requestSha256 = sha256(prepared.canonicalIdentity);
-      const startedMs = state.clock.now();
-      let raw: unknown;
-      try {
-        raw = await waitForAbort(client.complete(normalizedRequest), options.signal);
-      } catch (error) {
-        const typed = error instanceof PiModelError ? normalizePiFailure(error, usageLimits(state)) : undefined;
-        const usage: CallUsage = typed?.usage ?? {
-          attempts: 1,
-          durationMs: elapsedMs(startedMs, state.clock.now()),
-        };
-        const settled = settleAttemptUsage(state.ledger.current, pendingTokens, usage);
-        if (!settled.ok) {
-          const released = settleAttempt(state.ledger.current, pendingTokens, 0);
-          if (released.ok) state.ledger.current = released.value;
-          pendingTokens = 0;
-          throw new ModelInvocationError(settled.error, aggregate);
-        }
-        state.ledger.current = settled.value;
-        pendingTokens = 0;
-        const accountingError = addAccounting(usage);
-        const failure = accountingError ?? (typed
-          ? piFailure(typed)
-          : wasAborted(error, options.signal)
-            ? callError("CANCELLED", "model completion cancelled")
-            : callError("FAILED", "model completion failed"));
-        await journal(failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code, {
-          version: PROVIDER_REQUEST_IDENTITY_VERSION,
-          sha256: requestSha256,
-        });
-        throw new ModelInvocationError(failure, aggregate);
-      }
-
-      const response = normalizeModelResponse(raw, usageLimits(state));
-      if (!response) {
-        const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
-        const settled = settleAttemptUsage(state.ledger.current, pendingTokens, usage);
-        if (settled.ok) state.ledger.current = settled.value;
-        else {
-          const released = settleAttempt(state.ledger.current, pendingTokens, 0);
-          if (released.ok) state.ledger.current = released.value;
-        }
-        pendingTokens = 0;
-        const failure = addAccounting(usage) ?? callError("INVALID_RESULT", "model returned invalid usage");
-        await journal("invalid_result", usage, failure.code, {
-          version: PROVIDER_REQUEST_IDENTITY_VERSION,
-          sha256: requestSha256,
-        });
-        throw new ModelInvocationError(failure, aggregate);
-      }
-
-      const settled = settleAttemptUsage(state.ledger.current, pendingTokens, response.usage);
-      if (!settled.ok) {
-        const released = settleAttempt(state.ledger.current, pendingTokens, 0);
-        if (released.ok) state.ledger.current = released.value;
-        pendingTokens = 0;
-        throw new ModelInvocationError(settled.error, aggregate);
-      }
-      state.ledger.current = settled.value;
-      pendingTokens = 0;
-      const accountingError = addAccounting(response.usage);
-      if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
-      await journal("ok", response.usage, undefined, {
+      intent = await appendIntent({
         version: PROVIDER_REQUEST_IDENTITY_VERSION,
-        sha256: requestSha256,
-      });
-      return response;
-    } finally {
+        sha256: sha256(prepared.canonicalIdentity),
+      }, reserved.value);
+    } catch (error) {
       if (pendingTokens > 0) {
-        const released = settleAttempt(state.ledger.current, pendingTokens, 0);
-        if (released.ok) state.ledger.current = released.value;
+        const settled = settleAttempt(state.ledger.current, pendingTokens, 0);
+        if (settled.ok) state.ledger.current = settled.value;
       }
       if (active) state.ledger.current = releaseLeaf(state.ledger.current);
       release();
+      throw error;
     }
+
+    const startedMs = state.clock.now();
+    let external: Promise<unknown>;
+    try { external = Promise.resolve(client.complete(normalizedRequest)); }
+    catch (error) { external = Promise.reject(error); }
+    let settleLedger = false;
+    const finalizer = trackFinalizer((async (): Promise<ModelResponse> => {
+      try {
+        let raw: unknown;
+        try {
+          raw = await external;
+        } catch (error) {
+          if (!hasAuthority()) throw error;
+          settleLedger = true;
+          const typed = error instanceof PiModelError ? normalizePiFailure(error, usageLimits(state)) : undefined;
+          const usage: CallUsage = typed?.usage ?? {
+            attempts: 1,
+            durationMs: elapsedMs(startedMs, state.clock.now()),
+          };
+          const accountingError = accountUsage(pendingTokens, usage);
+          pendingTokens = 0;
+          const providerFailure = typed
+            ? piFailure(typed)
+            : wasAborted(error, options.signal)
+              ? callError("CANCELLED", "model completion cancelled")
+              : callError("FAILED", "model completion failed");
+          const failure = accountingError ?? providerFailure;
+          await appendSettlement(intent, accountingError
+            ? "invalid_result"
+            : failure.code === "CANCELLED" ? "cancelled" : "error", usage, failure.code);
+          throw new ModelInvocationError(failure, aggregate);
+        }
+
+        if (!hasAuthority()) return raw as ModelResponse;
+        settleLedger = true;
+        const response = normalizeModelResponse(raw, usageLimits(state));
+        if (!response) {
+          const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
+          const failure = accountUsage(pendingTokens, usage) ?? callError("INVALID_RESULT", "model returned invalid usage");
+          pendingTokens = 0;
+          await appendSettlement(intent, "invalid_result", usage, failure.code);
+          throw new ModelInvocationError(failure, aggregate);
+        }
+        const accountingError = accountUsage(pendingTokens, response.usage);
+        pendingTokens = 0;
+        if (accountingError) {
+          await appendSettlement(intent, "invalid_result", response.usage, accountingError.code);
+          throw new ModelInvocationError(accountingError, aggregate);
+        }
+        await appendSettlement(intent, "ok", response.usage);
+        return response;
+      } finally {
+        if (settleLedger) {
+          if (pendingTokens > 0) {
+            const settled = settleAttempt(state.ledger.current, pendingTokens, 0);
+            if (settled.ok) state.ledger.current = settled.value;
+          }
+          if (active) state.ledger.current = releaseLeaf(state.ledger.current);
+        }
+        release();
+      }
+    })());
+    return waitForAbort(finalizer, options.signal);
   };
 
-  const runExternal = async <T>(effect: () => Promise<T> | T): Promise<T> => {
+  const runExternal = async <T>(
+    effect: () => Promise<T> | T,
+    requestIdentity: ExternalRequestIdentity,
+  ): Promise<T> => {
     checkpoint();
     const release = await state.semaphore.acquire(options.signal);
     if (!release) {
@@ -496,59 +617,68 @@ export const createModelOperation = (
       throw new ModelInvocationError(callError("CANCELLED", "external model operation cancelled"), aggregate);
     }
     let active = false;
-    let settled = false;
-    const startedMs = state.clock.now();
-    const settleExternal = (): CallUsage => {
-      if (settled)
-        throw new ModelInvocationError(callError("INVALID_RESULT", "external model operation settled more than once"), aggregate);
-      const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
-      const before = state.ledger.current;
-      const settlement = settleAttemptUsage(before, 0, usage);
-      if (!settlement.ok) throw new ModelInvocationError(settlement.error, aggregate);
-      state.ledger.current = settlement.value;
-      const accountingError = addAccounting(usage);
-      if (accountingError) {
-        state.ledger.current = before;
-        throw new ModelInvocationError(accountingError, aggregate);
-      }
-      settled = true;
-      return usage;
-    };
+    let intent: OperationIntendedEvent;
     try {
       checkpoint();
-      const reservationError = reserve(0);
-      if (reservationError) throw new ModelInvocationError(reservationError, aggregate);
+      const reserved = reserve(0);
+      if (!reserved.ok) throw new ModelInvocationError(reserved.error, aggregate);
       const acquired = acquireLeaf(state.ledger.current);
       if (acquired === "saturated")
         throw new ModelInvocationError(callError("INVALID_RESULT", "model concurrency accounting diverged"), aggregate);
       state.ledger.current = acquired;
       active = true;
-
-      let value: T;
-      try {
-        value = await waitForAbort(Promise.resolve(effect()), options.signal);
-      } catch (error) {
-        const usage = settleExternal();
-        const cancelled = wasAborted(error, options.signal);
-        await journal(cancelled ? "cancelled" : "error", usage, cancelled ? "CANCELLED" : "FAILED");
-        throw error;
-      }
-      const usage = settleExternal();
-      await journal("ok", usage);
-      return value;
-    } finally {
+      intent = await appendIntent(requestIdentity, reserved.value);
+    } catch (error) {
       if (active) state.ledger.current = releaseLeaf(state.ledger.current);
       release();
+      throw error;
     }
+
+    const startedMs = state.clock.now();
+    let external: Promise<T>;
+    try { external = Promise.resolve(effect()); }
+    catch (error) { external = Promise.reject(error); }
+    let settleLedger = false;
+    const finalizer = trackFinalizer((async (): Promise<T> => {
+      try {
+        let value: T;
+        try {
+          value = await external;
+        } catch (error) {
+          if (!hasAuthority()) throw error;
+          settleLedger = true;
+          const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
+          const cancelled = wasAborted(error, options.signal);
+          const accountingError = accountUsage(0, usage);
+          const failure = accountingError ?? callError(cancelled ? "CANCELLED" : "FAILED", cancelled
+            ? "external operation cancelled"
+            : "external operation failed");
+          await appendSettlement(intent, accountingError ? "invalid_result" : cancelled ? "cancelled" : "error", usage, failure.code);
+          if (accountingError) throw new ModelInvocationError(accountingError, aggregate);
+          throw error;
+        }
+        if (!hasAuthority()) return value;
+        settleLedger = true;
+        const usage: CallUsage = { attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) };
+        const accountingError = accountUsage(0, usage);
+        if (accountingError) {
+          await appendSettlement(intent, "invalid_result", usage, accountingError.code);
+          throw new ModelInvocationError(accountingError, aggregate);
+        }
+        await appendSettlement(intent, "ok", usage);
+        return value;
+      } finally {
+        if (settleLedger && active) state.ledger.current = releaseLeaf(state.ledger.current);
+        release();
+      }
+    })());
+    return waitForAbort(finalizer, options.signal);
   };
 
   const runExternalReported = async <T>(
     effect: () => Promise<ExternalOperationResult<T>> | ExternalOperationResult<T>,
     requestIdentity: ExternalRequestIdentity,
   ): Promise<T> => {
-    if (typeof requestIdentity.version !== "string" || requestIdentity.version.length === 0
-      || !/^[0-9a-f]{64}$/.test(requestIdentity.sha256))
-      throw new ModelInvocationError(callError("INVALID_REQUEST", "external request identity is invalid"), aggregate);
     checkpoint();
     const release = await state.semaphore.acquire(options.signal);
     if (!release) {
@@ -556,78 +686,89 @@ export const createModelOperation = (
       throw new ModelInvocationError(callError("CANCELLED", "external operation cancelled"), aggregate);
     }
     let active = false;
-    let settled = false;
-    const startedMs = state.clock.now();
-    const measuredUsage = (): CallUsage => ({ attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) });
-    const settleReported = (usage: CallUsage): CallError | undefined => {
-      if (settled) return callError("INVALID_RESULT", "external operation settled more than once");
-      const before = state.ledger.current;
-      const settlement = settleAttemptUsage(before, 0, usage);
-      if (!settlement.ok) return settlement.error;
-      state.ledger.current = settlement.value;
-      const accountingError = addAccounting(usage);
-      if (accountingError) {
-        state.ledger.current = before;
-        return accountingError;
-      }
-      settled = true;
-      return undefined;
-    };
+    let intent: OperationIntendedEvent;
     try {
       checkpoint();
-      const reservationError = reserve(0);
-      if (reservationError) throw new ModelInvocationError(reservationError, aggregate);
+      const reserved = reserve(0);
+      if (!reserved.ok) throw new ModelInvocationError(reserved.error, aggregate);
       const acquired = acquireLeaf(state.ledger.current);
       if (acquired === "saturated")
         throw new ModelInvocationError(callError("INVALID_RESULT", "model concurrency accounting diverged"), aggregate);
       state.ledger.current = acquired;
       active = true;
-
-      let result: ExternalOperationResult<T>;
-      try {
-        result = await waitForAbort(Promise.resolve(effect()), options.signal);
-      } catch (error) {
-        const usage = measuredUsage();
-        const accountingError = settleReported(usage);
-        const cancelled = wasAborted(error, options.signal);
-        const failure = accountingError ?? callError(cancelled ? "CANCELLED" : "FAILED", cancelled
-          ? "external operation cancelled"
-          : "external operation failed");
-        await journal(cancelled ? "cancelled" : "error", usage, failure.code, requestIdentity);
-        throw new ModelInvocationError(failure, aggregate);
-      }
-
-      let usage = measuredUsage();
-      if (result.usage !== undefined) {
-        const normalized = normalizeCallUsage(result.usage, usageLimits(state));
-        if (!normalized.ok) {
-          const accountingError = settleReported(usage);
-          const failure = accountingError ?? callError("INVALID_RESULT", "external operation returned invalid usage");
-          await journal("invalid_result", usage, failure.code, requestIdentity);
-          throw new ModelInvocationError(failure, aggregate);
-        }
-        usage = { ...normalized.value, attempts: 1 };
-      }
-      const accountingError = settleReported(usage);
-      if (accountingError) {
-        const fallbackUsage = measuredUsage();
-        const fallbackError = settleReported(fallbackUsage);
-        if (fallbackError) throw new ModelInvocationError(fallbackError, aggregate);
-        await journal("invalid_result", fallbackUsage, accountingError.code, requestIdentity);
-        throw new ModelInvocationError(accountingError, aggregate);
-      }
-      await journal(result.outcome, usage, result.errorCode, requestIdentity);
-      return result.value;
-    } finally {
+      intent = await appendIntent(requestIdentity, reserved.value);
+    } catch (error) {
       if (active) state.ledger.current = releaseLeaf(state.ledger.current);
       release();
+      throw error;
     }
+
+    const startedMs = state.clock.now();
+    const measuredUsage = (): CallUsage => ({ attempts: 1, durationMs: elapsedMs(startedMs, state.clock.now()) });
+    let external: Promise<ExternalOperationResult<T>>;
+    try { external = Promise.resolve(effect()); }
+    catch (error) { external = Promise.reject(error); }
+    let settleLedger = false;
+    const finalizer = trackFinalizer((async (): Promise<T> => {
+      try {
+        let result: ExternalOperationResult<T>;
+        try {
+          result = await external;
+        } catch (error) {
+          if (!hasAuthority()) throw error;
+          settleLedger = true;
+          const usage = measuredUsage();
+          const accountingError = accountUsage(0, usage);
+          const cancelled = wasAborted(error, options.signal);
+          const failure = accountingError ?? callError(cancelled ? "CANCELLED" : "FAILED", cancelled
+            ? "external operation cancelled"
+            : "external operation failed");
+          await appendSettlement(intent, accountingError ? "invalid_result" : cancelled ? "cancelled" : "error", usage, failure.code);
+          throw new ModelInvocationError(failure, aggregate);
+        }
+        if (!hasAuthority()) return result.value;
+        settleLedger = true;
+        let usage = measuredUsage();
+        if (result.usage !== undefined) {
+          const normalized = normalizeCallUsage(result.usage, usageLimits(state));
+          if (!normalized.ok) {
+            const failure = accountUsage(0, usage) ?? callError("INVALID_RESULT", "external operation returned invalid usage");
+            await appendSettlement(intent, "invalid_result", usage, failure.code);
+            throw new ModelInvocationError(failure, aggregate);
+          }
+          usage = { ...normalized.value, attempts: 1 };
+        }
+        const validOutcome = result.outcome === "ok" || result.outcome === "error"
+          || result.outcome === "cancelled" || result.outcome === "invalid_result";
+        const validErrorCode = result.outcome === "ok"
+          ? result.errorCode === undefined
+          : typeof result.errorCode === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.errorCode);
+        if (!validOutcome || !validErrorCode) {
+          const failure = accountUsage(0, usage) ?? callError("INVALID_RESULT", "external operation returned an invalid outcome");
+          await appendSettlement(intent, "invalid_result", usage, failure.code);
+          throw new ModelInvocationError(failure, aggregate);
+        }
+        const accountingError = accountUsage(0, usage);
+        if (accountingError) {
+          await appendSettlement(intent, "invalid_result", usage, accountingError.code);
+          throw new ModelInvocationError(accountingError, aggregate);
+        }
+        await appendSettlement(intent, result.outcome, usage, result.errorCode);
+        return result.value;
+      } finally {
+        if (settleLedger && active) state.ledger.current = releaseLeaf(state.ledger.current);
+        release();
+      }
+    })());
+    return waitForAbort(finalizer, options.signal);
   };
 
   return {
     get usage() { return aggregate; },
     get attemptCount() { return attemptOrdinal; },
     get logicalCallReserved() { return logicalReserved; },
+    get idle() { return pendingFinalizers.size === 0; },
+    waitForIdle,
     complete,
     runExternal,
     runExternalReported,

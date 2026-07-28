@@ -1,11 +1,15 @@
 import { isProxy } from "node:util/types";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
+import type { RlmEvent } from "../core/journal.ts";
 import {
-  AGENT_REQUEST_IDENTITY_VERSION,
-  PROVIDER_REQUEST_IDENTITY_VERSION,
-  type RlmEvent,
-} from "../core/journal.ts";
+  deriveOperationIntentId,
+  OPERATION_JOURNAL_SCHEMA_VERSION,
+  operationRequestVersionAllowed,
+  type OperationIntentIdentity,
+} from "../core/operation.ts";
 import { err, ok, type Result } from "../core/result.ts";
+import { MAX_CALL_TOKENS } from "../core/usage.ts";
+import { sha256 } from "./hash.ts";
 
 const MAX_EVENT_DEPTH = 5;
 const MAX_EVENT_NODES = 20_000;
@@ -13,13 +17,15 @@ const MAX_EVENT_ARRAY = 10_000;
 const MAX_EVENT_STRING = 1_048_576;
 const MAX_EVENT_KEYS = 32;
 const HASH = /^[0-9a-f]{64}$/;
+const OPERATION_INTENT_ID = /^op_[0-9a-f]{64}$/;
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const CONTEXT_REF = /^ctx_[0-9a-f]{64}$/;
 const CALL_KINDS = new Set(["llm", "agent", "recurse", "tool", "artifact", "context"]);
 const COMPLETION_MODES = new Set(["answer", "fallback_extract"]);
 const FRAME_STATES = new Set(["open", "answered", "closed", "failed", "cancelled"]);
-const PROVIDER_KINDS = new Set(["controller", "llm", "extractor", "agent"]);
+const OPERATION_KINDS = new Set(["controller", "llm", "extractor", "agent"]);
 const AGENT_APPROVAL_DECISIONS = new Set(["allowlisted", "approved", "denied"]);
-const PROVIDER_OUTCOMES = new Set(["ok", "error", "cancelled", "invalid_result"]);
+const OPERATION_OUTCOMES = new Set(["ok", "error", "cancelled", "invalid_result"]);
 
 type RecordValue = Record<string, unknown>;
 const own = (value: RecordValue, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
@@ -123,6 +129,14 @@ const validInputRefs = (value: unknown): boolean => Array.isArray(value) && valu
 const validStringArray = (value: unknown): boolean =>
   Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0);
 
+const validOperationReservation = (value: unknown): boolean => {
+  const reservation = record(value);
+  return reservation !== undefined && exact(reservation, ["logicalCalls", "attempts", "tokens"])
+    && (reservation["logicalCalls"] === 0 || reservation["logicalCalls"] === 1)
+    && reservation["attempts"] === 1 && integer(reservation, "tokens")
+    && (reservation["tokens"] as number) <= MAX_CALL_TOKENS;
+};
+
 const validOptionalOutput = (
   value: RecordValue,
   refKey: "outputRef",
@@ -182,18 +196,43 @@ const validEvent = (event: RecordValue): boolean => {
     case "fallback_evidence_cited":
       return exact(event, ["type", "frameId", "evidenceRefs", "evidenceRefsHash"])
         && string(event, "frameId", false) && validStringArray(event["evidenceRefs"]) && hash(event, "evidenceRefsHash");
-    case "provider_attempted": {
-      if (!exact(event, ["type", "frameId", "operationId", "kind", "key", "attempt", "outcome", "usage"],
-        ["requestIdentityVersion", "requestSha256", "errorCode"])
-        || !string(event, "frameId", false) || !string(event, "operationId", false) || !oneOf(event, "kind", PROVIDER_KINDS)
-        || !string(event, "key") || !integer(event, "attempt", true) || !oneOf(event, "outcome", PROVIDER_OUTCOMES)
-        || !validUsage(event["usage"]) || !optional(event, "errorCode", () => string(event, "errorCode", false))) return false;
-      const requestIdentityFields = Number(own(event, "requestIdentityVersion")) + Number(own(event, "requestSha256"));
-      const expectedIdentityVersion = event["kind"] === "agent"
-        ? AGENT_REQUEST_IDENTITY_VERSION
-        : PROVIDER_REQUEST_IDENTITY_VERSION;
-      return requestIdentityFields === 0 || (requestIdentityFields === 2
-        && event["requestIdentityVersion"] === expectedIdentityVersion && hash(event, "requestSha256"));
+    case "operation_intended": {
+      if (!exact(event, ["type", "schemaVersion", "runId", "frameId", "operationId", "kind", "key", "attempt",
+        "requestIdentityVersion", "requestSha256", "reservation", "intentId"])
+        || event["schemaVersion"] !== OPERATION_JOURNAL_SCHEMA_VERSION
+        || !string(event, "runId", false) || !string(event, "frameId", false) || !string(event, "operationId", false)
+        || !oneOf(event, "kind", OPERATION_KINDS) || !string(event, "key") || !integer(event, "attempt", true)
+        || !string(event, "requestIdentityVersion", false) || !hash(event, "requestSha256")
+        || !validOperationReservation(event["reservation"])
+        || !string(event, "intentId", false) || !OPERATION_INTENT_ID.test(event["intentId"] as string)
+        || !operationRequestVersionAllowed(event["kind"] as OperationIntentIdentity["kind"], event["requestIdentityVersion"] as string))
+        return false;
+      const identity: OperationIntentIdentity = {
+        schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+        runId: event["runId"] as string,
+        frameId: event["frameId"] as string,
+        operationId: event["operationId"] as string,
+        kind: event["kind"] as OperationIntentIdentity["kind"],
+        key: event["key"] as string,
+        attempt: event["attempt"] as number,
+        requestIdentityVersion: event["requestIdentityVersion"] as OperationIntentIdentity["requestIdentityVersion"],
+        requestSha256: event["requestSha256"] as string,
+        reservation: event["reservation"] as unknown as OperationIntentIdentity["reservation"],
+      };
+      return event["intentId"] === deriveOperationIntentId(sha256, identity);
+    }
+    case "operation_settled": {
+      if (!exact(event, ["type", "schemaVersion", "runId", "frameId", "intentId", "outcome", "usage"], ["errorCode"])
+        || event["schemaVersion"] !== OPERATION_JOURNAL_SCHEMA_VERSION
+        || !string(event, "runId", false) || !string(event, "frameId", false)
+        || !string(event, "intentId", false) || !OPERATION_INTENT_ID.test(event["intentId"] as string)
+        || !oneOf(event, "outcome", OPERATION_OUTCOMES) || !validUsage(event["usage"])) return false;
+      const usage = record(event["usage"]);
+      if (usage?.["attempts"] !== 1) return false;
+      const okOutcome = event["outcome"] === "ok";
+      return okOutcome
+        ? !own(event, "errorCode")
+        : own(event, "errorCode") && string(event, "errorCode", false) && ERROR_CODE.test(event["errorCode"] as string);
     }
     case "call_committed":
       return exact(event, ["type", "frameId", "callId", "kind", "key", "cached", "ok", "usage"],

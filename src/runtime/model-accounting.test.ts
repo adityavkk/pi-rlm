@@ -119,9 +119,11 @@ describe("tree-wide model accounting", () => {
       activeLeafCalls: 0,
     });
     const journal = await events(dir);
-    const attempts = journal.filter((event) => event.type === "provider_attempted");
-    expect(attempts).toHaveLength(2);
-    expect(attempts.every((event) => event.type === "provider_attempted" && event.kind === "controller")).toBe(true);
+    const intents = journal.filter((event) => event.type === "operation_intended");
+    const settlements = journal.filter((event) => event.type === "operation_settled");
+    expect(intents).toHaveLength(2);
+    expect(settlements).toHaveLength(2);
+    expect(intents.every((event) => event.kind === "controller")).toBe(true);
     const cell = journal.find((event) => event.type === "cell_committed");
     expect(cell?.type === "cell_committed" && cell.usage).toMatchObject({ attempts: 2, totalTokens: 22, costUsd: 0.30000000000000004 });
   });
@@ -147,7 +149,7 @@ describe("tree-wide model accounting", () => {
     const journal = await events(dir);
     const recurse = journal.find((event) => event.type === "call_committed" && event.kind === "recurse");
     expect(recurse?.type === "call_committed" && recurse.usage.attempts).toBe(1);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toHaveLength(2);
+    expect(journal.filter((event) => event.type === "operation_settled")).toHaveLength(2);
   });
 
   test("leaf structured repair uses the same operation and counts both attempts", async () => {
@@ -193,8 +195,11 @@ describe("tree-wide model accounting", () => {
     expect(result.answer).toEqual({ answer: "external" });
     expect(model.callCount).toBe(0);
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, tokensUsed: 0 });
-    const attempt = (await events(dir)).find((event) => event.type === "provider_attempted");
-    expect(attempt).toMatchObject({ type: "provider_attempted", kind: "extractor", outcome: "ok", usage: { attempts: 1 } });
+    const journal = await events(dir);
+    const intent = journal.find((event) => event.type === "operation_intended");
+    const settlement = journal.find((event) => event.type === "operation_settled");
+    expect(intent).toMatchObject({ type: "operation_intended", kind: "extractor", reservation: { logicalCalls: 1, attempts: 1, tokens: 0 } });
+    expect(settlement).toMatchObject({ type: "operation_settled", intentId: intent?.type === "operation_intended" ? intent.intentId : "", outcome: "ok", usage: { attempts: 1 } });
   });
 
   test("provider fallback can call the model only through the shared boundary", async () => {
@@ -311,13 +316,13 @@ describe("reviewed accounting boundaries", () => {
     expect(tokenReservation({ ...request, schema: large })).toBeGreaterThan(tokenReservation({ ...request, schema: small })!);
   });
 
-  test("external extractor settles once when provider-attempt journal cache refresh fails", async () => {
+  test("external extractor settles once when operation-settlement cache refresh fails", async () => {
     const dir = await tmp();
     class CacheFailJournal extends JournalStore {
       private injected = false;
       override async append(event: RlmEvent): Promise<JournalAppendOutcome> {
         const outcome = await super.append(event);
-        if (!this.injected && event.type === "provider_attempted") {
+        if (!this.injected && event.type === "operation_settled") {
           this.injected = true;
           return {
             ...outcome,
@@ -347,7 +352,7 @@ describe("reviewed accounting boundaries", () => {
       error: { code: "JOURNAL_FAILED", cause: { name: "JournalAppendError" } },
       ledger: { usage: { logicalCalls: 1, attempts: 1, activeLeafCalls: 0 } },
     });
-    expect((await events(dir)).filter((event) => event.type === "provider_attempted")).toHaveLength(1);
+    expect((await events(dir)).filter((event) => event.type === "operation_settled")).toHaveLength(1);
   });
 
   test("external extractor receives no nested completion capability at maxConcurrency one", async () => {

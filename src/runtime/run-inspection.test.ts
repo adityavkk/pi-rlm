@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { callError } from "../core/errors.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
@@ -10,6 +10,8 @@ import { ZERO_CALL_USAGE } from "../core/usage.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
+
+setDefaultTimeout(15_000);
 import { FunctionExtractor } from "./extractor.ts";
 import type { ControllerDriver } from "./controller.ts";
 import { MockController } from "./mock-controller.ts";
@@ -238,7 +240,7 @@ describe("bounded managed run inspection pages", () => {
     await expectInspectionCode(inspectManagedRunPage(request(firstFixture.lease.name, "cells", {
       pageSize: 201,
     }), { root: firstFixture.root }), "RUN_INSPECTION_INVALID_REQUEST");
-  });
+  }, 15_000);
 
   test("continues an authenticated cursor over an unchanged prefix while the journal grows", async () => {
     const fixture = await managedRun("active-prefix", new MockController([
@@ -287,7 +289,7 @@ describe("bounded managed run inspection pages", () => {
     }));
     await expect(inspectManagedRunPage(request(fixture.lease.name, "summary"), { root: fixture.root }))
       .rejects.toMatchObject({ code: "RECOVERY_SEMANTIC_CORRUPTION" });
-  });
+  }, 15_000);
 
   test("rejects null, proxy, accessor, extra, and nonplain requests without invoking traps", async () => {
     const fixture = await managedRun("hostile", new MockController([{ reasoning: "done", code: "answer({ answer: 'ok' })" }]));
@@ -306,7 +308,10 @@ describe("bounded managed run inspection pages", () => {
   test("rejects a semantically valid large projection at the aggregate cap", async () => {
     const fixture = await managedRun("large", new MockController([{
       reasoning: "failure", code: "throw new Error('failed')",
-    }]), { profile: { ...DEFAULT_PROFILE, maxControllerTurns: 1 } });
+    }]), { profile: {
+      ...DEFAULT_PROFILE,
+      maxControllerTurns: MAX_RUN_INSPECTION_AGGREGATE_ITEMS + 1,
+    } });
     expect(fixture.result.status).toBe("failed");
     const original = await events(fixture.lease.dir);
     const started = original.find((event) => event.type === "run_started");

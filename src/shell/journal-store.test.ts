@@ -4,8 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { BudgetLimits } from "../core/budget.ts";
-import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
+import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
+import {
+  deriveOperationIntentId,
+  OPERATION_JOURNAL_SCHEMA_VERSION,
+  PROVIDER_REQUEST_IDENTITY_VERSION,
+  type OperationIntentIdentity,
+} from "../core/operation.ts";
 import {
   JournalAppendError,
   JournalStore,
@@ -343,20 +349,24 @@ describe("JournalStore", () => {
     expect(getterCalls).toBe(0);
     expect(parseRlmEvent(new Proxy(valid, {})).ok).toBe(false);
 
-    const providerAttempt = {
-      type: "provider_attempted", frameId: "f0", operationId: "op", kind: "llm", key: "k", attempt: 1,
-      outcome: "ok", usage: { attempts: 1, durationMs: 0 },
+    const operationIdentity: OperationIntentIdentity = {
+      schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+      runId: "r1", frameId: "f0", operationId: "op", kind: "llm", key: "fixture", attempt: 1,
+      requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: digestA,
+      reservation: { logicalCalls: 1, attempts: 1, tokens: 4 },
+    };
+    const operationIntent = {
+      type: "operation_intended", ...operationIdentity,
+      intentId: deriveOperationIntentId((value) => createHash("sha256").update(value).digest("hex"), operationIdentity),
     } as const;
-    // Omission remains valid for opaque external operations; provider requests require a complete supported identity pair.
-    expect(parseRlmEvent(providerAttempt).ok).toBe(true);
-    expect(parseRlmEvent({ ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION }).ok).toBe(false);
-    expect(parseRlmEvent({ ...providerAttempt, requestSha256: digestA }).ok).toBe(false);
-    expect(parseRlmEvent({ ...providerAttempt, requestIdentityVersion: "arbitrary", requestSha256: digestA }).ok).toBe(false);
+    expect(parseRlmEvent(operationIntent).ok).toBe(true);
+    expect(parseRlmEvent({ ...operationIntent, requestIdentityVersion: "arbitrary" }).ok).toBe(false);
+    expect(parseRlmEvent({ ...operationIntent, requestSha256: "A".repeat(64) }).ok).toBe(false);
+    expect(parseRlmEvent({ ...operationIntent, attempt: 2 }).ok).toBe(false);
     expect(parseRlmEvent({
-      ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: "A".repeat(64),
-    }).ok).toBe(false);
-    expect(parseRlmEvent({
-      ...providerAttempt, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: digestA,
+      type: "operation_settled", schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+      runId: "r1", frameId: "f0", intentId: operationIntent.intentId,
+      outcome: "ok", usage: { attempts: 1, durationMs: 0 },
     }).ok).toBe(true);
     expect(parseRlmEvent({
       type: "answer_committed", frameId: "f0", completionMode: "answer", outputRef: "ctx_short",

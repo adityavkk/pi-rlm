@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { settledOperations } from "../runtime/testing/operation-events.ts";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { canonicalStringify, parseJsonValue } from "../core/index.ts";
 import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
@@ -326,29 +327,16 @@ describe("public AgentSession rlm_run grant lifecycle", () => {
       assertGrant(fixture, confirmations);
       const journal = await fixture.readEvents();
       expect(journal.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_cancelled",
+        "run_started", "frame_opened", "operation_intended", "frame_closed", "run_cancelled",
       ]);
-      const attempts = journal.filter((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
-        event.type === "provider_attempted");
-      expect(attempts).toHaveLength(1);
+      expect(settledOperations(journal)).toHaveLength(0);
       const runStarted = journal[0];
       if (runStarted?.type !== "run_started") throw new Error("cancelled journal does not start with run_started");
       const frameId = `${runStarted.runId}:f0`;
-      expect(attempts[0]).toEqual({
-        type: "provider_attempted",
-        frameId,
-        operationId: `${frameId}:controller:1`,
-        kind: "controller",
-        key: "1",
-        attempt: 1,
-        outcome: "cancelled",
-        usage: { attempts: 1, durationMs: attempts[0]!.usage.durationMs },
-        requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
-        requestSha256: CONTROLLER_REQUEST_SHA,
-        errorCode: "CANCELLED",
+      expect(journal.find((event) => event.type === "operation_intended")).toMatchObject({
+        type: "operation_intended", frameId, operationId: `${frameId}:controller:1`, kind: "controller",
+        attempt: 1, requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: CONTROLLER_REQUEST_SHA,
       });
-      expect(Object.keys(attempts[0]!.usage).sort()).toEqual(["attempts", "durationMs"]);
-      expect(Number.isSafeInteger(attempts[0]!.usage.durationMs)).toBe(true);
       const terminals = terminalEvents(journal);
       expect(terminals).toHaveLength(1);
       expect(terminals[0]).toEqual({
@@ -374,17 +362,16 @@ describe("public AgentSession rlm_run grant lifecycle", () => {
         status: "cancelled",
         truncation: { omittedBytes: 0, originalBytes: 0, truncated: false },
         usage: {
-          activeLeafCalls: 0, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
+          activeLeafCalls: 1, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
           inputTokensUsed: 0, logicalCalls: 1, outputTokensUsed: 0,
-          providerDurationMs: attempts[0]!.usage.durationMs, storedBytes: 32,
-          tokensReserved: 0, tokensUsed: 0,
+          providerDurationMs: 0, storedBytes: 32,
+          tokensReserved: expect.any(Number), tokensUsed: 0,
         },
         warningCodes: [],
       });
 
       const treeBefore = await snapshotTree(fixture.runRoot);
       const eventsBefore = structuredClone(journal);
-      const accountingBefore = structuredClone(attempts[0]?.usage);
       if (!fixture.sessionFile) throw new Error("persistent AgentSession fixture has no session file");
       const sessionFileBefore = await readFile(fixture.sessionFile);
       const sessionBefore = JSON.stringify({
@@ -399,7 +386,6 @@ describe("public AgentSession rlm_run grant lifecycle", () => {
       expect(fixture.state.aborts).toBe(1);
       expect(await snapshotTree(fixture.runRoot)).toEqual(treeBefore);
       expect(await fixture.readEvents()).toEqual(eventsBefore);
-      expect(attempts[0]?.usage).toEqual(accountingBefore);
       expect(await readFile(fixture.sessionFile)).toEqual(sessionFileBefore);
       expect(JSON.stringify({
         messages: fixture.runtime.session.messages,

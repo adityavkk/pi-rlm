@@ -423,7 +423,9 @@ export const agentCall = async (
       const parsedRequest = normalizeDelegationV2Request(request);
       if (!parsedRequest.ok)
         return errResult(callId, callError("INVALID_REQUEST", "delegated agent request exceeds protocol limits"), ZERO_CALL_USAGE, false);
-      const requestSha256 = state.hasher(canonicalStringify(parsedRequest.value as unknown as JsonValue));
+      const { version: _protocolVersion, ...normalizedRequest } = parsedRequest.value;
+      const requestSnapshot = normalizedRequest as unknown as DelegationV2CallSpec;
+      const requestSha256 = state.hasher(canonicalStringify(requestSnapshot as unknown as JsonValue));
       operation = createModelOperation(state, frame, {
         operationId: callId,
         kind: "agent",
@@ -433,8 +435,8 @@ export const agentCall = async (
       });
       const attempted = await operation.runExternalReported(async () => {
         await verifyDelegatedContexts(state, delegated.references, signal);
-        const rawOutcome = await runtime.delegate(request, { signal });
-        const outcome = normalizeDelegationV2Outcome(rawOutcome, request.result.kind) ?? {
+        const rawOutcome = await runtime.delegate(requestSnapshot, { signal });
+        const outcome = normalizeDelegationV2Outcome(rawOutcome, requestSnapshot.result.kind) ?? {
           ok: false as const,
           code: "INVALID_RESULT" as const,
           status: "invalid_result",
@@ -483,15 +485,19 @@ export const agentCall = async (
     },
   );
 
-  state.inflight.set(callId, task);
+  const coalesced = task.then(
+    (result) => !operation || operation.idle ? result : operation.waitForIdle().then(() => result),
+    (error: unknown) => !operation || operation.idle ? Promise.reject(error) : operation.waitForIdle().then(() => { throw error; }),
+  );
+  state.inflight.set(callId, coalesced);
   state.progress?.publish();
-  void task.then(
+  void coalesced.then(
     () => {
-      if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+      if (state.inflight.get(callId) === coalesced) state.inflight.delete(callId);
       state.progress?.publish();
     },
     () => {
-      if (state.inflight.get(callId) === task) state.inflight.delete(callId);
+      if (state.inflight.get(callId) === coalesced) state.inflight.delete(callId);
       state.progress?.publish();
     },
   );

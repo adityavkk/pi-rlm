@@ -10,11 +10,16 @@
 
 import type { BudgetLimits } from "./budget.ts";
 import type { CallKind } from "./ids.ts";
+import type { OperationIntendedEvent, OperationKind, OperationSettledEvent } from "./operation.ts";
 import type { CallUsage } from "./usage.ts";
 
-export type ProviderOperationKind = "controller" | "llm" | "extractor" | "agent";
-export const PROVIDER_REQUEST_IDENTITY_VERSION = "pi-rlm.provider-request.v1";
-export const AGENT_REQUEST_IDENTITY_VERSION = "pi-rlm.agent-request.v1";
+export {
+  AGENT_REQUEST_IDENTITY_VERSION,
+  EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION,
+  OPERATION_JOURNAL_SCHEMA_VERSION,
+  PROVIDER_REQUEST_IDENTITY_VERSION,
+} from "./operation.ts";
+export type ProviderOperationKind = OperationKind;
 
 export type CompletionMode = "answer" | "fallback_extract";
 export type RunState = "running" | "completed" | "failed" | "cancelled";
@@ -96,20 +101,8 @@ export type RlmEvent =
       readonly evidenceRefs: readonly string[];
       readonly evidenceRefsHash: string;
     }
-  | {
-      readonly type: "provider_attempted";
-      readonly frameId: string;
-      readonly operationId: string;
-      readonly kind: ProviderOperationKind;
-      readonly key: string;
-      readonly attempt: number;
-      readonly outcome: "ok" | "error" | "cancelled" | "invalid_result";
-      readonly usage: CallUsage;
-      /** Present for every provider request; omitted only for opaque external operations. */
-      readonly requestIdentityVersion?: string;
-      readonly requestSha256?: string;
-      readonly errorCode?: string;
-    }
+  | OperationIntendedEvent
+  | OperationSettledEvent
   | {
       readonly type: "call_committed";
       readonly frameId: string;
@@ -254,7 +247,8 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       case "agent_approval":
       case "fallback_evidence_projected":
       case "fallback_evidence_cited":
-      case "provider_attempted":
+      case "operation_intended":
+      case "operation_settled":
         break;
       case "key_bound": {
         const registryKey = `${event.frameId}\u0000${event.kind}\u0000${event.key}`;

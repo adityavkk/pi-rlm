@@ -36,7 +36,8 @@ import {
 } from "./extractor-evidence.ts";
 import { runFrame } from "./frame.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
-import { createModelOperation, ModelInvocationError } from "./provider.ts";
+import { createRunOperationAuthority } from "./operation-authority.ts";
+import { createModelOperation, externalExtractorRequestIdentity, ModelInvocationError } from "./provider.ts";
 import { contextStoreLimits, DEFAULT_PROFILE, type Profile, resolveLimits } from "./profile.ts";
 import {
   createRunProgressTracker,
@@ -448,6 +449,7 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
     dslVersion: RLM_DSL_VERSION,
   });
   const ledgerRef = { current: createLedger(limits) };
+  const operationAuthority = createRunOperationAuthority();
   const progress = createRunProgressTracker({
     startMs,
     limits,
@@ -602,6 +604,7 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
       keyIdentities: new Map(),
       scopeUsage: new Map(),
       operationAttempts: new Map(),
+      operationAuthority,
       semaphore: new Semaphore(profile.maxConcurrency),
       contextSemaphore: new Semaphore(1),
       ...(agentDelegationRuntime ? { agentDelegation: agentDelegationRuntime } : {}),
@@ -674,7 +677,10 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
                 buildExtractorModelRequest(built.projection, request),
               ),
             }), scope.signal)
-          : await operation.runExternal(() => input.extractor!.extract(built.projection, scope.signal));
+          : await operation.runExternal(
+              () => input.extractor!.extract(built.projection, scope.signal),
+              externalExtractorRequestIdentity(manifestHash, built.metadata.projectionVersion, built.metadata.projectionHash),
+            );
         if (input.extractor.accountingMode === "provider" && operation.attemptCount === 0)
           throw new ModelInvocationError(
             { code: "INVALID_REQUEST", message: "provider extractor returned without using the accounting boundary", retryable: false },
@@ -730,6 +736,7 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
     planned = exceptionResult(runId, phase, error, scope);
   } finally {
     scope.dispose();
+    operationAuthority.close();
   }
 
   const result = planned ?? failure(runId, "FAILED", "run failed");
