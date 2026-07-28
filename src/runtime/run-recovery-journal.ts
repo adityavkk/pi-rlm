@@ -441,7 +441,9 @@ export const validateRecoveryJournal = (
         if (!binding || event.cached) semanticError("committed call lacks one prior key binding");
         const executions = calls.get(event.callId) ?? [];
         const prior = executions.at(-1);
-        if (prior && same(prior, event)) break;
+        // Recurse retries may produce byte-identical failed executions while opening
+        // distinct child frame IDs. Preserve each execution for frame/call bijection.
+        if (prior && event.kind !== "recurse" && same(prior, event)) break;
         if (prior && (!recoveryCallRetryFrameCompatible(prior, event) || prior.key !== event.key || prior.ok))
           semanticError("invalid repeated call execution");
         if (event.kind === "llm" || event.kind === "agent") {
