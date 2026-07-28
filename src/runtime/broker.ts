@@ -123,7 +123,7 @@ export const bindKeys = async (state: RunState, claims: readonly KeyClaim[]): Pr
     const additions: Array<KeyClaim & { canonicalIdentity: string; identityHash: string }> = [];
     for (const [id, claim] of requested) {
       const bound = state.keyIdentities.get(id);
-      if (bound && bound.canonicalIdentity !== claim.canonicalIdentity)
+      if (bound && bound.identityHash !== claim.identityHash)
         throw new DslError("KEY_IDENTITY_CHANGED", `${claim.kind} key "${claim.key}" was reused with a different identity`);
       if (bound?.state === "durable_failed") throw bound.error;
       if (bound?.state === "pending") pending.push(bound.ready);

@@ -16,12 +16,13 @@ import { RunRecoveryError } from "./run-recovery-types.ts";
 type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
 type AnswerEvent = Extract<RlmEvent, { type: "answer_committed" }>;
 type CallEvent = Extract<RlmEvent, { type: "call_committed" }>;
+type CheckpointEvent = Extract<RlmEvent, { type: "checkpoint_committed" }>;
 export interface RecoveryContentReference {
-  readonly role: "input" | "workspace" | "call" | "answer";
+  readonly role: "input" | "workspace" | "call" | "answer" | "checkpoint";
   readonly id: string;
   readonly sha256: string;
   readonly bytes: number;
-  readonly event?: CallEvent | AnswerEvent;
+  readonly event?: CallEvent | AnswerEvent | CheckpointEvent;
 }
 
 export interface RecoveryJournalModel {
@@ -89,7 +90,7 @@ const reference = (
   id: string | undefined,
   digest: string | undefined,
   bytes: number | undefined,
-  event?: CallEvent | AnswerEvent,
+  event?: CallEvent | AnswerEvent | CheckpointEvent,
 ): RecoveryContentReference => {
   if (id === undefined || digest === undefined || bytes === undefined || id !== `ctx_${digest}`)
     throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", `${role} event lacks complete content identity`);
@@ -145,6 +146,7 @@ export const validateRecoveryJournal = (
   let tokensReserved = 0;
   let tokensUsed = 0;
   let childFrames = 0;
+  let checkpointSequence = 0;
   let terminal: TerminalEvent | undefined;
 
   const requireFrame = (frameId: string): FrameRecord => {
@@ -353,6 +355,29 @@ export const validateRecoveryJournal = (
         attempt.segment.settlements += 1;
         attempt.segment.outcomes.push(event);
         settlements.set(event.intentId, event);
+        break;
+      }
+      case "checkpoint_committed": {
+        if (event.runId !== runId || event.manifestHash !== document.manifestHash || event.frameId !== rootFrameId)
+          throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "checkpoint identity does not match the run manifest");
+        if (event.checkpointSequence !== checkpointSequence + 1)
+          semanticError("checkpoint sequences are not contiguous");
+        if (event.nextIteration !== (frames.get(rootFrameId)?.cells.size ?? 0) + 1
+          || event.nextControllerTurn !== committedControllerTurns + 1)
+          semanticError("checkpoint continuation does not match the next controller turn");
+        if ([...intents.keys()].some((intentId) => !settlements.has(intentId)) || tokensReserved !== 0)
+          semanticError("checkpoint was committed with an unsettled external operation");
+        const openFrames = [...frames.values()].filter((candidate) => !candidate.closed);
+        if (openFrames.length !== 1 || openFrames[0]?.opened.frameId !== rootFrameId)
+          semanticError("checkpoint was not committed at a quiescent root-frame boundary");
+        checkpointSequence = event.checkpointSequence;
+        content.push(reference(
+          "checkpoint",
+          event.checkpointRef,
+          event.checkpointSha256,
+          event.checkpointBytes,
+          event,
+        ));
         break;
       }
       case "call_committed": {

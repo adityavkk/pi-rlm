@@ -10,10 +10,17 @@ interface Waiter {
 
 export class Semaphore {
   private available: number;
+  private readonly capacity: number;
   private readonly waiters: Waiter[] = [];
 
   constructor(max: number) {
-    this.available = Math.max(1, max);
+    this.capacity = Math.max(1, max);
+    this.available = this.capacity;
+  }
+
+  /** True only when no permit is held and no acquisition is queued. */
+  isIdle(): boolean {
+    return this.available === this.capacity && this.waiters.length === 0;
   }
 
   async acquire(signal?: AbortSignal): Promise<Release | undefined> {

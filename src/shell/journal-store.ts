@@ -18,6 +18,7 @@ import { parseRlmEvent } from "./journal-event.ts";
 export { parseRlmEvent } from "./journal-event.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
+const sha256Raw = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const lineHash = (line: string): string => sha256(line).slice(0, 12);
 const BATCH_RECORD_TYPE = "journal_batch";
 const BATCH_RECORD_VERSION = 1;
@@ -105,8 +106,18 @@ const validBatchSemantics = (events: readonly RlmEvent[]): boolean => {
 const recordLine = (record: RlmEvent | JournalBatchRecord): string =>
   `${canonicalStringify(record as unknown as JsonValue)}\n`;
 
+export interface JournalEventPosition {
+  /** Zero-based semantic event index in the verified event stream. */
+  readonly eventIndex: number;
+  /** Complete JSONL bytes preceding the physical record containing this event. */
+  readonly prefixBytes: number;
+  /** Complete JSONL bytes through the physical record containing this event. */
+  readonly endBytes: number;
+}
+
 interface JournalScan {
   readonly events: RlmEvent[];
+  readonly eventPositions: JournalEventPosition[];
   readonly verifiedBytes: number;
   readonly batchIds: ReadonlySet<string>;
 }
@@ -119,6 +130,7 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
     ? raw.length
     : raw.lastIndexOf(0x0a) + 1;
   const events: RlmEvent[] = [];
+  const eventPositions: JournalEventPosition[] = [];
   const batchIds = new Set<string>();
   let lineStart = 0;
   let lineNumber = 0;
@@ -149,11 +161,17 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
         const expected = makeBatchRecord(batchEvents);
         if (envelope["batchId"] !== expected.batchId || envelope["checksum"] !== expected.checksum
           || line !== recordLine(expected).slice(0, -1)) return err(corruptLine(lineNumber, line));
-        if (!batchIds.has(expected.batchId)) events.push(...expected.events);
+        if (!batchIds.has(expected.batchId)) {
+          for (const event of expected.events) {
+            eventPositions.push({ eventIndex: events.length, prefixBytes: lineStart, endBytes: i + 1 });
+            events.push(event);
+          }
+        }
         batchIds.add(expected.batchId);
       } else {
         const event = parseRlmEvent(parsed);
         if (!event.ok) return err(corruptLine(lineNumber, line));
+        eventPositions.push({ eventIndex: events.length, prefixBytes: lineStart, endBytes: i + 1 });
         events.push(event.value);
       }
     } catch {
@@ -163,11 +181,12 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
     lineNumber++;
   }
 
-  return ok({ events, verifiedBytes, batchIds });
+  return ok({ events, eventPositions, verifiedBytes, batchIds });
 };
 
 export interface ParsedJournalSnapshot {
   readonly events: readonly RlmEvent[];
+  readonly eventPositions: readonly JournalEventPosition[];
   /** Complete, checksummed JSONL prefix. A torn final record is excluded. */
   readonly verifiedBytes: number;
 }
@@ -175,7 +194,11 @@ export interface ParsedJournalSnapshot {
 /** Parse one bounded journal snapshot without repairing or writing it. */
 export const parseJournalSnapshotBytes = (raw: Uint8Array): Result<ParsedJournalSnapshot, InterpreterError> => {
   const scanned = scanJournal(raw);
-  return scanned.ok ? ok({ events: scanned.value.events, verifiedBytes: scanned.value.verifiedBytes }) : scanned;
+  return scanned.ok ? ok({
+    events: scanned.value.events,
+    eventPositions: scanned.value.eventPositions,
+    verifiedBytes: scanned.value.verifiedBytes,
+  }) : scanned;
 };
 
 /** Compatibility projection for callers which only need committed events. */
@@ -229,6 +252,14 @@ export interface JournalBatchAppendOutcome extends JournalStatusCacheOutcome {
   readonly events: readonly JournalAppendDisposition[];
 }
 
+export interface JournalAuthoritySnapshot extends ParsedJournalSnapshot {
+  readonly prefixSha256: string;
+}
+
+export interface JournalTailRepairOutcome extends JournalAuthoritySnapshot {
+  readonly removedBytes: number;
+}
+
 export class JournalStore {
   private readonly eventsPath: string;
   private readonly statusPath: string;
@@ -263,6 +294,69 @@ export class JournalStore {
     if (!validBatchSemantics(parsed))
       return Promise.reject(new JournalAppendError("event", false, interpreterError("JOURNAL_CORRUPT", "invalid journal batch")));
     return this.enqueue(parsed, true);
+  }
+
+  /** Stable complete prefix used to bind a content checkpoint before its commit event. */
+  authoritySnapshot(): Promise<JournalAuthoritySnapshot> {
+    return this.enqueueControl(async () => {
+      const raw = await this.fileSystem.readFile(this.eventsPath);
+      const scanned = scanJournal(raw);
+      if (!scanned.ok) throw scanned.error;
+      if (scanned.value.verifiedBytes !== raw.length)
+        throw interpreterError("JOURNAL_CORRUPT", "journal has an incomplete tail at checkpoint boundary");
+      return {
+        events: scanned.value.events,
+        eventPositions: scanned.value.eventPositions,
+        verifiedBytes: scanned.value.verifiedBytes,
+        prefixSha256: sha256Raw(raw),
+      };
+    });
+  }
+
+  /** Truncate only a parser-proven incomplete final record. Callers must own the writer lease. */
+  repairIncompleteTail(): Promise<JournalTailRepairOutcome> {
+    return this.enqueueControl(async () => {
+      let handle: JournalFileHandle | undefined;
+      let primary: unknown;
+      try {
+        handle = await this.fileSystem.open(this.eventsPath, "r+");
+        const raw = await handle.readFile();
+        const scanned = scanJournal(raw);
+        if (!scanned.ok) throw scanned.error;
+        const removedBytes = raw.length - scanned.value.verifiedBytes;
+        if (removedBytes > 0) {
+          await handle.truncate(scanned.value.verifiedBytes);
+          await handle.sync();
+        }
+        const prefix = raw.subarray(0, scanned.value.verifiedBytes);
+        return {
+          events: scanned.value.events,
+          eventPositions: scanned.value.eventPositions,
+          verifiedBytes: scanned.value.verifiedBytes,
+          prefixSha256: sha256Raw(prefix),
+          removedBytes,
+        };
+      } catch (error) {
+        primary = error;
+        throw error;
+      } finally {
+        if (handle) {
+          try { await handle.close(); }
+          catch (cleanup) {
+            if (primary !== undefined)
+              throw new AggregateError([primary, cleanup], "journal repair and handle close both failed");
+            throw cleanup;
+          }
+        }
+      }
+    });
+  }
+
+  private enqueueControl<T>(effect: () => Promise<T>): Promise<T> {
+    const owned = (): Promise<T> => this.fileSystem.runTransaction?.(effect) ?? effect();
+    const queued = this.queue.then(owned, owned);
+    this.queue = queued;
+    return queued;
   }
 
   private enqueue(batch: readonly RlmEvent[], batched: boolean): Promise<JournalBatchAppendOutcome> {

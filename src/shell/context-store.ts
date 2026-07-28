@@ -701,6 +701,52 @@ export class ContextStore {
     return this.entries.get(id)?.descriptor;
   }
 
+  /** Canonical runtime payload catalog. Control-plane stores use a separate instance. */
+  snapshotDescriptors(): readonly ContextDescriptor[] {
+    return [...this.entries.values()]
+      .map((entry) => ({ ...entry.descriptor }))
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  }
+
+  /** Verify and atomically install an exact descriptor catalog into a fresh process store. */
+  hydrateFromDisk(descriptors: readonly ContextDescriptor[]): Promise<void> {
+    const hydrate = async (): Promise<void> => {
+      const release = await this.acquireMutation();
+      try {
+        if (this.entries.size !== 0 || this.orphans.size !== 0 || this.uniqueBytes !== 0)
+          throw new ContextSpecError("context hydration requires an empty store");
+        const hydrated: Entry[] = [];
+        const ids = new Set<string>();
+        let total = 0;
+        let previous = "";
+        for (const descriptor of descriptors) {
+          if (typeof descriptor !== "object" || descriptor === null
+            || !/^ctx_[0-9a-f]{64}$/.test(descriptor.id)
+            || !/^[0-9a-f]{64}$/.test(descriptor.sha256)
+            || descriptor.id !== `ctx_${descriptor.sha256}`
+            || typeof descriptor.label !== "string" || typeof descriptor.mimeType !== "string"
+            || !Number.isSafeInteger(descriptor.bytes) || descriptor.bytes < 0
+            || descriptor.estimatedTokens !== estimateTokens(descriptor.bytes)
+            || descriptor.tokenEstimator !== TOKEN_ESTIMATOR
+            || ids.has(descriptor.id) || (previous !== "" && descriptor.id <= previous))
+            throw new ContextSpecError("context hydration descriptor catalog is invalid");
+          if (total > Number.MAX_SAFE_INTEGER - descriptor.bytes)
+            throw new ContextSpecError("context hydration byte total is too large");
+          const bytesArray = await this.loadFromDisk(descriptor);
+          hydrated.push({ descriptor: { ...descriptor }, bytesArray });
+          ids.add(descriptor.id);
+          previous = descriptor.id;
+          total += descriptor.bytes;
+        }
+        for (const entry of hydrated) this.entries.set(entry.descriptor.id, entry);
+        this.uniqueBytes = total;
+      } finally {
+        release();
+      }
+    };
+    return this.instrumentation.runTransaction?.(hydrate) ?? hydrate();
+  }
+
   totalBytes(): number {
     return this.uniqueBytes;
   }

@@ -58,6 +58,7 @@ import {
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 import { MANAGED_RUN_PERSISTENCE, type ManagedRunPersistenceCarrier } from "./run-managed-lifecycle.ts";
+import { RunCheckpointWriter } from "./checkpoint-persistence.ts";
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
@@ -585,6 +586,10 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
 
     const controllerTurnObserver = resolveControllerTurnObserver(input.signal);
     const agentDelegationRuntime = bindAgentDelegationRuntime(preparedAgentDelegation, scope.signal);
+    let checkpointWriter: RunCheckpointWriter | undefined;
+    const checkpoint = managedPersistence ? {
+      commit: (continuation: Parameters<RunCheckpointWriter["commit"]>[0]) => checkpointWriter!.commit(continuation),
+    } : undefined;
     const state: InternalRunState = {
       runId,
       startMs,
@@ -611,8 +616,17 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
       agentAttempts: new Map(),
       recurseExecutions: new Map(),
       frameSeq: { current: 1 },
+      ...(checkpoint ? { checkpoint } : {}),
       progress,
     };
+    if (managedPersistence) {
+      checkpointWriter = new RunCheckpointWriter({
+        state,
+        document,
+        checkpointStore: new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation),
+        signal: scope.signal,
+      });
+    }
     progress.setRuntimeGetter(() => ({ activeCalls: state.inflight.size }));
     const rootFrame: FrameRef = {
       frameId: rootFrameId,
