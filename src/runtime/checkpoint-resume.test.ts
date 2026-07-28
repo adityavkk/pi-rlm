@@ -4,19 +4,34 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeComponentIdentity } from "../core/identity.ts";
+import type { RlmEvent } from "../core/journal.ts";
 import type { ControllerDriver } from "./controller.ts";
 import { deriveOperationIntentId } from "../core/operation.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import { normalizeProgram } from "../core/program.ts";
 import { sha256 } from "../shell/hash.ts";
-import { JournalStore } from "../shell/journal-store.ts";
+import {
+  JournalStore,
+  nodeJournalFileSystem,
+  type JournalFileSystem,
+} from "../shell/journal-store.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import { OperationAbortedError } from "./abort.ts";
-import { ResumeFixtureController } from "./checkpoint-resume-fixture.ts";
+import {
+  NestedResumeFixtureController,
+  ResumeFixtureController,
+} from "./checkpoint-resume-fixture.ts";
 import { runCheckpointPayloadPath } from "./checkpoint-store.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
+import {
+  nodeRunDirectoryFileSystem,
+  RUN_LOCK_FILE,
+  RUN_MANIFEST_FILE,
+  type RunDirectoryFileSystem,
+} from "./run-manifest.ts";
 import { ManagedRunStore } from "./run-retention.ts";
+import { managedRunStoreTestOptions } from "./run-retention-test-support.ts";
 import { RunRecoveryError, type RunRecoveryErrorCode } from "./run-recovery-types.ts";
 import { inspectResumableManagedRun, resumeProgram } from "./run-resume.ts";
 import { runProgram } from "./run.ts";
@@ -49,7 +64,10 @@ const waitForFile = async (path: string, child: ReturnType<typeof Bun.spawn>): P
   }
 };
 
-const crashAtCheckpoint = async (root: string): Promise<string> => {
+const crashAtCheckpoint = async (
+  root: string,
+  controllerExport = "ResumeFixtureController",
+): Promise<string> => {
   const ready = join(tmpdir(), `pi-rlm-resume-ready-${crypto.randomUUID()}.json`);
   const retentionUrl = new URL("./run-retention.ts", import.meta.url).href;
   const runUrl = new URL("./run.ts", import.meta.url).href;
@@ -62,7 +80,9 @@ const crashAtCheckpoint = async (root: string): Promise<string> => {
       const { writeFileSync } = await import("node:fs");
       const { ManagedRunStore } = await import(${JSON.stringify(retentionUrl)});
       const { runProgram } = await import(${JSON.stringify(runUrl)});
-      const { ResumeFixtureController } = await import(${JSON.stringify(fixtureUrl)});
+      const fixture = await import(${JSON.stringify(fixtureUrl)});
+      const Controller = fixture[${JSON.stringify(controllerExport)}];
+      if (typeof Controller !== "function") throw new Error("invalid checkpoint fixture controller");
       const { QuickJsBackend } = await import(${JSON.stringify(quickJsUrl)});
       const { MockModelClient } = await import(${JSON.stringify(mockUrl)});
       const { normalizeProgram } = await import(${JSON.stringify(programUrl)});
@@ -71,7 +91,7 @@ const crashAtCheckpoint = async (root: string): Promise<string> => {
       const store = new ManagedRunStore({ root: ${JSON.stringify(root)} });
       const lease = await store.create();
       const backend = await QuickJsBackend.create();
-      const controller = new ResumeFixtureController(() => {
+      const controller = new Controller(() => {
         writeFileSync(${JSON.stringify(ready)}, JSON.stringify({ name: lease.name }), { mode: 0o600 });
         return new Promise(() => {});
       });
@@ -105,8 +125,9 @@ const resumeWith = (
   lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>>,
   backend: QuickJsBackend,
   model = new MockModelClient(() => "must-not-run", modelIdentity),
+  controller: ControllerDriver = new ResumeFixtureController(),
 ) => resumeProgram({
-  controller: new ResumeFixtureController(),
+  controller,
   model,
   backend,
   dir: lease.dir,
@@ -120,6 +141,14 @@ const expectRecoveryCode = async (work: Promise<unknown>, code: RunRecoveryError
     expect(error).toBeInstanceOf(RunRecoveryError);
     expect((error as RunRecoveryError).code).toBe(code);
   }
+};
+
+const writeJournalEvents = async (dir: string, events: readonly RlmEvent[]): Promise<void> => {
+  await writeFile(
+    join(dir, "events.jsonl"),
+    events.map((event) => `${canonicalStringify(event as unknown as JsonValue)}\n`).join(""),
+    { mode: 0o600 },
+  );
 };
 
 const rewriteCheckpointPayload = async (
@@ -147,6 +176,161 @@ const rewriteCheckpointPayload = async (
 };
 
 describe("managed checkpoint continuation", () => {
+  test("rejects both missing recurse executions and missing completed child frames before hydration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-nested-corrupt-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    try {
+      const name = await crashAtCheckpoint(root, "NestedResumeFixtureController");
+      lease = await new ManagedRunStore({ root }).openForResume(name);
+      const read = await new JournalStore(lease.dir).readEvents();
+      if (!read.ok) throw read.error;
+      const original = [...read.value];
+      const child = original.find((event) => event.type === "frame_opened" && event.parentFrameId !== null);
+      if (!child || child.type !== "frame_opened") throw new Error("missing completed child fixture");
+
+      await writeJournalEvents(lease.dir, original.filter((event) =>
+        event.type !== "call_committed" || event.kind !== "recurse"));
+      await expectRecoveryCode(
+        resumeWith(lease, backend, undefined, new NestedResumeFixtureController()),
+        "RECOVERY_SEMANTIC_CORRUPTION",
+      );
+
+      const childCells = original.filter((event) => event.type === "cell_committed" && event.frameId === child.frameId).length;
+      await writeJournalEvents(lease.dir, original
+        .filter((event) => !("frameId" in event) || event.frameId !== child.frameId)
+        .map((event) => event.type === "checkpoint_committed"
+          ? { ...event, nextControllerTurn: event.nextControllerTurn - childCells }
+          : event));
+      await expectRecoveryCode(
+        resumeWith(lease, backend, undefined, new NestedResumeFixtureController()),
+        "RECOVERY_SEMANTIC_CORRUPTION",
+      );
+      await lease.abandon();
+      lease = undefined;
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("hydrates a completed nested frame and reuses its recurse result on resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-nested-positive-"));
+    const backend = await QuickJsBackend.create();
+    try {
+      const name = await crashAtCheckpoint(root, "NestedResumeFixtureController");
+      const lease = await new ManagedRunStore({ root }).openForResume(name);
+      const model = new MockModelClient(() => "must-not-run", modelIdentity);
+      const result = await resumeWith(lease, backend, model, new NestedResumeFixtureController());
+      await lease.finish(result.status, result.runId);
+      expect(result).toMatchObject({
+        status: "completed",
+        answer: { answer: "nested:nested:true" },
+        ledger: { usage: { framesOpened: 1, controllerTurns: 3, activeLeafCalls: 0 } },
+      });
+      expect(model.callCount).toBe(0);
+      const read = await new JournalStore(lease.dir).readEvents();
+      if (!read.ok) throw read.error;
+      expect(read.value.filter((event) => event.type === "frame_opened" && event.parentFrameId !== null)).toHaveLength(1);
+      expect(read.value.filter((event) => event.type === "call_committed" && event.kind === "recurse")).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("preserves cancellation during bounded journal reads and prefix hashing", async () => {
+    const target = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-journal-cancel-"));
+    try {
+      const event: RlmEvent = { type: "frame_opened", frameId: "f0", parentFrameId: null, depth: 0, objective: "x" };
+      const line = `${canonicalStringify(event as unknown as JsonValue)}\n`;
+      const raw = line.repeat(2_000);
+      expect(Buffer.byteLength(raw)).toBeGreaterThan(64 * 1024);
+      await writeFile(join(target, "events.jsonl"), raw, { mode: 0o600 });
+
+      const readCancellation = new OperationAbortedError(new Error("cancelled during journal read"));
+      const midRead: JournalFileSystem = {
+        ...nodeJournalFileSystem,
+        async open(path, flags, mode) {
+          const handle = await nodeJournalFileSystem.open(path, flags, mode);
+          let reads = 0;
+          return {
+            appendFile: (data, encoding) => handle.appendFile(data, encoding),
+            close: () => handle.close(),
+            read: (buffer, offset, length, position) => {
+              if (++reads === 2) return Promise.reject(readCancellation);
+              return handle.read(buffer, offset, length, position);
+            },
+            readFile: () => handle.readFile(),
+            stat: () => handle.stat(),
+            sync: () => handle.sync(),
+            truncate: (length) => handle.truncate(length),
+            writeFile: (data, encoding) => handle.writeFile(data, encoding),
+          };
+        },
+      };
+      await expect(new JournalStore(target, midRead).inspectTail()).rejects.toBe(readCancellation);
+
+      let checkpoints = 0;
+      await new JournalStore(target).inspectTail({ checkpoint: () => { checkpoints++; } });
+      const hashCancellation = new OperationAbortedError(new Error("cancelled during journal hash"));
+      let remaining = checkpoints - 1;
+      await expect(new JournalStore(target).inspectTail({
+        checkpoint: () => { if (--remaining === 0) throw hashCancellation; },
+      })).rejects.toBe(hashCancellation);
+    } finally {
+      await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves abort, deadline, and writer failures from manifest and lock authority reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-authority-control-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    try {
+      const name = await crashAtCheckpoint(root);
+      let fault: { readonly leaf: string; readonly error: unknown } | undefined;
+      const authorityFileSystem: RunDirectoryFileSystem = {
+        ...nodeRunDirectoryFileSystem,
+        async open(path, flags, mode) {
+          const handle = await nodeRunDirectoryFileSystem.open(path, flags, mode);
+          if (!handle.read || !handle.stat) return handle;
+          return {
+            close: () => handle.close(),
+            read: async (buffer, offset, length, position) => {
+              if (fault && path.endsWith(`/${fault.leaf}`)) {
+                const error = fault.error;
+                fault = undefined;
+                throw error;
+              }
+              return handle.read!(buffer, offset, length, position);
+            },
+            stat: () => handle.stat!(),
+            sync: () => handle.sync(),
+            writeFile: (data, encoding) => handle.writeFile(data, encoding),
+          };
+        },
+      };
+      const store = new ManagedRunStore(managedRunStoreTestOptions({ root, runDirectoryFileSystem: authorityFileSystem }));
+      lease = await store.openForResume(name);
+      const abort = new OperationAbortedError(new Error("cancelled during manifest read"));
+      fault = { leaf: RUN_MANIFEST_FILE, error: abort };
+      await expect(resumeWith(lease, backend)).rejects.toBe(abort);
+
+      const deadline = Object.assign(new Error("deadline during lock read"), { code: "BUDGET_DEADLINE" });
+      fault = { leaf: RUN_LOCK_FILE, error: deadline };
+      await expect(resumeWith(lease, backend)).rejects.toBe(deadline);
+
+      const writer = Object.assign(new Error("writer fenced during lock read"), { code: "WRITER_ARBITER_FENCED" });
+      fault = { leaf: RUN_LOCK_FILE, error: writer };
+      await expect(resumeWith(lease, backend)).rejects.toBe(writer);
+      await lease.abandon();
+      lease = undefined;
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   test("fresh process resumes the next root iteration without replay or double spend", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-resume-"));
     const backend = await QuickJsBackend.create();

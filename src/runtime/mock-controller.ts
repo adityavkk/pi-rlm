@@ -21,13 +21,13 @@ export class MockController implements ControllerDriver {
     capture: (boundary) => ({ index: this.index, nextIteration: boundary.nextIteration }),
     validate: (state, boundary) => {
       if (!isJsonObject(state) || Object.keys(state).length !== 2
-        || !Number.isSafeInteger(state["index"]) || (state["index"] as number) < 0
+        || state["index"] !== boundary.trajectoryLength
         || state["nextIteration"] !== boundary.nextIteration)
         throw new TypeError("MockController checkpoint cursor is invalid");
     },
     restore: (state, boundary) => {
       if (!isJsonObject(state) || Object.keys(state).length !== 2
-        || !Number.isSafeInteger(state["index"]) || (state["index"] as number) < 0
+        || state["index"] !== boundary.trajectoryLength
         || state["nextIteration"] !== boundary.nextIteration)
         throw new TypeError("MockController checkpoint cursor is invalid");
       this.index = state["index"] as number;

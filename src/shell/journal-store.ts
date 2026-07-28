@@ -19,7 +19,19 @@ import { parseRlmEvent } from "./journal-event.ts";
 export { parseRlmEvent } from "./journal-event.ts";
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
-const sha256Raw = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
+const sha256Raw = (
+  value: Uint8Array,
+  control: { readonly checkpoint?: () => void } = {},
+): string => {
+  const hash = createHash("sha256");
+  control.checkpoint?.();
+  for (let offset = 0; offset < value.length; offset += 64 * 1024) {
+    control.checkpoint?.();
+    hash.update(value.subarray(offset, Math.min(value.length, offset + 64 * 1024)));
+  }
+  control.checkpoint?.();
+  return hash.digest("hex");
+};
 const lineHash = (line: string): string => sha256(line).slice(0, 12);
 const BATCH_RECORD_TYPE = "journal_batch";
 const BATCH_RECORD_VERSION = 1;
@@ -151,10 +163,11 @@ const scanJournal = (
     const line = Buffer.from(raw.subarray(lineStart, i)).toString("utf8");
     if (line.length === 0) return err(corruptLine(lineNumber, line));
     let parsed: unknown;
+    control.checkpoint?.();
+    try { parsed = JSON.parse(line); }
+    catch { return err(corruptLine(lineNumber, line)); }
+    control.checkpoint?.();
     try {
-      control.checkpoint?.();
-      parsed = JSON.parse(line);
-      control.checkpoint?.();
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
         && Object.getOwnPropertyDescriptor(parsed, "type")?.value === BATCH_RECORD_TYPE) {
         const envelope = parsed as Record<string, unknown>;
@@ -365,7 +378,7 @@ export class JournalStore {
         events: scanned.value.events,
         eventPositions: scanned.value.eventPositions,
         verifiedBytes: scanned.value.verifiedBytes,
-        prefixSha256: sha256Raw(prefix),
+        prefixSha256: sha256Raw(prefix, control),
         verifiedPrefix: Buffer.from(prefix),
         incompleteTailBytes: raw.length - scanned.value.verifiedBytes,
       };
@@ -387,7 +400,7 @@ export class JournalStore {
         events: scanned.value.events,
         eventPositions: scanned.value.eventPositions,
         verifiedBytes: scanned.value.verifiedBytes,
-        prefixSha256: sha256Raw(raw),
+        prefixSha256: sha256Raw(raw, control),
         verifiedPrefix: Buffer.from(raw),
       };
     });
@@ -416,7 +429,7 @@ export class JournalStore {
           events: scanned.value.events,
           eventPositions: scanned.value.eventPositions,
           verifiedBytes: scanned.value.verifiedBytes,
-          prefixSha256: sha256Raw(prefix),
+          prefixSha256: sha256Raw(prefix, control),
           verifiedPrefix: Buffer.from(prefix),
           removedBytes,
         };

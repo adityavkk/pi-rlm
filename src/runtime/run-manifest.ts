@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { checkpointControlFailure } from "./checkpoint-failure.ts";
 import type { BudgetLimits } from "../core/budget.ts";
 import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import { canonicalStringify, parseJsonValue, type JsonValue } from "../core/json.ts";
@@ -681,6 +682,8 @@ export const readRunManifest = async (
       throw new TypeError("stored run manifest is not canonical strict JSON");
     return document;
   } catch (error) {
+    const control = checkpointControlFailure(error);
+    if (control !== undefined) throw control;
     if (error instanceof RunDirectoryError) throw error;
     if (error instanceof RunManifestCompatibilityError)
       throw new RunDirectoryError("MANIFEST_INCOMPATIBLE", "stored run manifest is incompatible", error);

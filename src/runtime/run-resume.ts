@@ -17,6 +17,7 @@ import {
   prepareAgentDelegation,
   type AgentDelegationConfig,
 } from "./agent-delegation.ts";
+import { checkpointControlFailure } from "./checkpoint-failure.ts";
 import { recoverLatestRunCheckpoint } from "./checkpoint-recovery.ts";
 import { RunCheckpointWriter } from "./checkpoint-persistence.ts";
 import { RunCheckpointStore } from "./checkpoint-store.ts";
@@ -87,6 +88,11 @@ export interface ResumeInput {
 const same = (left: unknown, right: unknown): boolean =>
   canonicalStringify(left as JsonValue) === canonicalStringify(right as JsonValue);
 
+const preserveAuthorityControlFailure = (cause: unknown): void => {
+  const control = checkpointControlFailure(cause);
+  if (control !== undefined) throw control;
+};
+
 const validatePermanentClaim = async (
   input: ResumeInput,
   runId: string,
@@ -105,6 +111,7 @@ const validatePermanentClaim = async (
     if (!parsed.ok || canonicalStringify(parsed.value) !== text || !same(parsed.value, expected))
       throw new TypeError("run lock identity is invalid");
   } catch (cause) {
+    preserveAuthorityControlFailure(cause);
     throw new RunRecoveryError("RECOVERY_LOCK_INVALID", "permanent run claim is invalid", cause);
   }
 };
@@ -114,6 +121,7 @@ const readCompatibleManifest = async (input: ResumeInput, checkpoint: () => void
   let document;
   try { document = await readRunManifest(input.dir, persistence.runDirectoryFileSystem(), checkpoint); }
   catch (cause) {
+    preserveAuthorityControlFailure(cause);
     if (cause instanceof RunDirectoryError && cause.code === "MANIFEST_INCOMPATIBLE")
       throw new RunRecoveryError("RECOVERY_INCOMPATIBLE", "stored run manifest is incompatible", cause);
     throw new RunRecoveryError("RECOVERY_MANIFEST_INVALID", "stored run manifest is invalid", cause);

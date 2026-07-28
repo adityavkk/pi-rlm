@@ -117,6 +117,39 @@ const reference = (
   return { role, id, sha256: digest, bytes, ...(event ? { event } : {}) };
 };
 
+const validateRecurseExecutionBijection = (
+  runId: string,
+  frames: ReadonlyMap<string, FrameRecord>,
+  calls: ReadonlyMap<string, readonly CallEvent[]>,
+): void => {
+  const childExecutions = new Map<string, Array<{ ordinal: number; frame: FrameRecord }>>();
+  for (const frame of frames.values()) {
+    if (frame.opened.parentFrameId === null) continue;
+    const prefix = `${runId}:frame:`;
+    const suffix = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
+    const match = /^(call_recurse_[a-f0-9]{64}):e([1-9][0-9]*)$/.exec(suffix);
+    if (!match || !frame.closed) semanticError("closed child frame has an invalid recurse execution identity");
+    const callId = match![1]!;
+    const grouped = childExecutions.get(callId) ?? [];
+    grouped.push({ ordinal: Number(match![2]), frame });
+    childExecutions.set(callId, grouped);
+  }
+  for (const [callId, executions] of calls) {
+    const last = executions.at(-1)!;
+    if (last.kind !== "recurse") continue;
+    const children = (childExecutions.get(callId) ?? []).sort((left, right) => left.ordinal - right.ordinal);
+    if (children.length !== executions.length) semanticError("recurse call executions do not match child frames");
+    children.forEach((child, index) => {
+      const call = executions[index]!;
+      if (child.ordinal !== index + 1 || call.frameId !== child.frame.opened.parentFrameId
+        || call.kind !== "recurse" || call.ok !== (child.frame.closed?.state === "answered"))
+        semanticError("recurse call execution does not match its child frame");
+    });
+    childExecutions.delete(callId);
+  }
+  if (childExecutions.size > 0) semanticError("closed child frame lacks its recurse call execution");
+};
+
 /** Strict semantic fold. It does not trust the lossy status projection. */
 export const validateRecoveryJournal = (
   document: RunManifestDocument,
@@ -390,6 +423,7 @@ export const validateRecoveryJournal = (
         const openFrames = [...frames.values()].filter((candidate) => !candidate.closed);
         if (openFrames.length !== 1 || openFrames[0]?.opened.frameId !== rootFrameId)
           semanticError("checkpoint was not committed at a quiescent root-frame boundary");
+        validateRecurseExecutionBijection(runId, frames, calls);
         checkpointSequence = event.checkpointSequence;
         content.push(reference(
           "checkpoint",
@@ -496,32 +530,7 @@ export const validateRecoveryJournal = (
   if (terminal) {
     for (const frame of frames.values()) if (!frame.closed) semanticError("terminal run has an open frame");
     if (terminal.type === "run_completed") {
-      const childExecutions = new Map<string, Array<{ ordinal: number; frame: FrameRecord }>>();
-      for (const frame of frames.values()) {
-        if (frame.opened.parentFrameId === null) continue;
-        const prefix = `${runId}:frame:`;
-        const suffix = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
-        const match = /^(call_recurse_[a-f0-9]{64}):e([1-9][0-9]*)$/.exec(suffix);
-        if (!match)
-          throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "completed child frame has an invalid execution identity");
-        const grouped = childExecutions.get(match[1]!) ?? [];
-        grouped.push({ ordinal: Number(match[2]), frame });
-        childExecutions.set(match[1]!, grouped);
-      }
-      for (const [callId, executions] of calls) {
-        const last = executions.at(-1)!;
-        if (last.kind !== "recurse") continue;
-        const children = (childExecutions.get(callId) ?? []).sort((left, right) => left.ordinal - right.ordinal);
-        if (children.length !== executions.length) semanticError("recurse call executions do not match child frames");
-        children.forEach((child, index) => {
-          const call = executions[index]!;
-          if (child.ordinal !== index + 1 || call.frameId !== child.frame.opened.parentFrameId
-            || call.kind !== "recurse" || call.ok !== (child.frame.closed?.state === "answered"))
-            semanticError("recurse call execution does not match its child frame");
-        });
-        childExecutions.delete(callId);
-      }
-      if (childExecutions.size > 0) semanticError("completed child frame lacks its recurse call execution");
+      validateRecurseExecutionBijection(runId, frames, calls);
       if (!root?.answer || root.closed?.state !== "answered" || root.answer.completionMode !== terminal.completionMode
         || terminal.outputRef === undefined || terminal.outputRef !== root.answer.outputRef)
         throw new RunRecoveryError("RECOVERY_TERMINAL_INCONSISTENT", "completed terminal lacks one matching root answer");

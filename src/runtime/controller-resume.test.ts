@@ -38,13 +38,17 @@ describe("controller resume capability contract", () => {
       { reasoning: "second", code: "2" },
     ]);
     await original.next({} as never);
-    const token = requireControllerResumeCapability(original).capability.capture({ ...boundary, nextIteration: 2 });
+    const cursorBoundary = { ...boundary, nextIteration: 2, trajectoryLength: 1 };
+    const token = requireControllerResumeCapability(original).capability.capture(cursorBoundary);
     const fresh = new MockController([
       { reasoning: "first", code: "1" },
       { reasoning: "second", code: "2" },
     ]);
-    requireControllerResumeCapability(fresh).capability.restore(token, { ...boundary, nextIteration: 2 });
+    requireControllerResumeCapability(fresh).capability.restore(token, cursorBoundary);
     expect(await fresh.next({} as never)).toEqual({ reasoning: "second", code: "2" });
+    expect(() => requireControllerResumeCapability(fresh).capability.validate(token, {
+      ...cursorBoundary, trajectoryLength: 2,
+    })).toThrow("checkpoint cursor is invalid");
 
     const unsupported: ControllerDriver = {
       identity: { id: "test/unsupported", version: "1", configuration: {} },

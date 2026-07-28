@@ -42,7 +42,8 @@ export const checkpointControlFailure = (error: unknown): unknown | undefined =>
   if (error instanceof OperationAbortedError) return error;
   if (typeof error !== "object" || error === null) return undefined;
   const code = ownCode(error);
-  if ((code?.startsWith("WRITER_") ?? false) || (code !== undefined && writerCodes.has(code))) return error;
+  if (code === "BUDGET_DEADLINE" || (code?.startsWith("WRITER_") ?? false)
+    || (code !== undefined && writerCodes.has(code))) return error;
   for (const nested of aggregateErrors(error) ?? []) {
     const found = checkpointControlFailure(nested);
     if (found !== undefined) return found;

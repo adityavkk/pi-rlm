@@ -313,13 +313,13 @@ const validateRuntimeContent = async (
   for (const artifact of payload.artifacts) storedBytes += artifact.descriptor.bytes;
   if (!Number.isSafeInteger(storedBytes) || storedBytes > document.manifest.limits.storedByteLimit)
     invalid("checkpoint retained-byte catalog exceeds the run limit");
+  const model = validateRecoveryJournal(document, events);
   try { await store.hydrateFromDisk(payload.contexts, control); }
   catch (cause) {
     preserveControlFailure(cause);
     invalid("checkpoint context catalog could not be hydrated", cause);
   }
 
-  const model = validateRecoveryJournal(document, events);
   for (const reference of model.content) {
     if (reference.role === "checkpoint") continue;
     const descriptor = descriptors.get(reference.id);
