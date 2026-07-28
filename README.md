@@ -192,6 +192,47 @@ credential-free cases: the worktree entry loaded directly with
 from Pi settings without `-e`. Both require the exact bounded and durable
 `RLM_SOURCE_REQUIRED` custom result lifecycle without an agent/provider turn.
 
+### Manual InteractiveMode visual acceptance
+
+Run the packed, credential-free fixture in a real terminal:
+
+```bash
+scripts/run-interactive-tui-acceptance.sh
+```
+
+The launcher packs the current worktree, installs the tarball and pinned public
+Pi peers under isolated HOME/XDG/cache/tmp roots, disables model networking,
+and starts the runtime under an OS network-denial sandbox. The first `/rlm`
+starts automatically and remains active for 30 seconds unless cancelled.
+
+Herdr checklist (type commands in the Pi editor, then press Enter):
+
+1. Confirm the above-editor active-run widget displays `#visual_1` while the
+   initial foreground fixture runs.
+2. After it completes, enter `/rlm-active-fixture`. Note the notified alias,
+   confirm the active widget returns, then enter `/rlm cancel <alias>`. Confirm
+   the detached widget disappears and cancellation is acknowledged without
+   provider activity.
+3. Enter `/rlm {"objective":"Fallback view","context":"offline"}`; confirm a
+   completed `fallback_extract` result. Repeat once; confirm deterministic
+   `VISUAL_FAILURE`. Later runs alternate these outcomes.
+4. Enter `/rlm runs`. Use Up/Down, Enter to inspect, `r` to refresh,
+   and Escape to close. Confirm the injected managed completed run is
+   present.
+5. Enter `/rlm inspect run-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`. Use Tab and
+   Shift+Tab (or Left/Right) across summary, frames, cells, calls, budget, and
+   errors. Use `n`/`p` for the next/previous cursor page; use Escape to close.
+6. Enter `/rlm-approval-fixture`. Confirm the exact delegated-agent dialog has
+   sanitized Agent, Call ID, request/task hashes, routing, preview, and
+   capability warning fields. Accept with `y`/Enter or decline with `n`/Escape.
+7. Exit with Ctrl+D.
+
+Evidence checklist: terminal size and platform; packed-install success; active
+widget screenshots for foreground and detached runs; cancellation result;
+fallback and failure results; managed navigator; all six inspector views plus
+next/previous page; approval dialog; confirmation that no credentials were
+provided and provider/network access was not attempted.
+
 ## Roadmap
 
 - Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls.
