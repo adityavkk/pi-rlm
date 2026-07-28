@@ -273,6 +273,7 @@ const executeRun = async (
       onProgressSource: ownership.attachProgress,
       runLifecycle: {
         claimEntries: lease.lifecycle.claimEntries,
+        persistence: lease.lifecycle.persistence,
         onManifest: async (runId) => {
           requireCoordinatorMutation(ownership.bindRunId(runId), "run-id binding");
           await lease.lifecycle.onManifest(runId);

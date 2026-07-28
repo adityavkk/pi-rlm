@@ -392,16 +392,16 @@ export class RunWriterLease {
   }
 
   run<T>(effect: () => T | PromiseLike<T>): Promise<T> { return this.scheduler.run(effect); }
+  runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    return this.scheduler.runOwnedOperation(effect);
+  }
   release(): Promise<void> {
     if (this.role === "retirement")
       return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_RELEASE_CONFLICT", "retirement authority is irreversible"));
     return this.scheduler.release();
   }
 
-  /** Terminal retention transition. The caller must reconcile rename and root sync before returning. */
-  quarantine<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
-    if (this.role !== "retention" && this.role !== "retirement")
-      return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_INPUT", "only retention authority may quarantine a run"));
+  private terminalTransition<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
     return this.scheduler.terminal(async () => {
       const value = await effect({
         managedRoot: this.pinned.managedRoot,
@@ -413,6 +413,20 @@ export class RunWriterLease {
       await this.pinned.close();
       return value;
     });
+  }
+
+  /** Terminal retention transition. The caller must reconcile rename and root sync before returning. */
+  quarantine<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
+    if (this.role !== "retention" && this.role !== "retirement")
+      return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_INPUT", "only retention authority may quarantine a run"));
+    return this.terminalTransition(effect);
+  }
+
+  /** Fail-closed terminal transition for an ordinal-one genesis never exposed to a runtime. */
+  quarantineGenesis<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
+    if (this.role !== "writer" || this.generation.ordinal !== 1)
+      return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_INPUT", "only ordinal-one writer genesis may use genesis quarantine"));
+    return this.terminalTransition(effect);
   }
 
   private async assertOwnedTip(): Promise<void> {

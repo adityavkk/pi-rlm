@@ -9,11 +9,12 @@ import {
   type ContextDescriptor,
   type ContextOperationControl,
   ContextStore,
+  type ContextStoreInstrumentation,
 } from "../shell/context-store.ts";
 import { type Clock, systemClock } from "../shell/clock.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
-import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
+import { JournalAppendError, JournalStore, type JournalFileSystem } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { persistAnswer } from "./answer-persistence.ts";
@@ -55,12 +56,15 @@ import {
 } from "./run-manifest.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
+import type { LeaseOwnedRunPersistence } from "./run-writer-mutation.ts";
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
 export interface RunLifecycleHooks {
   /** Pre-existing manager files allowed during the otherwise-exclusive manifest claim. */
   readonly claimEntries: readonly string[];
+  /** Opaque lease-owned persistence capability for managed runs. */
+  readonly persistence?: LeaseOwnedRunPersistence;
   /** Called after durable manifest publication and before journals or source snapshots. */
   readonly onManifest: (runId: string) => Promise<void>;
 }
@@ -84,6 +88,10 @@ export interface RunInput {
   readonly createRunNonce?: () => string;
   /** Optional manifest persistence injection for fault testing. */
   readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
+  /** Optional journal filesystem injection. Managed runs compose it beneath their lease guard. */
+  readonly journalFileSystem?: JournalFileSystem;
+  /** Optional context filesystem instrumentation, composed beneath managed-run ownership. */
+  readonly contextStoreInstrumentation?: ContextStoreInstrumentation;
   /** Host-managed lifecycle binding; custom run directories omit this. */
   readonly runLifecycle?: RunLifecycleHooks;
   /** Optional store injection for fault testing and embedded runtimes. */
@@ -460,7 +468,16 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   try { input.onProgressSource?.(progress.source); } catch { /* Progress observers have no run authority. */ }
   try {
     try {
-      await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem, input.runLifecycle?.claimEntries);
+      if (input.runLifecycle?.persistence && input.journal)
+        throw new TypeError("managed runs cannot bypass lease ownership with a preconstructed journal");
+      const runDirectoryFileSystem = input.runLifecycle?.persistence
+        ?.runDirectoryFileSystem(input.runDirectoryFileSystem);
+      await claimRunDirectory(
+        input.dir,
+        document,
+        runDirectoryFileSystem ?? input.runDirectoryFileSystem,
+        input.runLifecycle?.claimEntries,
+      );
   } catch (error) {
     const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
     const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
@@ -472,8 +489,13 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throw error;
     }
     await input.runLifecycle?.onManifest(runId);
-  const journal = input.journal ?? new JournalStore(input.dir);
-  const store = new ContextStore(input.dir, contextStoreLimits(profile));
+  const journalFileSystem = input.runLifecycle?.persistence?.journalFileSystem(input.journalFileSystem)
+    ?? input.journalFileSystem;
+  const contextInstrumentation = input.runLifecycle?.persistence
+    ?.contextInstrumentation(input.contextStoreInstrumentation)
+    ?? input.contextStoreInstrumentation;
+  const journal = input.journal ?? new JournalStore(input.dir, journalFileSystem);
+  const store = new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation);
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
   let phase: Phase = "journal";
   const setPhase = (value: Phase): void => {

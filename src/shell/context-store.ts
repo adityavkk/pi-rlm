@@ -187,6 +187,10 @@ export class ContextStore {
     this.limits = validateLimits(limits);
   }
 
+  private fileOperation<T>(path: string, effect: () => Promise<T>): Promise<T> {
+    return this.instrumentation.runFileSystemOperation?.(path, effect) ?? effect();
+  }
+
   private contentHash(value: string | Uint8Array): string {
     const hash = this.instrumentation.hasher?.(value)
       ?? (typeof value === "string" ? sha256(value) : sha256Bytes(value));
@@ -230,10 +234,10 @@ export class ContextStore {
   private async trustedRootPath(contextId: string): Promise<string> {
     let actual: string;
     try {
-      const info = await lstat(this.dir);
+      const info = await this.fileOperation(this.dir, () => lstat(this.dir));
       if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0)
         throw new ContextIntegrityError(contextId, "type");
-      actual = await realpath(this.dir);
+      actual = await this.fileOperation(this.dir, () => realpath(this.dir));
     } catch (error) {
       if (error instanceof ContextIntegrityError) throw error;
       throw new ContextIntegrityError(contextId, "containment");
@@ -253,21 +257,21 @@ export class ContextStore {
     const root = await this.trustedRootPath(contextId);
     if (create) {
       try {
-        await mkdir(this.contentDir, { mode: 0o700 });
+        await this.fileOperation(this.contentDir, () => mkdir(this.contentDir, { mode: 0o700 }));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
     }
     let info;
     try {
-      info = await lstat(this.contentDir);
+      info = await this.fileOperation(this.contentDir, () => lstat(this.contentDir));
     } catch (error) {
       if (!create && (error as NodeJS.ErrnoException).code === "ENOENT") throw new ContextUnavailableError(contextId);
       throw error;
     }
     if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0)
       throw new ContextIntegrityError(contextId, "type");
-    const actual = await realpath(this.contentDir);
+    const actual = await this.fileOperation(this.contentDir, () => realpath(this.contentDir));
     const expected = join(root, "contexts");
     if (actual !== expected || !this.contained(root, actual)) throw new ContextIntegrityError(contextId, "containment");
     return actual;
@@ -291,7 +295,7 @@ export class ContextStore {
     await this.revalidateDirectory(directory, contextId);
     let handle;
     try {
-      handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      handle = await this.fileOperation(path, () => open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ENOENT") throw new ContextUnavailableError(contextId);
@@ -299,42 +303,45 @@ export class ContextStore {
       throw error;
     }
     try {
-      const info = await handle.stat();
+      const info = await this.fileOperation(path, () => handle.stat());
       if (!info.isFile() || info.nlink !== 1 || (requirePrivateMode && (info.mode & 0o077) !== 0))
         throw new ContextIntegrityError(contextId, "type");
       await this.revalidateDirectory(directory, contextId);
       return handle;
     } catch (error) {
-      await handle.close().catch(() => undefined);
+      await this.fileOperation(path, () => handle.close()).catch(() => undefined);
       throw error;
     }
   }
 
   private async syncPayload(path: string, directory: string, reference: ContextContentReference): Promise<void> {
     if (this.instrumentation.syncFile) {
-      await this.instrumentation.syncFile(path);
+      await this.fileOperation(path, () => this.instrumentation.syncFile!(path));
       return;
     }
     const handle = await this.openPayload(path, directory, reference.id, true);
     try {
-      await handle.sync();
+      await this.fileOperation(path, () => handle.sync());
     } finally {
-      await handle.close();
+      await this.fileOperation(path, () => handle.close());
     }
   }
 
   private async syncDirectory(directory: string, contextId: string): Promise<void> {
     await this.revalidateDirectory(directory, contextId);
     if (this.instrumentation.syncDirectory) {
-      await this.instrumentation.syncDirectory(directory);
+      await this.fileOperation(directory, () => this.instrumentation.syncDirectory!(directory));
     } else {
-      const handle = await open(directory, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const handle = await this.fileOperation(
+        directory,
+        () => open(directory, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)),
+      );
       try {
-        const info = await handle.stat();
+        const info = await this.fileOperation(directory, () => handle.stat());
         if (!info.isDirectory()) throw new ContextIntegrityError(contextId, "type");
-        await handle.sync();
+        await this.fileOperation(directory, () => handle.sync());
       } finally {
-        await handle.close();
+        await this.fileOperation(directory, () => handle.close());
       }
     }
     await this.revalidateDirectory(directory, contextId);
@@ -347,7 +354,7 @@ export class ContextStore {
   ): Promise<Uint8Array> {
     const handle = await this.openPayload(path, directory, reference.id, true);
     try {
-      const before = await handle.stat();
+      const before = await this.fileOperation(path, () => handle.stat());
       if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o077) !== 0)
         throw new ContextIntegrityError(reference.id, "type");
       if (before.size !== reference.bytes || reference.bytes > MAX_VERIFIED_CONTEXT_BYTES)
@@ -355,11 +362,14 @@ export class ContextStore {
       const buffer = Buffer.alloc(reference.bytes);
       let offset = 0;
       while (offset < buffer.length) {
-        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+        const { bytesRead } = await this.fileOperation(
+          path,
+          () => handle.read(buffer, offset, buffer.length - offset, offset),
+        );
         if (bytesRead === 0) break;
         offset += bytesRead;
       }
-      const after = await handle.stat();
+      const after = await this.fileOperation(path, () => handle.stat());
       if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o077) !== 0)
         throw new ContextIntegrityError(reference.id, "type");
       if (offset !== reference.bytes || after.size !== reference.bytes || before.dev !== after.dev
@@ -370,7 +380,7 @@ export class ContextStore {
       await this.revalidateDirectory(directory, reference.id);
       return bytes;
     } finally {
-      await handle.close();
+      await this.fileOperation(path, () => handle.close());
     }
   }
 
@@ -412,14 +422,14 @@ export class ContextStore {
       try {
         let bytes: number;
         if (this.instrumentation.fileBytes) {
-          bytes = await this.instrumentation.fileBytes(path);
+          bytes = await this.fileOperation(path, () => this.instrumentation.fileBytes!(path));
         } else {
           if (mutationDirectory === undefined) return { exists: true, bytes: maximum };
           const handle = await this.openPayload(path, mutationDirectory, contextId);
           try {
-            bytes = (await handle.stat()).size;
+            bytes = (await this.fileOperation(path, () => handle.stat())).size;
           } finally {
-            await handle.close();
+            await this.fileOperation(path, () => handle.close());
           }
         }
         return { exists: true, bytes: Number.isSafeInteger(bytes) && bytes >= 0 && bytes <= maximum ? bytes : maximum };
@@ -445,7 +455,8 @@ export class ContextStore {
         if (candidate.tempPath !== undefined) {
           try {
             if (mutationDirectory !== undefined) await this.revalidateDirectory(mutationDirectory, descriptor.id);
-            await remove(candidate.tempPath);
+            const tempPath = candidate.tempPath;
+            await this.fileOperation(tempPath, () => remove(tempPath));
             if (mutationDirectory !== undefined) await this.revalidateDirectory(mutationDirectory, descriptor.id);
           } catch (cause) {
             if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -500,7 +511,7 @@ export class ContextStore {
         }
       }
       if (createdDir && this.orphans.size === 0 && mutationDirectory !== undefined)
-        await rmdir(mutationDirectory).catch(() => undefined);
+        await this.fileOperation(mutationDirectory, () => rmdir(mutationDirectory!)).catch(() => undefined);
       if (failures.length > 0) throw new ContextCleanupError(failures);
     };
 
@@ -546,7 +557,7 @@ export class ContextStore {
       }
       if (staged.length > 0) {
         try {
-          await lstat(this.contentDir);
+          await this.fileOperation(this.contentDir, () => lstat(this.contentDir));
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") createdDir = true;
           else throw error;
@@ -570,12 +581,12 @@ export class ContextStore {
         candidate.finalPath = finalPath;
         candidate.state = "temp-owned";
         if (this.instrumentation.writeFile) {
-          await this.instrumentation.writeFile(tempPath, entry.bytesArray);
+          await this.fileOperation(tempPath, () => this.instrumentation.writeFile!(tempPath, entry.bytesArray));
         } else {
-          await writeFile(tempPath, entry.bytesArray, {
+          await this.fileOperation(tempPath, () => writeFile(tempPath, entry.bytesArray, {
             flag: constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
             mode: 0o600,
-          });
+          }));
         }
         await this.syncPayload(tempPath, directory, entry.descriptor);
         // The synced pathname, not the earlier in-memory buffer, is the
@@ -585,10 +596,10 @@ export class ContextStore {
         await this.revalidateDirectory(directory, entry.descriptor.id);
         try {
           if (this.instrumentation.rename) {
-            await this.instrumentation.rename(tempPath, finalPath);
+            await this.fileOperation(finalPath, () => this.instrumentation.rename!(tempPath, finalPath));
             candidate.tempPath = undefined;
           } else {
-            await link(tempPath, finalPath);
+            await this.fileOperation(finalPath, () => link(tempPath, finalPath));
           }
           candidate.state = "published-shared";
         } catch (error) {
@@ -598,7 +609,8 @@ export class ContextStore {
         await this.revalidateDirectory(directory, entry.descriptor.id);
 
         if (candidate.tempPath !== undefined) {
-          await remove(candidate.tempPath);
+          const ownedTemp = candidate.tempPath;
+          await this.fileOperation(ownedTemp, () => remove(ownedTemp));
           candidate.tempPath = undefined;
           await this.revalidateDirectory(directory, entry.descriptor.id);
         }
@@ -705,15 +717,15 @@ export class ContextStore {
         if (!orphan.removable) continue;
         control?.checkpoint?.();
         try {
-          await remove(path);
+          await this.fileOperation(path, () => remove(path));
         } catch (cause) {
           if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
             let bytes = orphan.bytes;
             let exists = true;
             try {
               const measured = this.instrumentation.fileBytes
-                ? await this.instrumentation.fileBytes(path)
-                : (await lstat(path)).size;
+                ? await this.fileOperation(path, () => this.instrumentation.fileBytes!(path))
+                : (await this.fileOperation(path, () => lstat(path))).size;
               if (Number.isSafeInteger(measured) && measured >= 0 && measured <= bytes) bytes = measured;
             } catch (measurementCause) {
               const code = (measurementCause as NodeJS.ErrnoException).code;
@@ -739,7 +751,8 @@ export class ContextStore {
       }
       if (this.entries.size === 0 && this.orphans.size === 0) {
         const directory = await this.contentDirectory("contexts", false).catch(() => undefined);
-        if (directory !== undefined) await rmdir(directory).catch(() => undefined);
+        if (directory !== undefined)
+          await this.fileOperation(directory, () => rmdir(directory)).catch(() => undefined);
       }
       if (failures.length > 0) throw new ContextCleanupError(failures);
     } finally {

@@ -65,8 +65,24 @@ export class RunWriterScheduler {
   private released = false;
   private releaseInFlight: Promise<void> | undefined;
   private terminalInFlight: Promise<unknown> | undefined;
+  private terminalPrepared = false;
 
   constructor(private readonly hooks: RunWriterSchedulerHooks) {}
+
+  /** Filesystem adapters use inline nesting because their operation promise is always awaited by the owner shell. */
+  runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    const inherited = writerScope.getStore();
+    if (inherited?.open) {
+      if (inherited.scheduler !== this) {
+        return Promise.reject(new RunWriterSchedulerError(
+          "WRITER_SCHEDULER_LOCK_ORDER",
+          "cannot enter a different writer scheduler from an open writer scope",
+        ));
+      }
+      return invoke(effect);
+    }
+    return this.run(effect);
+  }
 
   run<T>(effect: () => T | PromiseLike<T>): Promise<T> {
     const inherited = writerScope.getStore();
@@ -177,9 +193,12 @@ export class RunWriterScheduler {
   }
 
   private async runTerminalQueued<T>(effect: () => T | PromiseLike<T>): Promise<T> {
-    const before = await attempt(this.hooks.preFence);
-    if (before.status === "rejected")
-      throw new RunWriterSchedulerManagementError("pre-fence", before.error, false, undefined);
+    if (!this.terminalPrepared) {
+      const before = await attempt(this.hooks.preFence);
+      if (before.status === "rejected")
+        throw new RunWriterSchedulerManagementError("pre-fence", before.error, false, undefined);
+      this.terminalPrepared = true;
+    }
 
     const scope: WriterScope = { scheduler: this, children: [], open: true };
     let effectResult: Attempt<T>;

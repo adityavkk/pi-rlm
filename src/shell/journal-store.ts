@@ -38,7 +38,7 @@ export interface JournalFileSystem {
   rename(oldPath: string, newPath: string): Promise<void>;
 }
 
-const nodeFileSystem: JournalFileSystem = {
+export const nodeJournalFileSystem: JournalFileSystem = {
   open: async (path, flags, mode) => open(path, flags, mode),
   readFile: async (path) => readFile(path),
   rename,
@@ -235,7 +235,7 @@ export class JournalStore {
 
   constructor(
     private readonly dir: string,
-    private readonly fileSystem: JournalFileSystem = nodeFileSystem,
+    private readonly fileSystem: JournalFileSystem = nodeJournalFileSystem,
   ) {
     this.eventsPath = join(dir, "events.jsonl");
     this.statusPath = join(dir, "status.json");
