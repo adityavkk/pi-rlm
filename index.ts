@@ -299,6 +299,8 @@ const executeRun = async (
   return result;
 };
 
+export interface RlmUiIntervalHandle { unref?(): void }
+
 export interface RlmExtensionDependencies {
   readonly executeRun?: (
     request: LaunchRequest,
@@ -309,6 +311,9 @@ export interface RlmExtensionDependencies {
   readonly now?: () => number;
   readonly createId?: () => string;
   readonly grantTtlMs?: number;
+  /** Deterministic TUI refresh seams. Production uses one unref'ed interval. */
+  readonly setUiInterval?: (callback: () => void, intervalMs: number) => RlmUiIntervalHandle;
+  readonly clearUiInterval?: (handle: RlmUiIntervalHandle) => void;
   /** Host-managed listing seam, already bound to its retention options. */
   readonly listManagedRuns?: () => Promise<ManagedRunListing>;
   /** Host-managed inspection seam, already bound to the same retention options. */
@@ -611,12 +616,59 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   });
   let runWidget: RunWidget | undefined;
   let widgetContext: ExtensionContext | undefined;
-  const unsubscribeWidget = runCoordinator.subscribe((runs) => runWidget?.update(runs));
+  let widgetRefresh: RlmUiIntervalHandle | undefined;
+  let widgetRefreshStarting = false;
+  let widgetRefreshGeneration = 0;
+  let widgetInstallation = 0;
+  const clearRefresh = dependencies.clearUiInterval
+    ?? ((handle: RlmUiIntervalHandle) => clearInterval(handle as ReturnType<typeof setInterval>));
+  const stopWidgetRefresh = (): void => {
+    widgetRefreshGeneration += 1;
+    const handle = widgetRefresh;
+    widgetRefresh = undefined;
+    if (!handle) return;
+    try { clearRefresh(handle); } catch { /* Best-effort timer cleanup. */ }
+  };
+  const hasActiveRuns = (runs: ReturnType<RunCoordinator["list"]>): boolean =>
+    runs.some((run) => run.state === "running" || run.state === "cancelling");
+  const syncWidgetRefresh = (runs: ReturnType<RunCoordinator["list"]>): void => {
+    if (!runWidget || widgetContext?.mode !== "tui" || !hasActiveRuns(runs)) { stopWidgetRefresh(); return; }
+    if (widgetRefresh !== undefined || widgetRefreshStarting) return;
+    widgetRefreshStarting = true;
+    const generation = ++widgetRefreshGeneration;
+    const schedule = dependencies.setUiInterval
+      ?? ((callback: () => void, intervalMs: number): RlmUiIntervalHandle => setInterval(callback, intervalMs));
+    let handle: RlmUiIntervalHandle | undefined;
+    try {
+      handle = schedule(() => {
+        if (!runWidget || widgetContext?.mode !== "tui") { stopWidgetRefresh(); return; }
+        const current = runCoordinator.list();
+        if (!hasActiveRuns(current)) { stopWidgetRefresh(); return; }
+        try { runWidget.update(current); } catch { /* Rendering cannot own timer cleanup. */ }
+      }, 1_000);
+    } catch { widgetRefreshGeneration += 1; }
+    finally { widgetRefreshStarting = false; }
+    if (!handle) return;
+    if (generation !== widgetRefreshGeneration || !runWidget
+      || widgetContext?.mode !== "tui" || !hasActiveRuns(runCoordinator.list())) {
+      try { clearRefresh(handle); } catch { /* Best-effort unpublished timer cleanup. */ }
+      return;
+    }
+    widgetRefresh = handle;
+    try { handle.unref?.(); }
+    catch { stopWidgetRefresh(); }
+  };
+  const unsubscribeWidget = runCoordinator.subscribe((runs) => {
+    try { runWidget?.update(runs); }
+    finally { syncWidgetRefresh(runs); }
+  });
   const clearWidget = (): void => {
+    widgetInstallation += 1;
     const current = widgetContext;
     const widget = runWidget;
     widgetContext = undefined;
     runWidget = undefined;
+    stopWidgetRefresh();
     try { widget?.dispose(); } catch { /* Component disposal is best-effort and idempotent. */ }
     if (current?.mode === "tui") {
       try { current.ui.setWidget("pi-rlm-runs", undefined); } catch { /* Best-effort UI cleanup. */ }
@@ -625,17 +677,33 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   const installWidget = (ctx: ExtensionContext): void => {
     clearWidget();
     if (ctx.mode !== "tui") return;
+    const installation = widgetInstallation;
     widgetContext = ctx;
+    let factoryConsumed = false;
     try {
       ctx.ui.setWidget("pi-rlm-runs", (tui) => {
-        const widget = new RunWidget(runCoordinator.list(), () => tui.requestRender());
+        if (factoryConsumed || installation !== widgetInstallation || widgetContext !== ctx || ctx.mode !== "tui") {
+          const stale = new RunWidget();
+          stale.dispose();
+          return stale;
+        }
+        factoryConsumed = true;
+        if (runWidget) return runWidget;
+        let widget!: RunWidget;
+        widget = new RunWidget(runCoordinator.list(), () => tui.requestRender(), () => {
+          if (runWidget !== widget) return;
+          runWidget = undefined;
+          stopWidgetRefresh();
+        });
         runWidget = widget;
+        syncWidgetRefresh(runCoordinator.list());
         return widget;
       }, { placement: "aboveEditor" });
     } catch {
       const widget = runWidget;
       widgetContext = undefined;
       runWidget = undefined;
+      stopWidgetRefresh();
       try { widget?.dispose(); } catch { /* Best-effort failed-install cleanup. */ }
     }
   };
