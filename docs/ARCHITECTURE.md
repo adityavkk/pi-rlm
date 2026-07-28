@@ -185,18 +185,15 @@ same-user trusted.
 `src/runtime/provider.ts` is the only production location that calls
 `ModelClient.complete`. It validates the complete request, estimates all system,
 prompt, context, canonical structured-schema, and enforced-output tokens, then
-atomically reserves the logical operation (on its first attempt), attempt, tokens, and concurrency slot
-before entering the provider. Every exit settles finite reported tokens, cost,
-and duration; `finally` releases token and concurrency reservations. Reported
-token overshoot remains charged and blocks later reservations.
+atomically reserves the logical operation (on its first attempt), attempt, tokens, and concurrency slot. It then derives and syncs a deterministic `operation_intended` identity before entering the provider. Every result is linked exactly once by `operation_settled` with finite reported tokens, cost, and duration; `finally` releases token and concurrency reservations. Reported token overshoot remains charged and blocks later reservations. A durable intent without settlement is an ambiguous external effect and is never an automatic retry signal.
 
 | Path | Logical operations | Attempts | Usage ownership |
 | --- | ---: | ---: | --- |
-| Controller turn, valid primary | 1 | 1 | controller trajectory, `provider_attempted`, tree ledger |
-| Controller malformed primary + repair | 1 | 2 | combined on the same turn operation |
-| Leaf `llm`, valid primary | 1 | 1 | `CallResult`, `call_committed`, tree ledger |
-| Leaf structured repair | 1 | 2 | combined on the same leaf operation |
-| Delegated `agent`, uncached | 1 | 1 | `agent_approval`, reported child usage, `provider_attempted`, successful `call_committed`, tree ledger |
+| Controller turn, valid primary | 1 | 1 | controller trajectory, operation intent/settlement, tree ledger |
+| Controller malformed primary + repair | 1 | 2 | two settled intents combined on the same turn operation |
+| Leaf `llm`, valid primary | 1 | 1 | `CallResult`, `call_committed`, operation intent/settlement, tree ledger |
+| Leaf structured repair | 1 | 2 | two settled intents combined on the same leaf operation |
+| Delegated `agent`, uncached | 1 | 1 | `agent_approval`, reported child usage, operation intent/settlement, successful `call_committed`, tree ledger |
 | Provider fallback extractor | 1 | provider completions | extractor provider events and tree ledger |
 | External custom extractor | 1 | 1 explicit opaque operation | zero reported tokens/cost, measured host duration; no nested completion capability |
 | `recurse` | 1 frame operation | 0 itself | parent-lineage-scoped identity; subtree provider usage copied into its result, never re-settled |
@@ -220,9 +217,7 @@ use the supplied completion capability and fail if they return without doing
 so. `external` extractors receive no completion capability while holding their
 leaf slot; because arbitrary external code cannot report internal provider
 accounting, the runtime charges one explicit logical operation and attempt.
-Settlement and scoped aggregation happen once before journal persistence, so a
-typed journal failure cannot charge the opaque operation twice. This is an
-opaque-operation contract, not a claim about hidden transport token usage.
+Settlement and scoped aggregation happen once before the authoritative settlement append, so a typed journal failure cannot charge the opaque operation twice. The synced intent still makes a missing settlement recover as `RECOVERY_AMBIGUOUS`. This is an opaque-operation contract, not a claim about hidden transport token usage.
 
 Recurse call identity and key binding include the deterministic parent controller
 lineage. Equal calls under one parent coalesce, while equal keys in separate
