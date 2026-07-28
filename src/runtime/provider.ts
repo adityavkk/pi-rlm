@@ -352,15 +352,20 @@ export const createModelOperation = (
 ): ModelOperation => {
   let logicalReserved = false;
   let aggregate: CallUsage = ZERO_CALL_USAGE;
-  let poisoned: unknown;
+  let poisoned = false;
+  let poisonCause: unknown;
   const pendingFinalizers = new Set<Promise<unknown>>();
   const attemptKey = `${frame.frameId}\0${options.operationId}`;
   let attemptOrdinal = state.operationAttempts.get(attemptKey) ?? 0;
 
   const ensureUsable = (): void => {
-    if (poisoned !== undefined) throw poisoned;
+    if (poisoned) throw poisonCause;
   };
-  const poison = (error: unknown): void => { if (poisoned === undefined) poisoned = error; };
+  const poison = (error: unknown): void => {
+    if (poisoned) return;
+    poisoned = true;
+    poisonCause = error;
+  };
   const trackFinalizer = <T>(work: Promise<T>): Promise<T> => {
     pendingFinalizers.add(work);
     void work.then(

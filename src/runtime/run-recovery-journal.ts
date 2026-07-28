@@ -38,6 +38,7 @@ type OperationSettlement = Extract<RlmEvent, { type: "operation_settled" }>;
 
 interface OperationSegment {
   readonly intents: OperationIntent[];
+  readonly outcomes: OperationSettlement[];
   usage: CallUsage;
   settlements: number;
 }
@@ -205,6 +206,8 @@ export const validateRecoveryJournal = (
         break;
       }
       case "cell_committed": {
+        if (event.iteration > document.manifest.limits.maxControllerTurns)
+          semanticError("committed cells exceed the manifest turn limit");
         const key = `${event.frameId}\0${event.iteration}`;
         if (rememberExact(cells, key, event, "cell")) {
           if (event.iteration !== frame.cells.size + 1) semanticError("cell iterations are not contiguous");
@@ -300,7 +303,7 @@ export const validateRecoveryJournal = (
 
         let segment: OperationSegment;
         if (reservation.logicalCalls === 1) {
-          segment = { intents: [], usage: ZERO_CALL_USAGE, settlements: 0 };
+          segment = { intents: [], outcomes: [], usage: ZERO_CALL_USAGE, settlements: 0 };
           if (!operation) operation = { kind: event.kind, key: event.key, segments: [], lastAttempt: 0, lastIntentId: "" };
           operation.segments.push(segment);
         } else {
@@ -338,6 +341,7 @@ export const validateRecoveryJournal = (
         if (combined.ok) attempt.segment.usage = combined.value;
         else semanticError("operation settlement usage aggregate is invalid");
         attempt.segment.settlements += 1;
+        attempt.segment.outcomes.push(event);
         settlements.set(event.intentId, event);
         break;
       }
@@ -350,11 +354,18 @@ export const validateRecoveryJournal = (
         if (prior && (prior.frameId !== event.frameId || prior.kind !== event.kind || prior.key !== event.key
           || prior.ok)) semanticError("invalid repeated call execution");
         if (event.kind === "llm" || event.kind === "agent") {
+          const expectedCallId = `call_${event.kind}_${sha256(canonicalStringify({
+            runId,
+            kind: event.kind,
+            key: event.key,
+            identityHash: binding!.identityHash,
+          }))}`;
           const operation = operations.get(`${event.frameId}\0${event.callId}`);
           const segment = operation?.segments.at(-1);
-          if (!event.ok || operation?.kind !== event.kind || !segment
-            || segment.settlements !== segment.intents.length || !same(event.usage, segment.usage))
-            semanticError("committed call usage does not match authoritative operation settlements");
+          if (event.callId !== expectedCallId || !event.ok || operation?.kind !== event.kind || !segment
+            || segment.settlements !== segment.intents.length || segment.outcomes.at(-1)?.outcome !== "ok"
+            || !same(event.usage, segment.usage))
+            semanticError("committed call identity or usage does not match authoritative operation settlements");
         }
         executions.push(event);
         calls.set(event.callId, executions);

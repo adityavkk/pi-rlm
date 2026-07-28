@@ -32,7 +32,12 @@ export const deriveCallId = (
 ): string => {
   const digest = fullDigest(
     hasher,
-    canonicalStringify({ runId: parts.runId, kind: parts.kind, key: parts.key, identity: parts.identity }),
+    canonicalStringify({
+      runId: parts.runId,
+      kind: parts.kind,
+      key: parts.key,
+      identityHash: identityHash(hasher, parts.identity),
+    }),
   );
   return `call_${parts.kind}_${digest}`;
 };

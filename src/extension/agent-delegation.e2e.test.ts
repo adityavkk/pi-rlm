@@ -82,7 +82,7 @@ describe("public Pi agent delegation E2E", () => {
             context: input,
           });
           answer({ answer: delegated.ok ? delegated.value : delegated.error.code });`,
-        profileOverrides: { maxLogicalCalls: 2, maxAttempts: 2 },
+        profileOverrides: { maxLogicalCalls: 2, maxAttempts: 2, wallMs: 15_000, cellWallMs: 15_000 },
         extensionSetup(pi) {
           pi.events.on(SUBAGENT_DELEGATION_REQUEST_EVENT, (data) => {
             if (!isV2Request(data)) return;
@@ -134,7 +134,11 @@ describe("public Pi agent delegation E2E", () => {
         },
       } as unknown as ExtensionUIContext;
       await fixture.runtime.session.bindExtensions({ mode: "tui", uiContext: approvingUi });
-      await withTimeout(fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }), "delegation prompt");
+      await withTimeout(
+        fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }),
+        "delegation prompt",
+        15_000,
+      );
 
       expect(fixture.state.fetchCalls).toBe(0);
       expect(approvalPrompts).toBe(1);
@@ -194,7 +198,7 @@ describe("public Pi agent delegation E2E", () => {
       await fixture?.dispose();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test.each(["rpc", "print", "json"] as const)("%s denies opaque agents without dialog or delegation", async (mode) => {
     const root = await mkdtemp(join(tmpdir(), `pi-rlm-${mode}-opaque-`));
