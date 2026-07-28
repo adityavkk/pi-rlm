@@ -849,7 +849,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         grantId,
         ...binding,
         issuedAtMs,
-        expiresAtMs: issuedAtMs + grantTtlMs,
+        expiresAtMs: authorizationRequest.expiresAtMs,
         oneShot: true,
       });
       resumeGrantStore = mintResumeGrant(resumeGrantStore, grant);
