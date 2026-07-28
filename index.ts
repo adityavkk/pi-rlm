@@ -828,7 +828,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         ...binding,
         expiresAtMs,
       });
-      let approved: boolean;
+      let approved: unknown;
       try {
         approved = hasTuiAuthorization
           ? await waitForAbort(ctx.ui.confirm(
@@ -856,7 +856,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         ));
         return;
       }
-      if (!approved) {
+      if (approved !== true) {
         deliver(managementFailure("resume", "RLM_RESUME_DENIED", "Managed continuation was not approved.", { managedName }));
         return;
       }
@@ -982,15 +982,22 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       requireCoordinatorMutation(ownership.setPhase("initializing"), "resume initialization");
 
       const profile = (dependencies.runtime?.resolveProfile ?? resolveProfile)();
-      const backendWork = Promise.resolve((dependencies.runtime?.createBackend ?? getBackend)());
-      const modelWork = dependencies.runtime?.createModel
-        ? Promise.resolve(dependencies.runtime.createModel(profile))
-        : getRuntime().then((runtime) => new PiModelClient(runtime, profile.models.medium));
-      const [backend, model] = await waitForAbort(Promise.all([backendWork, modelWork]), ownership.signal);
+      const backend = await waitForAbort(
+        Promise.resolve((dependencies.runtime?.createBackend ?? getBackend)()),
+        ownership.signal,
+      );
+      if (!current()) return;
+      const model = await waitForAbort(
+        dependencies.runtime?.createModel
+          ? Promise.resolve(dependencies.runtime.createModel(profile))
+          : getRuntime().then((runtime) => new PiModelClient(runtime, profile.models.medium)),
+        ownership.signal,
+      );
       if (!current()) return;
       const controller = (dependencies.runtime?.createController
         ?? ((client: ModelClient, selectedProfile: Profile) =>
           new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
+      if (!current()) return;
       const agentDelegation = candidate.agentDelegationRequired ? extensionAgentDelegation(
         ctx,
         sessionId,

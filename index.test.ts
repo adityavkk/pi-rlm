@@ -973,7 +973,7 @@ describe("pi-rlm extension wiring", () => {
   });
 
   test("resume terminal, non-TUI policy absence, denial, and audit failure construct no factories", async () => {
-    const cases = ["terminal", "headless", "denied", "audit"] as const;
+    const cases = ["terminal", "headless", "denied", "malformed", "audit"] as const;
     for (const kind of cases) {
       let factories = 0;
       let acquisitions = 0;
@@ -1001,19 +1001,23 @@ describe("pi-rlm extension wiring", () => {
             abandon: async () => { abandons++; },
           };
         },
-        ...(kind === "headless" ? {} : { authorizeResume: async () => kind !== "denied" }),
+        ...(kind === "headless" ? {} : {
+          authorizeResume: async () => kind === "malformed"
+            ? "deny" as unknown as boolean
+            : kind !== "denied",
+        }),
       });
       h.setMode("print");
       if (kind === "audit") h.setAppendFaultType("pi-rlm-resume-grant");
       await h.commands.get("rlm")!.handler(`resume ${MANAGED_NAME}`, h.ctx);
       expect(factories).toBe(0);
       expect(acquisitions).toBe(kind === "terminal" || kind === "headless" ? 0 : 1);
-      expect(abandons).toBe(kind === "denied" || kind === "audit" ? 1 : 0);
+      expect(abandons).toBe(kind === "denied" || kind === "malformed" || kind === "audit" ? 1 : 0);
       const content = String(h.resultMessages.at(-1)?.message["content"]);
       expect(content).not.toContain("RAW terminal");
       expect(content).toContain(kind === "terminal" ? "RLM_RESUME_TERMINAL"
         : kind === "headless" ? "RLM_RESUME_AUTHORIZATION_REQUIRED"
-          : kind === "denied" ? "RLM_RESUME_DENIED" : "RLM_RESUME_AUDIT_FAILED");
+          : kind === "denied" || kind === "malformed" ? "RLM_RESUME_DENIED" : "RLM_RESUME_AUDIT_FAILED");
     }
   });
 

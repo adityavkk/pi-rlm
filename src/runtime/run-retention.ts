@@ -1440,12 +1440,13 @@ export class ManagedRunStore {
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target became active or ambiguous");
   }
 
-  private async scavengeDeadGeneses(): Promise<void> {
+  private async scavengeDeadGeneses(checkpoint: () => void): Promise<void> {
     await this.ensureRoot();
     const directory = await opendir(this.root, { bufferSize: 1 });
     let examined = 0;
     try {
       for await (const entry of directory) {
+        checkpoint();
         if (++examined > this.policy.maxScanEntries)
           throw this.scanLimit("dead genesis scavenging entry limit reached");
         if (!RUN_NAME.test(entry.name)) continue;
@@ -1504,6 +1505,7 @@ export class ManagedRunStore {
 
         let terminal = false;
         try {
+          checkpoint();
           const guard = () => assertFailedGenesisRetirement(
             this.root,
             entry.name,
@@ -1547,12 +1549,13 @@ export class ManagedRunStore {
     } finally { try { await directory.close(); } catch { /* Iterator may already have closed it. */ } }
   }
 
-  private async scavengeQuarantines(): Promise<void> {
+  private async scavengeQuarantines(checkpoint: () => void): Promise<void> {
     await this.ensureRoot();
     const directory = await opendir(this.root, { bufferSize: 1 });
     let examined = 0;
     try {
       for await (const entry of directory) {
+        checkpoint();
         if (++examined > this.policy.maxScanEntries)
           throw this.scanLimit("quarantine scavenging entry limit reached");
         if (!isRunQuarantineName(entry.name)) continue;
@@ -1583,9 +1586,9 @@ export class ManagedRunStore {
       if (!options.dryRun) {
         await this.retryReleaseAuthorities();
         checkpoint();
-        await this.scavengeQuarantines();
+        await this.scavengeQuarantines(checkpoint);
         checkpoint();
-        await this.scavengeDeadGeneses();
+        await this.scavengeDeadGeneses(checkpoint);
         checkpoint();
       }
     } catch (cause) {
