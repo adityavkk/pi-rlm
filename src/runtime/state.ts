@@ -12,6 +12,7 @@ import type { ModelClient } from "../shell/model/client.ts";
 import type { GuestCallResult } from "./call-result.ts";
 import type { AgentDelegationRuntime } from "./agent-delegation.ts";
 import type { Profile } from "./profile.ts";
+import type { RunOperationAuthority } from "./operation-authority.ts";
 import type { RunProgressTracker } from "./run-progress.ts";
 import type { Semaphore } from "./semaphore.ts";
 
@@ -62,6 +63,8 @@ export interface RunState {
   readonly scopeUsage: Map<string, CallUsage>;
   /** Highest durable-attempt ordinal reserved for each frame and operation identity. */
   readonly operationAttempts: Map<string, number>;
+  /** Present for top-level runs; closed before frame/run terminalization starts. */
+  readonly operationAuthority?: RunOperationAuthority;
   readonly semaphore: Semaphore;
   readonly contextSemaphore: Semaphore;
   readonly agentDelegation?: AgentDelegationRuntime;

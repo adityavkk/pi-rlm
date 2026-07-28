@@ -236,21 +236,22 @@ describe("dispatchCall cancellation ownership", () => {
     holderAbort.abort();
     const holderResult = await holder;
     expect(holderResult.error?.code).toBe("CANCELLED");
-    expect(state.inflight.size).toBe(0);
+    expect(state.inflight.size).toBe(1);
     expect(state.ledger.current.usage.logicalCalls).toBe(1);
     expect(state.ledger.current.usage.attempts).toBe(1);
-    expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
-    expect(state.ledger.current.usage.tokensReserved).toBe(0);
+    expect(state.ledger.current.usage.activeLeafCalls).toBe(1);
+    expect(state.ledger.current.usage.tokensReserved).toBeGreaterThan(0);
     expect(state.callCache.size).toBe(0);
     expect(leafAcquisitions).toBe(1);
-    expect(leafReleaseInvocations).toBe(1);
+    expect(leafReleaseInvocations).toBe(0);
     expect(retentionAcquisitions).toBe(0);
 
     rejectStuck(new Error("late model rejection"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(state.inflight.size).toBe(0);
     expect(state.callCache.size).toBe(0);
+    expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
+    expect(state.ledger.current.usage.tokensReserved).toBe(0);
     expect(leafReleaseInvocations).toBe(1);
 
     const next = await dispatchCall(

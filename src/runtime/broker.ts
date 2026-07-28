@@ -652,14 +652,17 @@ ${first.text}`;
     },
   );
 
-  state.inflight.set(callId, task);
+  const coalesced = task.then(
+    (result) => operation.idle ? result : operation.waitForIdle().then(() => result),
+    (error: unknown) => operation.idle ? Promise.reject(error) : operation.waitForIdle().then(() => { throw error; }),
+  );
+  state.inflight.set(callId, coalesced);
   state.progress?.publish();
-  try {
-    return await task;
-  } finally {
-    if (state.inflight.get(callId) === task) state.inflight.delete(callId);
-    state.progress?.publish();
-  }
+  void coalesced.then(
+    () => { if (state.inflight.get(callId) === coalesced) state.inflight.delete(callId); state.progress?.publish(); },
+    () => { if (state.inflight.get(callId) === coalesced) state.inflight.delete(callId); state.progress?.publish(); },
+  );
+  return task;
 };
 
 const llmBatch = async (

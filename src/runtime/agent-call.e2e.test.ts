@@ -14,6 +14,7 @@ import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import type { AgentDelegator, AgentApprovalRequest } from "./agent-delegation.ts";
 import { MockController } from "./mock-controller.ts";
+import { inspectRecoveredRun } from "./run-recovery.ts";
 import { runProgram } from "./run.ts";
 
 let backend: QuickJsBackend;
@@ -76,6 +77,7 @@ const successfulUsage = {
 describe("agent() delegation E2E", () => {
   test("coalesces, accounts, journals, retains, and passes verified context files", async () => {
     const client = new FakeDelegator(async (spec) => {
+      expect((spec as DelegationV2CallSpec & { version?: number }).version).toBeUndefined();
       expect(spec.requestId).toMatch(/^req_[0-9a-f]{64}$/);
       expect(spec.ownerRunId).toMatch(/^run_[0-9a-f]{64}$/);
       expect(spec.nodeId).toMatch(/^call_agent_[0-9a-f]{64}$/);
@@ -213,6 +215,40 @@ describe("agent() delegation E2E", () => {
     const journal = await events(dir);
     expect(settledOperations(journal)).toHaveLength(0);
     expect(journal.filter((event) => event.type === "run_cancelled")).toHaveLength(1);
+  });
+
+  test("owner cancellation leaves an abort-ignoring delegated operation unresolved", async () => {
+    let markStarted!: () => void;
+    let releaseLate!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const client = new FakeDelegator(async () => {
+      markStarted();
+      await new Promise<void>((resolve) => { releaseLate = resolve; });
+      return { ok: true, status: "completed", value: "late", usage: successfulUsage };
+    });
+    const controller = new MockController([{
+      reasoning: "delegate",
+      code: `const r = await agent({ key: 'late', agent: 'reviewer', task: 'Wait.' }); answer({ answer: r.ok ? r.value : r.error.code });`,
+    }]);
+    const owner = new AbortController();
+    const dir = await tmp();
+    const running = runProgram({
+      program: program(), sources: { context: "source" }, controller, model: model(), backend, dir, signal: owner.signal,
+      agentDelegation: { client, cwd: "/tmp/project", allowedAgents: ["reviewer"] },
+    });
+    await started;
+    owner.abort();
+    const result = await running;
+    expect(result.status).toBe("cancelled");
+    expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, activeLeafCalls: 1, tokensReserved: 0 });
+    const journal = await events(dir);
+    expect(journal.filter((event) => event.type === "operation_intended")).toHaveLength(1);
+    expect(journal.filter((event) => event.type === "operation_settled")).toHaveLength(0);
+    await expect(inspectRecoveredRun(dir)).rejects.toMatchObject({ code: "RECOVERY_AMBIGUOUS" });
+    const before = await readFile(join(dir, "events.jsonl"), "utf8");
+    releaseLate();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(before);
   });
 
   test("denies an opaque agent before delegation spend", async () => {

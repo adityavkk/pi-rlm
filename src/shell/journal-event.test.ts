@@ -18,6 +18,7 @@ const intent = (kind: OperationIntentIdentity["kind"] = "agent") => {
     frameId: "frame",
     operationId: "call_agent_abc",
     kind,
+    key: "fixture",
     attempt: 1,
     requestIdentityVersion: kind === "agent" ? AGENT_REQUEST_IDENTITY_VERSION : PROVIDER_REQUEST_IDENTITY_VERSION,
     requestSha256: "a".repeat(64),

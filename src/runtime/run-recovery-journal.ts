@@ -2,6 +2,12 @@
 
 import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
+import {
+  AGENT_REQUEST_IDENTITY_VERSION,
+  EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION,
+  PROVIDER_REQUEST_IDENTITY_VERSION,
+} from "../core/operation.ts";
+import { addUsage, normalizeCallUsage, type CallUsage, ZERO_CALL_USAGE } from "../core/usage.ts";
 import { normalizeProgram } from "../core/program.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { RunManifestDocument } from "./run-manifest.ts";
@@ -25,6 +31,28 @@ export interface RecoveryJournalModel {
   readonly content: readonly RecoveryContentReference[];
   readonly committedCells: number;
   readonly committedCalls: number;
+}
+
+type OperationIntent = Extract<RlmEvent, { type: "operation_intended" }>;
+type OperationSettlement = Extract<RlmEvent, { type: "operation_settled" }>;
+
+interface OperationSegment {
+  readonly intents: OperationIntent[];
+  usage: CallUsage;
+  settlements: number;
+}
+
+interface OperationRecord {
+  readonly kind: OperationIntent["kind"];
+  readonly key: string;
+  readonly segments: OperationSegment[];
+  lastAttempt: number;
+  lastIntentId: string;
+}
+
+interface OperationAttemptRecord {
+  readonly operation: OperationRecord;
+  readonly segment: OperationSegment;
 }
 
 interface FrameRecord {
@@ -104,13 +132,17 @@ export const validateRecoveryJournal = (
   const calls = new Map<string, CallEvent[]>();
   const keys = new Map<string, Extract<RlmEvent, { type: "key_bound" }>>();
   const approvals = new Map<string, Extract<RlmEvent, { type: "agent_approval" }>>();
-  const intents = new Map<string, Extract<RlmEvent, { type: "operation_intended" }>>();
-  const settlements = new Map<string, Extract<RlmEvent, { type: "operation_settled" }>>();
-  const attemptIntents = new Map<string, Extract<RlmEvent, { type: "operation_intended" }>>();
-  const operations = new Map<string, {
-    readonly kind: Extract<RlmEvent, { type: "operation_intended" }>["kind"];
-    lastAttempt: number;
-  }>();
+  const intents = new Map<string, OperationIntent>();
+  const settlements = new Map<string, OperationSettlement>();
+  const attemptIntents = new Map<string, OperationIntent>();
+  const attemptRecords = new Map<string, OperationAttemptRecord>();
+  const operations = new Map<string, OperationRecord>();
+  const controllerOperations = new Set<string>();
+  let logicalCalls = 0;
+  let attempts = 0;
+  let tokensReserved = 0;
+  let tokensUsed = 0;
+  let childFrames = 0;
   let terminal: TerminalEvent | undefined;
 
   const requireFrame = (frameId: string): FrameRecord => {
@@ -142,7 +174,13 @@ export const validateRecoveryJournal = (
           || frames.has(rootFrameId)) semanticError("invalid root frame");
       } else {
         const parent = requireFrame(event.parentFrameId);
-        if (event.depth !== parent.opened.depth + 1) semanticError("invalid child frame depth");
+        if (event.depth !== parent.opened.depth + 1 || event.depth > document.manifest.limits.maxDepth)
+          semanticError("invalid child frame depth");
+        childFrames += 1;
+        logicalCalls += 1;
+        if (childFrames > document.manifest.limits.maxFrames
+          || logicalCalls > document.manifest.limits.maxLogicalCalls)
+          semanticError("frame reservations exceed manifest limits");
       }
       frames.set(event.frameId, { opened: event, cells: new Map(), workspaces: new Map(), progress: new Map() });
       continue;
@@ -171,6 +209,13 @@ export const validateRecoveryJournal = (
         if (rememberExact(cells, key, event, "cell")) {
           if (event.iteration !== frame.cells.size + 1) semanticError("cell iterations are not contiguous");
           frame.cells.set(event.iteration, event);
+          const controller = operations.get(`${event.frameId}\0${event.frameId}:controller:${event.iteration}`);
+          const segment = controller?.segments.at(-1);
+          if (controller && (controller.kind !== "controller" || controller.segments.length !== 1
+            || !segment || segment.settlements !== segment.intents.length))
+            semanticError("cell controller operation is incomplete");
+          if (!same(event.usage ?? ZERO_CALL_USAGE, segment?.usage ?? ZERO_CALL_USAGE))
+            semanticError("cell usage does not match controller settlements");
           if (event.outputRef !== undefined)
             content.push(reference("answer", event.outputRef, event.outputRefSha256, event.outputRefBytes));
         }
@@ -183,27 +228,116 @@ export const validateRecoveryJournal = (
         rememberExact(approvals, `${event.frameId}\0${event.callId}`, event, "agent approval");
         break;
       case "operation_intended": {
-        if (event.runId !== runId) throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation intent run does not match the manifest");
+        if (event.runId !== runId)
+          throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation intent run does not match the manifest");
         if (intents.has(event.intentId)) semanticError("duplicate operation intent");
+
+        const reservation = event.reservation;
+        attempts += reservation.attempts;
+        logicalCalls += reservation.logicalCalls;
+        if (attempts > document.manifest.limits.maxAttempts
+          || logicalCalls > document.manifest.limits.maxLogicalCalls)
+          semanticError("operation reservations exceed manifest limits");
+        if (tokensReserved > Number.MAX_SAFE_INTEGER - reservation.tokens)
+          semanticError("operation token reservations overflow");
+        const nextReserved = tokensReserved + reservation.tokens;
+        if (document.manifest.limits.tokenLimit !== undefined
+          && tokensUsed > document.manifest.limits.tokenLimit - nextReserved)
+          semanticError("operation token reservations exceed the manifest token limit");
+        tokensReserved = nextReserved;
+
+        if (event.requestIdentityVersion === AGENT_REQUEST_IDENTITY_VERSION
+          || event.requestIdentityVersion === EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION) {
+          if (reservation.tokens !== 0) semanticError("opaque operation has a token reservation");
+        } else if (event.requestIdentityVersion === PROVIDER_REQUEST_IDENTITY_VERSION && reservation.tokens === 0) {
+          semanticError("provider operation lacks a token reservation");
+        }
+
+        if (event.kind === "controller") {
+          const iteration = frame.cells.size + 1;
+          if (event.operationId !== `${event.frameId}:controller:${iteration}` || event.key !== String(iteration)
+            || event.requestIdentityVersion !== PROVIDER_REQUEST_IDENTITY_VERSION)
+            semanticError("controller operation does not match its authoritative turn");
+          if (!controllerOperations.has(event.operationId)) {
+            controllerOperations.add(event.operationId);
+            if (controllerOperations.size > document.manifest.limits.maxControllerTurns)
+              semanticError("controller operations exceed the manifest turn limit");
+          }
+        } else if (event.kind === "extractor") {
+          if (event.frameId !== rootFrameId || event.operationId !== `${runId}:extractor`
+            || event.key !== frame.fallbackProjection?.projectionHash
+            || document.manifest.components.extractor === null)
+            semanticError("extractor operation lacks its authoritative fallback projection");
+        } else {
+          const expectedPrefix = event.kind === "llm" ? "call_llm_" : "call_agent_";
+          const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
+          if (!event.operationId.startsWith(expectedPrefix) || !/^[a-f0-9]{64}$/.test(event.operationId.slice(expectedPrefix.length))
+            || !binding) semanticError("call operation lacks its authoritative key binding");
+          if (event.kind === "llm" && event.requestIdentityVersion !== PROVIDER_REQUEST_IDENTITY_VERSION)
+            semanticError("llm operation has an invalid request protocol");
+          if (event.kind === "agent") {
+            const approval = approvals.get(`${event.frameId}\0${event.operationId}`);
+            if (event.requestIdentityVersion !== AGENT_REQUEST_IDENTITY_VERSION
+              || !approval || approval.decision === "denied")
+              semanticError("agent operation lacks prior approval");
+          }
+        }
+
         const operationKey = `${event.frameId}\0${event.operationId}`;
-        const operation = operations.get(operationKey);
-        if (operation && operation.kind !== event.kind)
-          semanticError("operation kind changed between attempts");
+        let operation = operations.get(operationKey);
+        if (operation && (operation.kind !== event.kind || operation.key !== event.key))
+          semanticError("operation identity changed between attempts");
         const attemptKey = `${operationKey}\0${event.attempt}`;
         if (attemptIntents.has(attemptKey)) semanticError("duplicate operation attempt intent");
         if (operation ? event.attempt !== operation.lastAttempt + 1 : event.attempt !== 1)
           semanticError("operation attempts are not contiguous");
+        if (operation && !settlements.has(operation.lastIntentId))
+          semanticError("operation launched another attempt before prior settlement");
+        if (!operation && reservation.logicalCalls !== 1)
+          semanticError("first operation attempt lacks a logical-call reservation");
+        if (event.kind === "agent" && reservation.logicalCalls !== 1)
+          semanticError("agent attempt lacks a logical-call reservation");
+
+        let segment: OperationSegment;
+        if (reservation.logicalCalls === 1) {
+          segment = { intents: [], usage: ZERO_CALL_USAGE, settlements: 0 };
+          if (!operation) operation = { kind: event.kind, key: event.key, segments: [], lastAttempt: 0, lastIntentId: "" };
+          operation.segments.push(segment);
+        } else {
+          segment = operation?.segments.at(-1) as OperationSegment;
+          if (!segment) semanticError("operation attempt has no logical-call segment");
+        }
+        operation!.lastAttempt = event.attempt;
+        operation!.lastIntentId = event.intentId;
+        segment.intents.push(event);
         intents.set(event.intentId, event);
         attemptIntents.set(attemptKey, event);
-        operations.set(operationKey, { kind: event.kind, lastAttempt: event.attempt });
+        attemptRecords.set(event.intentId, { operation: operation!, segment });
+        operations.set(operationKey, operation!);
         break;
       }
       case "operation_settled": {
-        if (event.runId !== runId) throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation settlement run does not match the manifest");
+        if (event.runId !== runId)
+          throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation settlement run does not match the manifest");
         const intent = intents.get(event.intentId);
-        if (!intent) throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "operation settlement has no prior intent");
+        const attempt = attemptRecords.get(event.intentId);
+        if (!intent || !attempt)
+          throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "operation settlement has no prior intent");
         if (intent.frameId !== event.frameId) semanticError("operation settlement frame does not match its intent");
         if (settlements.has(event.intentId)) semanticError("duplicate operation settlement");
+        const normalized = normalizeCallUsage(event.usage);
+        const parts = (event.usage.inputTokens ?? 0) + (event.usage.outputTokens ?? 0);
+        if (!normalized.ok || (event.usage.totalTokens !== undefined && parts > event.usage.totalTokens))
+          semanticError("operation settlement usage is invalid");
+        if (tokensReserved < intent.reservation.tokens) semanticError("operation token settlement exceeds reservations");
+        const actualTokens = event.usage.totalTokens ?? parts;
+        if (tokensUsed > Number.MAX_SAFE_INTEGER - actualTokens) semanticError("operation token usage overflows");
+        tokensReserved -= intent.reservation.tokens;
+        tokensUsed += actualTokens;
+        const combined = addUsage(attempt.segment.usage, event.usage);
+        if (combined.ok) attempt.segment.usage = combined.value;
+        else semanticError("operation settlement usage aggregate is invalid");
+        attempt.segment.settlements += 1;
         settlements.set(event.intentId, event);
         break;
       }
@@ -215,6 +349,13 @@ export const validateRecoveryJournal = (
         if (prior && same(prior, event)) break;
         if (prior && (prior.frameId !== event.frameId || prior.kind !== event.kind || prior.key !== event.key
           || prior.ok)) semanticError("invalid repeated call execution");
+        if (event.kind === "llm" || event.kind === "agent") {
+          const operation = operations.get(`${event.frameId}\0${event.callId}`);
+          const segment = operation?.segments.at(-1);
+          if (!event.ok || operation?.kind !== event.kind || !segment
+            || segment.settlements !== segment.intents.length || !same(event.usage, segment.usage))
+            semanticError("committed call usage does not match authoritative operation settlements");
+        }
         executions.push(event);
         calls.set(event.callId, executions);
         content.push(reference("call", event.outputRef, event.outputSha256, event.outputBytes, event));
@@ -325,6 +466,7 @@ export const validateRecoveryJournal = (
   const unresolved = [...intents.keys()].filter((intentId) => !settlements.has(intentId));
   if (unresolved.length > 0)
     throw new RunRecoveryError("RECOVERY_AMBIGUOUS", "one or more external operation intents have no authoritative settlement");
+  if (tokensReserved !== 0) semanticError("settled operation journal retains token reservations");
 
   return {
     rootFrameId,

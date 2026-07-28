@@ -197,11 +197,11 @@ const validEvent = (event: RecordValue): boolean => {
       return exact(event, ["type", "frameId", "evidenceRefs", "evidenceRefsHash"])
         && string(event, "frameId", false) && validStringArray(event["evidenceRefs"]) && hash(event, "evidenceRefsHash");
     case "operation_intended": {
-      if (!exact(event, ["type", "schemaVersion", "runId", "frameId", "operationId", "kind", "attempt",
+      if (!exact(event, ["type", "schemaVersion", "runId", "frameId", "operationId", "kind", "key", "attempt",
         "requestIdentityVersion", "requestSha256", "reservation", "intentId"])
         || event["schemaVersion"] !== OPERATION_JOURNAL_SCHEMA_VERSION
         || !string(event, "runId", false) || !string(event, "frameId", false) || !string(event, "operationId", false)
-        || !oneOf(event, "kind", OPERATION_KINDS) || !integer(event, "attempt", true)
+        || !oneOf(event, "kind", OPERATION_KINDS) || !string(event, "key") || !integer(event, "attempt", true)
         || !string(event, "requestIdentityVersion", false) || !hash(event, "requestSha256")
         || !validOperationReservation(event["reservation"])
         || !string(event, "intentId", false) || !OPERATION_INTENT_ID.test(event["intentId"] as string)
@@ -213,6 +213,7 @@ const validEvent = (event: RecordValue): boolean => {
         frameId: event["frameId"] as string,
         operationId: event["operationId"] as string,
         kind: event["kind"] as OperationIntentIdentity["kind"],
+        key: event["key"] as string,
         attempt: event["attempt"] as number,
         requestIdentityVersion: event["requestIdentityVersion"] as OperationIntentIdentity["requestIdentityVersion"],
         requestSha256: event["requestSha256"] as string,

@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import {
+  AGENT_REQUEST_IDENTITY_VERSION,
   deriveOperationIntentId,
   OPERATION_JOURNAL_SCHEMA_VERSION,
   PROVIDER_REQUEST_IDENTITY_VERSION,
@@ -64,6 +65,7 @@ const operationPair = (
     frameId,
     operationId,
     kind,
+    key: operationId,
     attempt,
     requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
     requestSha256: sha256(`${operationId}:${attempt}`),
@@ -376,6 +378,91 @@ describe("authoritative run recovery inspection", () => {
     });
     await rewriteEvents(fallbackDir, (await events(fallbackDir)).filter((event) => event.type !== "fallback_evidence_projected"));
     await expectRecoveryCode(inspectRecoveredRun(fallbackDir), "RECOVERY_SEMANTIC_CORRUPTION");
+  });
+
+  test("rejects impossible operation reservations, contexts, and committed usage", async () => {
+    const makeCompleted = async (fixture: string, controller = new MockController([{
+      reasoning: "done", code: "answer({ answer: 'ok' })",
+    }])): Promise<string> => {
+      const dir = await temp();
+      await runProgram({
+        program: program(), sources: { context: "source" }, controller,
+        model: new MockModelClient(() => "model", identity(fixture)), backend, dir,
+        signal: new AbortController().signal,
+      });
+      return dir;
+    };
+
+    const deniedBudget = await temp();
+    await runProgram({
+      program: program(), sources: { context: "source" }, controller: new MockController([]),
+      model: new MockModelClient(() => "unused", identity("impossible-budget")), backend, dir: deniedBudget,
+      profile: { ...DEFAULT_PROFILE, maxAttempts: 0 }, signal: new AbortController().signal,
+    });
+    const budgetEvents = await events(deniedBudget);
+    const openedIndex = budgetEvents.findIndex((event) => event.type === "frame_opened");
+    const opened = budgetEvents[openedIndex] as Extract<RlmEvent, { type: "frame_opened" }>;
+    const started = budgetEvents[0] as Extract<RlmEvent, { type: "run_started" }>;
+    const budgetIdentity: OperationIntentIdentity = {
+      schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION, runId: started.runId, frameId: opened.frameId,
+      operationId: `${opened.frameId}:controller:1`, kind: "controller", key: "1", attempt: 1,
+      requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: sha256("impossible-budget"),
+      reservation: { logicalCalls: 1, attempts: 1, tokens: 1 },
+    };
+    budgetEvents.splice(openedIndex + 1, 0, {
+      type: "operation_intended", ...budgetIdentity, intentId: deriveOperationIntentId(sha256, budgetIdentity),
+    });
+    await rewriteEvents(deniedBudget, budgetEvents);
+    await expectRecoveryCode(inspectRecoveredRun(deniedBudget), "RECOVERY_SEMANTIC_CORRUPTION");
+
+    const unboundAgent = await makeCompleted("unbound-agent");
+    const agentEvents = await events(unboundAgent);
+    const agentOpenedIndex = agentEvents.findIndex((event) => event.type === "frame_opened");
+    const agentFrame = agentEvents[agentOpenedIndex] as Extract<RlmEvent, { type: "frame_opened" }>;
+    const agentStart = agentEvents[0] as Extract<RlmEvent, { type: "run_started" }>;
+    const agentIdentity: OperationIntentIdentity = {
+      schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION, runId: agentStart.runId, frameId: agentFrame.frameId,
+      operationId: `call_agent_${"a".repeat(64)}`, kind: "agent", key: "unbound", attempt: 1,
+      requestIdentityVersion: AGENT_REQUEST_IDENTITY_VERSION, requestSha256: sha256("unbound-agent"),
+      reservation: { logicalCalls: 1, attempts: 1, tokens: 0 },
+    };
+    const agentIntent = { type: "operation_intended" as const, ...agentIdentity, intentId: deriveOperationIntentId(sha256, agentIdentity) };
+    agentEvents.splice(agentOpenedIndex + 1, 0, agentIntent, {
+      type: "operation_settled", schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+      runId: agentStart.runId, frameId: agentFrame.frameId, intentId: agentIntent.intentId,
+      outcome: "ok", usage: { attempts: 1, durationMs: 1 },
+    });
+    await rewriteEvents(unboundAgent, agentEvents);
+    await expectRecoveryCode(inspectRecoveredRun(unboundAgent), "RECOVERY_SEMANTIC_CORRUPTION");
+
+    const usageDrift = await makeCompleted("usage-drift", new MockController([{
+      reasoning: "call", code: "const r = await llm({ key: 'k', prompt: 'p' }); answer({ answer: r.value })",
+    }]));
+    const driftEvents = await events(usageDrift);
+    const settlementIndex = driftEvents.findIndex((event) => event.type === "operation_settled");
+    const settlement = driftEvents[settlementIndex] as Extract<RlmEvent, { type: "operation_settled" }>;
+    driftEvents[settlementIndex] = { ...settlement, usage: { ...settlement.usage, durationMs: settlement.usage.durationMs + 1 } };
+    await rewriteEvents(usageDrift, driftEvents);
+    await expectRecoveryCode(inspectRecoveredRun(usageDrift), "RECOVERY_SEMANTIC_CORRUPTION");
+  });
+
+  test("classifies pre-operation-protocol manifests as incompatible before legacy journal parsing", async () => {
+    const dir = await temp();
+    await runProgram({
+      program: program(), sources: { context: "source" },
+      controller: new MockController([{ reasoning: "done", code: "answer({ answer: 'ok' })" }]),
+      model: new MockModelClient(() => "unused", identity("legacy-provider-event")), backend, dir,
+      signal: new AbortController().signal,
+    });
+    const document = JSON.parse(await readFile(join(dir, "manifest.json"), "utf8")) as Record<string, unknown>;
+    (document["manifest"] as Record<string, unknown>)["schemaVersion"] = 2;
+    document["manifestHash"] = sha256(canonicalStringify(document["manifest"] as JsonValue));
+    await writeFile(join(dir, "manifest.json"), `${canonicalStringify(document as JsonValue)}\n`, { mode: 0o600 });
+    await appendFile(join(dir, "events.jsonl"), `${canonicalStringify({
+      type: "provider_attempted", frameId: "legacy", operationId: "legacy", kind: "llm", key: "legacy",
+      attempt: 1, outcome: "ok", usage: { attempts: 1, durationMs: 1 },
+    })}\n`);
+    await expectRecoveryCode(inspectRecoveredRun(dir), "RECOVERY_INCOMPATIBLE");
   });
 
   test("types incompatible manifests and rejects public roots and context payloads", async () => {

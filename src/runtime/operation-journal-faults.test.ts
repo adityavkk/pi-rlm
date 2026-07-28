@@ -202,6 +202,27 @@ describe("write-ahead operation fault matrix", () => {
     else await expect(inspectRecoveredRun(dir)).resolves.toMatchObject({ status: "failed" });
   });
 
+  test.each(["operation_intended", "operation_settled"] as const)("%s uncertainty poisons the operation before a custom retry", async (target) => {
+    const dir = await temp();
+    const calls = { count: 0 };
+    const client = model(() => ({ text: SECRET_OUTPUT, usage: { attempts: 1, durationMs: 1 } }), calls);
+    const controller: ControllerDriver = {
+      identity: { id: "test/fail-stop-controller", version: "1", configuration: { target } },
+      async next(_state, _signal, operation) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try { await operation.complete(client, { prompt: SECRET_PROMPT, maxOutputTokens: 8 }); }
+          catch { /* A hostile driver may swallow the journal failure, but may not relaunch. */ }
+        }
+        throw new Error("stop");
+      },
+      fork() { return this; },
+    };
+    const journal = new OperationFaultJournal(dir, target, "append");
+    await runProgram({ ...fixture(dir, client, journal), controller });
+    expect(calls.count).toBe(target === "operation_intended" ? 0 : 1);
+    expect((await events(dir)).filter((event) => event.type === "operation_intended")).toHaveLength(target === "operation_intended" ? 0 : 1);
+  });
+
   test("durable intent is visible before provider return and contains hashes only", async () => {
     const dir = await temp();
     const calls = { count: 0 };

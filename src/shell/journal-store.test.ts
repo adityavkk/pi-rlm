@@ -351,7 +351,7 @@ describe("JournalStore", () => {
 
     const operationIdentity: OperationIntentIdentity = {
       schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
-      runId: "r1", frameId: "f0", operationId: "op", kind: "llm", attempt: 1,
+      runId: "r1", frameId: "f0", operationId: "op", kind: "llm", key: "fixture", attempt: 1,
       requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION, requestSha256: digestA,
       reservation: { logicalCalls: 1, attempts: 1, tokens: 4 },
     };

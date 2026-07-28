@@ -81,13 +81,13 @@ const runCommand = async (mode: OfflineProviderMode) => {
   }
 };
 
-const runIdentity = (events: readonly RlmEvent[]) => {
+const runIdentity = (events: readonly RlmEvent[], expectedRunEvents = 4) => {
   const starts = events.filter((event) => event.type === "run_started");
   expect(starts).toHaveLength(1);
   const runId = starts[0]!.runId;
   const frameId = `${runId}:f0`;
   expect(runId).toMatch(/^run_[a-f0-9]{64}$/);
-  expect(events.filter((event) => "runId" in event && event.runId === runId)).toHaveLength(4);
+  expect(events.filter((event) => "runId" in event && event.runId === runId)).toHaveLength(expectedRunEvents);
   expect(events.filter((event) => "frameId" in event && event.frameId !== frameId)).toHaveLength(0);
   const terminals = terminalEvents(events);
   expect(terminals).toHaveLength(1);
@@ -244,20 +244,21 @@ describe("credential-free offline Pi provider E2E", () => {
       expect(fixture.state.aborts).toBe(1);
       expect(fixture.state.calls[0]?.signal?.aborted).toBe(true);
       const events = await fixture.readEvents();
-      const { runId, frameId, terminal } = runIdentity(events);
+      const { runId, frameId, terminal } = runIdentity(events, 3);
       expect(events.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "operation_intended", "operation_settled", "frame_closed", "run_cancelled",
+        "run_started", "frame_opened", "operation_intended", "frame_closed", "run_cancelled",
       ]);
-      const attempt = settledOperations(events)[0]!;
-      exactAttempt(attempt, frameId, "cancelled");
-      expect(Object.keys(attempt.usage).sort()).toEqual(["attempts", "durationMs"]);
+      expect(settledOperations(events)).toHaveLength(0);
+      expect(events.find((event) => event.type === "operation_intended")).toMatchObject({
+        type: "operation_intended", frameId, operationId: `${frameId}:controller:1`, kind: "controller", attempt: 1,
+      });
       expect(terminal).toEqual({ type: "run_cancelled", runId, code: "CANCELLED", message: "run cancelled by owner" });
       expect(events.find((event) => event.type === "frame_closed")).toEqual({ type: "frame_closed", frameId, state: "cancelled" });
       expect(observed.map(customMessage).filter(Boolean)).toHaveLength(0);
 
       const journalBefore = await fixture.readJournalBytes();
       const eventsBefore = structuredClone(events);
-      const accountingBefore = structuredClone(attempt.usage);
+
       fixture.state.emitLate();
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(fixture.state.lateEmissionAttempts).toBe(1);
@@ -266,7 +267,7 @@ describe("credential-free offline Pi provider E2E", () => {
       expect(fixture.state.aborts).toBe(1);
       expect(await fixture.readJournalBytes()).toEqual(journalBefore);
       expect(await fixture.readEvents()).toEqual(eventsBefore);
-      expect(attempt.usage).toEqual(accountingBefore);
+
       expect(fixture.state.calls).toHaveLength(1);
       expect(fixture.state.fetchCalls).toBe(0);
       expect(observed.map(customMessage).filter(Boolean)).toHaveLength(0);

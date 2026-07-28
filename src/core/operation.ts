@@ -4,7 +4,7 @@ import type { Hasher } from "./ids.ts";
 import { canonicalStringify, type JsonValue } from "./json.ts";
 import type { CallUsage } from "./usage.ts";
 
-export const OPERATION_JOURNAL_SCHEMA_VERSION = 1;
+export const OPERATION_JOURNAL_SCHEMA_VERSION = 2;
 export const PROVIDER_REQUEST_IDENTITY_VERSION = "pi-rlm.provider-request.v1";
 export const AGENT_REQUEST_IDENTITY_VERSION = "pi-rlm.agent-request.v1";
 export const EXTERNAL_EXTRACTOR_REQUEST_IDENTITY_VERSION = "pi-rlm.external-extractor-request.v1";
@@ -29,6 +29,8 @@ export interface OperationIntentIdentity {
   readonly frameId: string;
   readonly operationId: string;
   readonly kind: OperationKind;
+  /** Durable linkage to the authoritative controller iteration, call binding, or extractor projection. */
+  readonly key: string;
   readonly attempt: number;
   readonly requestIdentityVersion: OperationRequestIdentityVersion;
   readonly requestSha256: string;

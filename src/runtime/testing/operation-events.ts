@@ -6,6 +6,7 @@ export interface SettledOperation {
   readonly frameId: string;
   readonly operationId: string;
   readonly kind: Extract<RlmEvent, { type: "operation_intended" }>["kind"];
+  readonly key: string;
   readonly attempt: number;
   readonly intentId: string;
   readonly requestIdentityVersion: string;
@@ -29,6 +30,7 @@ export const settledOperations = (events: readonly RlmEvent[]): SettledOperation
       frameId: event.frameId,
       operationId: intent.operationId,
       kind: intent.kind,
+      key: intent.key,
       attempt: intent.attempt,
       intentId: event.intentId,
       requestIdentityVersion: intent.requestIdentityVersion,

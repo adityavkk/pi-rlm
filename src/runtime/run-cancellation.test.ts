@@ -11,6 +11,7 @@ import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/cl
 import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
 import { FunctionExtractor } from "./extractor.ts";
 import { DEFAULT_PROFILE } from "./profile.ts";
+import { inspectRecoveredRun } from "./run-recovery.ts";
 import { runProgram, type RunResult } from "./run.ts";
 
 const extractorIdentity = (fixture: string) => ({
@@ -184,7 +185,7 @@ describe("run cancellation and terminal finalization", () => {
     await expectSingleTerminal(dir, result);
   });
 
-  test("abort releases queued leaf work and drops an abort-ignoring late model result", async () => {
+  test("abort retains unresolved model capacity and drops an abort-ignoring late result", async () => {
     const dir = await tmp();
     const owner = new AbortController();
     let markStarted!: () => void;
@@ -219,8 +220,12 @@ describe("run cancellation and terminal finalization", () => {
     expect(calls).toBe(1);
     expect(result.ledger.usage.logicalCalls).toBe(1);
     expect(result.ledger.usage.attempts).toBe(1);
-    expect(result.ledger.usage.activeLeafCalls).toBe(0);
-    expect(result.ledger.usage.tokensReserved).toBe(0);
+    expect(result.ledger.usage.activeLeafCalls).toBe(1);
+    expect(result.ledger.usage.tokensReserved).toBeGreaterThan(0);
+    const operationEvents = await events(dir);
+    expect(operationEvents.filter((event) => event.type === "operation_intended")).toHaveLength(1);
+    expect(operationEvents.filter((event) => event.type === "operation_settled")).toHaveLength(0);
+    await expect(inspectRecoveredRun(dir)).rejects.toMatchObject({ code: "RECOVERY_AMBIGUOUS" });
     const before = await readFile(join(dir, "events.jsonl"), "utf8");
     const ledgerBefore = JSON.stringify(result.ledger);
     resolveLate({ text: "late", usage: ZERO_CALL_USAGE });
@@ -228,6 +233,37 @@ describe("run cancellation and terminal finalization", () => {
     expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(before);
     expect(JSON.stringify(result.ledger)).toBe(ledgerBefore);
     await expectSingleTerminal(dir, result);
+  });
+
+  test("abort retains unresolved external-extractor capacity until its ignored work terminates", async () => {
+    const dir = await tmp();
+    const owner = new AbortController();
+    let markStarted!: () => void;
+    let releaseLate!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const extractor = new FunctionExtractor(async (evidence) => {
+      markStarted();
+      await new Promise<void>((resolve) => { releaseLate = resolve; });
+      return { ok: true, value: { answer: "late" }, evidenceRefs: [evidence.handles[0]!.evidenceId!] };
+    }, "external", extractorIdentity("noncooperative-external"));
+    const run = runProgram({
+      program: program(true), sources: { context: "evidence" }, controller: new OneCellController(), model: unusedModel,
+      backend: new FunctionBackend(async () => valueOutcome()), dir, signal: owner.signal, extractor,
+      profile: { ...DEFAULT_PROFILE, maxControllerTurns: 0 },
+    });
+    await started;
+    owner.abort();
+    const result = await within(run);
+    expect(result.status).toBe("cancelled");
+    expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, activeLeafCalls: 1, tokensReserved: 0 });
+    const journal = await events(dir);
+    expect(journal.filter((event) => event.type === "operation_intended")).toHaveLength(1);
+    expect(journal.filter((event) => event.type === "operation_settled")).toHaveLength(0);
+    await expect(inspectRecoveredRun(dir)).rejects.toMatchObject({ code: "RECOVERY_AMBIGUOUS" });
+    const before = await readFile(join(dir, "events.jsonl"), "utf8");
+    releaseLate();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await readFile(join(dir, "events.jsonl"), "utf8")).toBe(before);
   });
 
   test("abort closes a pending recursive frame in child-first order", async () => {
