@@ -50,6 +50,12 @@ export interface RunWriterTerminalIdentity {
   readonly generation: GenerationRecord;
 }
 
+/** Signals that a terminal pathname transition applied even though its durability step failed. */
+export class RunWriterTerminalAppliedError extends Error {
+  override readonly name: string = "RunWriterTerminalAppliedError";
+  constructor(message: string, override readonly cause?: unknown) { super(message); }
+}
+
 export type RunWriterArbiterErrorCode =
   | "WRITER_ARBITER_INPUT"
   | "WRITER_ARBITER_UNSUPPORTED_REALM"
@@ -420,17 +426,37 @@ export class RunWriterLease {
     effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>,
     guard?: () => void | PromiseLike<void>,
   ): Promise<T> {
-    return this.scheduler.terminal(async () => {
-      const value = await effect({
-        managedRoot: this.pinned.managedRoot,
-        runPath: this.pinned.runPath,
-        arbitrationPath: this.pinned.arbitrationPath,
-        generation: this.generation,
-      });
+    const transition = this.scheduler.terminal(async (): Promise<
+      { readonly status: "succeeded"; readonly value: T }
+      | { readonly status: "applied-failure"; readonly error: RunWriterTerminalAppliedError }
+    > => {
+      let outcome:
+        | { readonly status: "succeeded"; readonly value: T }
+        | { readonly status: "applied-failure"; readonly error: RunWriterTerminalAppliedError };
+      try {
+        outcome = { status: "succeeded", value: await effect({
+          managedRoot: this.pinned.managedRoot,
+          runPath: this.pinned.runPath,
+          arbitrationPath: this.pinned.arbitrationPath,
+          generation: this.generation,
+        }) };
+      } catch (error) {
+        if (!(error instanceof RunWriterTerminalAppliedError)) throw error;
+        outcome = { status: "applied-failure", error };
+      }
+      try { await this.pinned.close(); }
+      catch (cleanup) {
+        throw outcome.status === "applied-failure"
+          ? new AggregateError([outcome.error, cleanup], "applied terminal transition and pinned-handle close both failed")
+          : cleanup;
+      }
       if (registry.active.get(this.pinned.key)?.lease === this) registry.active.delete(this.pinned.key);
-      await this.pinned.close();
-      return value;
+      return outcome;
     }, guard);
+    return transition.then((outcome) => {
+      if (outcome.status === "applied-failure") throw outcome.error;
+      return outcome.value;
+    });
   }
 
   /** Terminal retention transition. The caller must reconcile rename and root sync before returning. */

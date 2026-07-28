@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileShorthand } from "../core/program.ts";
@@ -10,7 +10,15 @@ import type { ControllerDriver } from "./controller.ts";
 import { DEFAULT_PROFILE, resolveLimits } from "./profile.ts";
 import { buildRunManifest, claimRunDirectory, RLM_DSL_VERSION } from "./run-manifest.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
-import { ManagedRunStore, RUN_ACTIVE_FILE, type ManagedRunLease } from "./run-retention.ts";
+import {
+  ManagedRunStore as ProductionManagedRunStore,
+  RUN_ACTIVE_FILE,
+  type ManagedRunLease,
+} from "./run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./run-retention-test-support.ts";
 import { runProgram } from "./run.ts";
 import { acquireRunRetentionLease } from "./run-writer-arbiter.ts";
 import { publishImmutableArbitrationRecord } from "./run-writer-publisher.ts";
@@ -25,6 +33,10 @@ import {
 } from "./run-writer-protocol.ts";
 import type { RunQuarantineFileSystem } from "./run-writer-quarantine.ts";
 
+class ManagedRunStore extends ProductionManagedRunStore {
+  constructor(options: ManagedRunStoreTestOptions = {}) { super(managedRunStoreTestOptions(options)); }
+}
+
 const privateRoot = async (): Promise<string> => {
   const path = await mkdtemp(join(tmpdir(), "pi-rlm-final-hardening-"));
   await chmod(path, 0o700);
@@ -32,6 +44,14 @@ const privateRoot = async (): Promise<string> => {
 };
 const ownerTokens = () => { let value = 0; return () => (++value).toString(16).padStart(32, "0"); };
 const token64 = (value: number): string => value.toString(16).padStart(64, "0");
+const containsSchedulerPhase = (error: unknown, phase: string, seen = new Set<object>()): boolean => {
+  if (typeof error !== "object" || error === null || seen.has(error)) return false;
+  seen.add(error);
+  const item = error as { phase?: unknown; cause?: unknown; managementError?: unknown; errors?: unknown };
+  return item.phase === phase || containsSchedulerPhase(item.cause, phase, seen)
+    || containsSchedulerPhase(item.managementError, phase, seen)
+    || (Array.isArray(item.errors) && item.errors.some((nested) => containsSchedulerPhase(nested, phase, seen)));
+};
 const program = (() => {
   const compiled = compileShorthand({ objective: "final hardening" });
   if (!compiled.ok) throw new Error("fixture program failed");
@@ -128,8 +148,12 @@ const createGenesisWindow = async (root: string, kind: GenesisWindow, ordinal: n
   }
   await publishImmutableArbitrationRecord({ directory: arbitrationPath, record: genesis });
   if (kind === "durable-manifest") {
-    await writeFile(join(runPath, ".pi-rlm-run.lock"), "", { mode: 0o600 });
-    await writeFile(join(runPath, "manifest.json"), "{}\n", { mode: 0o600 });
+    await claimRunDirectory(
+      runPath,
+      document(`failed-genesis-${ordinal}`),
+      undefined,
+      [ARBITRATION_DIRECTORY],
+    );
   }
   if (kind === "retention-successor") {
     await acquireRunRetentionLease({
@@ -325,6 +349,202 @@ describe("final managed lifecycle hardening", () => {
     await lease.finish("failed", runId);
     expect(directorySyncs).toBe(2);
     expect((await store.list()).runs[0]?.activity).toBe("inactive");
+  });
+
+  test("retains malformed post-lock failed-genesis content byte-for-byte", async () => {
+    const root = await privateRoot();
+    const cases = ["lock", "manifest", "temp"] as const;
+    const names: string[] = [];
+    const retained = new Map<string, string>();
+    for (let index = 0; index < cases.length; index++) {
+      const kind = cases[index]!;
+      const runName = await createGenesisWindow(root, "published-genesis", 300 + index);
+      const runPath = join(root, runName);
+      let target: string;
+      if (kind === "lock") {
+        target = join(runPath, ".pi-rlm-run.lock");
+        await writeFile(target, "", { mode: 0o600 });
+      } else {
+        const runDocument = document(`malformed-${kind}-${index}`);
+        await claimRunDirectory(runPath, runDocument, undefined, [ARBITRATION_DIRECTORY]);
+        target = join(runPath, "manifest.json");
+        if (kind === "temp") {
+          const temp = join(runPath, `.manifest.json.${runDocument.manifest.run.nonce}.tmp`);
+          await rename(target, temp);
+          target = temp;
+        }
+        await writeFile(target, kind === "manifest" ? "{}\n" : "{", { mode: 0o600 });
+      }
+      names.push(runName);
+      retained.set(target, await readFile(target, "utf8"));
+    }
+    const store = new ManagedRunStore({
+      root,
+      writerArbiterOptions: { livenessProbe: () => "absent" },
+    });
+    await expect(store.cleanup()).rejects.toMatchObject({
+      code: "RUN_RETENTION_CLEANUP_FAILED",
+      result: { retained: names.slice().sort() },
+    });
+    for (const [path, bytes] of retained) expect(await readFile(path, "utf8")).toBe(bytes);
+  });
+
+  test("recovers an exact canonical release orphan left after failed-genesis successor publication", async () => {
+    const root = await privateRoot();
+    const runName = await createGenesisWindow(root, "published-genesis", 320);
+    const arbiterUrl = new URL("./run-writer-arbiter.ts", import.meta.url).href;
+    const publisherUrl = new URL("./run-writer-publisher.ts", import.meta.url).href;
+    const protocolUrl = new URL("./run-writer-protocol.ts", import.meta.url).href;
+    const child = Bun.spawn([process.execPath, "-e", `
+      const fs = await import("node:fs/promises");
+      const path = await import("node:path");
+      const { acquireRunRetentionLease } = await import(${JSON.stringify(arbiterUrl)});
+      const { publishImmutableArbitrationRecord } = await import(${JSON.stringify(publisherUrl)});
+      const { encodeReleaseRecord, releaseIntentFilename } = await import(${JSON.stringify(protocolUrl)});
+      let token = 5000;
+      const lease = await acquireRunRetentionLease({
+        managedRoot: ${JSON.stringify(root)}, runName: ${JSON.stringify(runName)},
+        preflightRetirement: async () => {},
+      }, {
+        livenessProbe: () => "absent",
+        createToken: () => (++token).toString(16).padStart(64, "0"),
+        async publish(input, options) {
+          if (input.record.type === "generation") return publishImmutableArbitrationRecord(input, options);
+          await fs.writeFile(
+            path.join(input.directory, releaseIntentFilename(input.record.token)),
+            encodeReleaseRecord(input.record),
+            { mode: 0o600, flag: "wx" },
+          );
+          throw new Error("crash after canonical release intent");
+        },
+      });
+      try { await lease.release(); } catch {}
+    `], { stdout: "ignore", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    const before = await scanArbitrationDirectory(join(root, runName, ARBITRATION_DIRECTORY));
+    expect(before.orphans).toContainEqual(expect.objectContaining({ recordType: "release", validity: "canonical" }));
+    await new ManagedRunStore({
+      root,
+      writerArbiterOptions: { livenessProbe: () => "absent" },
+    }).cleanup();
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  test.each(["post-open", "pre-close"] as const)(
+    "closes lifecycle metadata handles when the %s writer fence fails",
+    async (failurePhase) => {
+      const root = await privateRoot();
+      let trackedOpen = false;
+      let synced = false;
+      let scansAfterSync = 0;
+      let injected = false;
+      let closes = 0;
+      const store = new ManagedRunStore({
+        root,
+        createToken: ownerTokens(),
+        writerArbiterOptions: {
+          async scan(directory) {
+            if (!injected && failurePhase === "post-open" && trackedOpen) {
+              injected = true;
+              throw new Error("metadata post-open fence fault");
+            }
+            if (!injected && failurePhase === "pre-close" && synced && ++scansAfterSync === 2) {
+              injected = true;
+              throw new Error("metadata pre-close fence fault");
+            }
+            return scanArbitrationDirectory(directory);
+          },
+        },
+        metadataFileSystem: {
+          async open(path, flags, mode) {
+            const handle = await open(path, flags, mode);
+            const tracked = flags !== "r";
+            if (tracked) trackedOpen = true;
+            return {
+              writeFile: (data, encoding) => handle.writeFile(data, encoding),
+              async sync() { await handle.sync(); if (tracked) synced = true; },
+              async close() {
+                await handle.close();
+                if (tracked) { trackedOpen = false; closes++; }
+              },
+            };
+          },
+          rename,
+          unlink: (path) => import("node:fs/promises").then((fs) => fs.unlink(path)),
+        },
+      });
+      const lease = await store.create();
+      let failure: unknown;
+      try { await lease.lifecycle.onManifest(`run_${"c".repeat(64)}`); }
+      catch (error) { failure = error; }
+      expect(injected).toBe(true);
+      expect(closes).toBe(1);
+      expect(containsSchedulerPhase(failure, failurePhase === "post-open" ? "post-fence" : "pre-fence")).toBe(true);
+      await lease.discard();
+    },
+  );
+
+  test("retries root sync after quarantine rename and terminalizes persistent applied faults before scavenging", async () => {
+    const root = await privateRoot();
+    const producer = new ManagedRunStore({ root, createToken: ownerTokens() });
+    const lease = await producer.create();
+    const runId = await publishFailedTerminalEvidence(lease, "applied-quarantine-sync");
+    await lease.finish("failed", runId);
+    let renamed = false;
+    let rootSyncs = 0;
+    const quarantineFileSystem: RunQuarantineFileSystem = {
+      lstat: (path) => lstat(path, { bigint: true }),
+      async rename(oldPath, newPath) { await rename(oldPath, newPath); renamed = true; },
+      async openDirectory(path) {
+        const handle = await open(path, "r");
+        return {
+          stat: (options) => handle.stat(options),
+          close: () => handle.close(),
+          async sync() {
+            await handle.sync();
+            if (path === root && renamed && ++rootSyncs <= 2) throw new Error("applied quarantine root sync fault");
+          },
+        };
+      },
+    };
+    const sweeper = new ManagedRunStore({
+      root,
+      quarantineFileSystem,
+      writerArbiterOptions: { livenessProbe: () => "absent" },
+    });
+    await expect(sweeper.cleanup({ force: true })).rejects.toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    await expect(lstat(lease.dir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await readdir(root))).toHaveLength(1);
+    await sweeper.cleanup({ force: true });
+    expect(rootSyncs).toBe(3);
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  test("retries retained release authority through an equivalent canonical root", async () => {
+    const parent = await privateRoot();
+    const actualParent = join(parent, "actual");
+    const aliasParent = join(parent, "alias");
+    const actualRoot = join(actualParent, "runs");
+    const aliasRoot = join(aliasParent, "runs");
+    await mkdir(actualRoot, { recursive: true, mode: 0o700 });
+    await symlink(actualParent, aliasParent, "dir");
+    let releaseAttempts = 0;
+    const producer = new ManagedRunStore({
+      root: aliasRoot,
+      createToken: ownerTokens(),
+      writerArbiterOptions: {
+        async publish(input, options) {
+          if (input.record.type === "release" && ++releaseAttempts <= 2) throw new Error("release fault");
+          return publishImmutableArbitrationRecord(input, options);
+        },
+      },
+    });
+    const lease = await producer.create();
+    const runId = await publishFailedTerminalEvidence(lease, "canonical-release-root");
+    await expect(lease.finish("failed", runId)).rejects.toMatchObject({ code: "RUN_RETENTION_METADATA_FAILED" });
+    await new ManagedRunStore({ root: actualRoot }).cleanup();
+    expect(releaseAttempts).toBe(3);
+    expect((await new ManagedRunStore({ root: actualRoot }).list()).runs[0]?.activity).toBe("inactive");
   });
 
   test("retries a failed final-ordinal quarantine through ManagedRunStore in the same process", async () => {

@@ -16,15 +16,23 @@ import {
   type RunDirectoryFileSystem,
 } from "./run-manifest.ts";
 import {
-  ManagedRunStore,
+  ManagedRunStore as ProductionManagedRunStore,
   RUN_ACTIVE_FILE,
   type ManagedRunLease,
 } from "./run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./run-retention-test-support.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
 import { runProgram } from "./run.ts";
 import { publishImmutableArbitrationRecord } from "./run-writer-publisher.ts";
 import { scanArbitrationDirectory } from "./run-writer-protocol.ts";
 import { readLine, tokenAt } from "./run-writer-arbiter.test-helpers.ts";
+
+class ManagedRunStore extends ProductionManagedRunStore {
+  constructor(options: ManagedRunStoreTestOptions = {}) { super(managedRunStoreTestOptions(options)); }
+}
 
 const root = async (): Promise<string> => {
   const path = await mkdtemp(join(tmpdir(), "pi-rlm-retention-adversarial-"));
@@ -205,22 +213,39 @@ describe("managed lifecycle adversarial recovery", () => {
     expect((await lstat(oldest.dir)).isDirectory()).toBe(true);
   });
 
-  test.each(["manifest", "context", "first-journal"] as const)(
-    "production composition quarantines genesis after a %s fault before durable run_started",
+  test("production composition reaches the injected manifest publication fault and quarantines unexposed genesis", async () => {
+    const path = await root();
+    let invoked = false;
+    const manifestFileSystem: RunDirectoryFileSystem = {
+      ...nodeRunDirectoryFileSystem,
+      async rename() { invoked = true; throw new Error("manifest rename fault"); },
+    };
+    const store = new ManagedRunStore({
+      root: path,
+      createToken: ownerTokens(),
+      runDirectoryFileSystem: manifestFileSystem,
+    });
+    const lease = await store.create();
+    await expect(runProgram({
+      program, sources: { context: "source" }, backend, model, controller,
+      dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
+    })).rejects.toMatchObject({ code: "MANIFEST_WRITE_FAILED" });
+    expect(invoked).toBe(true);
+    await lease.abandon();
+    await expect(lstat(lease.dir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each(["context", "first-journal"] as const)(
+    "production composition reaches the injected %s fault before durable run_started and retains the manifest",
     async (fault) => {
       const path = await root();
-      const store = new ManagedRunStore({ root: path, createToken: ownerTokens() });
-      const lease = await store.create();
-      const manifestFileSystem: RunDirectoryFileSystem | undefined = fault === "manifest" ? {
-        ...nodeRunDirectoryFileSystem,
-        async rename() { throw new Error("manifest rename fault"); },
-      } : undefined;
+      let invoked = false;
       const journalFileSystem: JournalFileSystem | undefined = fault === "first-journal" ? {
         ...nodeJournalFileSystem,
         async open(target, flags, mode) {
           const handle = await open(target, flags, mode);
           return {
-            appendFile: async () => { throw new Error("first journal append fault"); },
+            appendFile: async () => { invoked = true; throw new Error("first journal append fault"); },
             readFile: () => handle.readFile(), sync: () => handle.sync(),
             truncate: (length) => handle.truncate(length),
             writeFile: (data, encoding) => handle.writeFile(data, encoding),
@@ -228,24 +253,32 @@ describe("managed lifecycle adversarial recovery", () => {
           };
         },
       } : undefined;
-      let result;
-      let thrown: unknown;
-      try {
-        result = await runProgram({
-          program, sources: { context: "source" }, backend, model, controller,
-          dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
-          ...(manifestFileSystem ? { runDirectoryFileSystem: manifestFileSystem } : {}),
-          ...(journalFileSystem ? { journalFileSystem } : {}),
-          ...(fault === "context" ? { contextStoreInstrumentation: {
-            writeFile: async () => { throw new Error("context publication fault"); },
-          } } : {}),
-        });
-      } catch (error) { thrown = error; }
-      if (thrown !== undefined) await lease.abandon();
-      else await expect(lease.finish(result!.status, result!.runId)).rejects.toMatchObject({
+      const store = new ManagedRunStore({
+        root: path,
+        createToken: ownerTokens(),
+        ...(journalFileSystem ? { journalFileSystem } : {}),
+        ...(fault === "context" ? { contextStoreInstrumentation: {
+          writeFile: async () => { invoked = true; throw new Error("context publication fault"); },
+        } } : {}),
+      });
+      const lease = await store.create();
+      const result = await runProgram({
+        program, sources: { context: "source" }, backend, model, controller,
+        dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
+      });
+      expect(invoked).toBe(true);
+      expect(result).toMatchObject({
+        status: "failed",
+        error: { code: fault === "context" ? "SOURCE_FAILED" : "JOURNAL_FAILED" },
+      });
+      await expect(lease.finish(result.status, result.runId)).rejects.toMatchObject({
         code: "RUN_RETENTION_METADATA_FAILED",
       });
-      await expect(lstat(lease.dir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await lstat(lease.dir)).isDirectory()).toBe(true);
+      expect((await new ManagedRunStore({
+        root: path,
+        policy: { abandonedGraceMs: 0 },
+      }).cleanup({ force: true })).deleted).toEqual([lease.name]);
     },
   );
 

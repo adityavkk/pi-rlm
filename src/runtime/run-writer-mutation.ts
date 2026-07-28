@@ -23,13 +23,22 @@ export class RunWriterMutationPathError extends Error {
  * Every operation enters the same lease scheduler. Its pre/post fences rescan the
  * authoritative generation and revalidate pinned root/run/arbitration identities.
  */
+export interface LeaseOwnedRunPersistenceOptions {
+  readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
+  readonly journalFileSystem?: JournalFileSystem;
+  readonly contextStoreInstrumentation?: ContextStoreInstrumentation;
+}
+
 export class LeaseOwnedRunPersistence {
   readonly managedRoot: string;
   readonly runName: string;
   readonly runPath: string;
   private readonly realRunPath: string;
 
-  constructor(private readonly lease: RunWriterLease) {
+  constructor(
+    private readonly lease: RunWriterLease,
+    private readonly options: LeaseOwnedRunPersistenceOptions = {},
+  ) {
     const identity = lease.mutationIdentity();
     this.managedRoot = identity.managedRoot;
     this.runName = identity.runName;
@@ -67,7 +76,7 @@ export class LeaseOwnedRunPersistence {
     return this.lease.runOwnedOperation(effect);
   }
 
-  contextInstrumentation(base: ContextStoreInstrumentation = {}): ContextStoreInstrumentation {
+  contextInstrumentation(base: ContextStoreInstrumentation = this.options.contextStoreInstrumentation ?? {}): ContextStoreInstrumentation {
     return {
       ...base,
       runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
@@ -77,7 +86,7 @@ export class LeaseOwnedRunPersistence {
     };
   }
 
-  runDirectoryFileSystem(base: RunDirectoryFileSystem = nodeRunDirectoryFileSystem): RunDirectoryFileSystem {
+  runDirectoryFileSystem(base: RunDirectoryFileSystem = this.options.runDirectoryFileSystem ?? nodeRunDirectoryFileSystem): RunDirectoryFileSystem {
     return {
       runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
         this.runTransaction(() => base.runTransaction?.(effect) ?? effect()),
@@ -104,7 +113,7 @@ export class LeaseOwnedRunPersistence {
     };
   }
 
-  journalFileSystem(base: JournalFileSystem = nodeJournalFileSystem): JournalFileSystem {
+  journalFileSystem(base: JournalFileSystem = this.options.journalFileSystem ?? nodeJournalFileSystem): JournalFileSystem {
     return {
       runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
         this.runTransaction(() => base.runTransaction?.(effect) ?? effect()),

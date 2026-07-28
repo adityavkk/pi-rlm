@@ -6,6 +6,7 @@ import {
 import { arbiterFixture, tokens } from "./run-writer-arbiter.test-helpers.ts";
 import {
   quarantineOwnedRun,
+  RunQuarantineAppliedError,
   scavengeRunQuarantine,
   type RunQuarantineFileSystem,
 } from "./run-writer-quarantine.ts";
@@ -69,7 +70,7 @@ describe("terminal writer quarantine", () => {
     },
   );
 
-  test("rejects a managed-root mode change after sync and retries the visible quarantine", async () => {
+  test("terminalizes a visible quarantine when managed-root validation keeps failing", async () => {
     const fixture = await arbiterFixture();
     let changed = false;
     try {
@@ -93,13 +94,18 @@ describe("terminal writer quarantine", () => {
           };
         },
       };
-      await expect(lease.quarantine((identity) => quarantineOwnedRun(identity, fileSystem))).rejects.toThrow(
-        "private directory descriptor or pathname identity changed during sync",
-      );
+      let applied: unknown;
+      try { await lease.quarantine((identity) => quarantineOwnedRun(identity, fileSystem)); }
+      catch (error) { applied = error; }
+      expect(applied).toBeInstanceOf(RunQuarantineAppliedError);
+      await expect(lease.quarantine((identity) => quarantineOwnedRun(identity))).rejects.toMatchObject({
+        code: "WRITER_SCHEDULER_CLOSED",
+      });
       await chmod(fixture.root, 0o700);
-      const quarantined = await lease.quarantine((identity) => quarantineOwnedRun(identity));
       await scavengeRunQuarantine({
-        root: fixture.root, name: quarantined.name, remove: (path) => rm(path, { recursive: true }),
+        root: fixture.root,
+        name: (applied as RunQuarantineAppliedError).quarantine.name,
+        remove: (path) => rm(path, { recursive: true }),
       });
     } finally { await chmod(fixture.root, 0o700).catch(() => {}); await fixture.cleanup(); }
   });

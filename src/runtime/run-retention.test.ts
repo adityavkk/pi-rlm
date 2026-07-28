@@ -12,7 +12,7 @@ import { buildRunManifest, claimRunDirectory, RLM_DSL_VERSION } from "./run-mani
 import {
   cleanupManagedRuns,
   defaultRunStateRoot,
-  ManagedRunStore,
+  ManagedRunStore as ProductionManagedRunStore,
   RUN_ACTIVE_FILE,
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
@@ -20,8 +20,16 @@ import {
   type ManagedRunLease,
   type RunLifecycleStatus,
 } from "./run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./run-retention-test-support.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
 import { ARBITRATION_DIRECTORY } from "./run-writer-protocol.ts";
+
+class ManagedRunStore extends ProductionManagedRunStore {
+  constructor(options: ManagedRunStoreTestOptions = {}) { super(managedRunStoreTestOptions(options)); }
+}
 
 const root = () => mkdtemp(join(tmpdir(), "pi-rlm-retention-"));
 const tokens = () => {
@@ -353,9 +361,11 @@ describe("bounded deterministic retention", () => {
   test("cleanup cannot delete while another process binds lifecycle under writer genesis", async () => {
     const path = await root();
     const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const supportUrl = new URL("./run-retention-test-support.ts", import.meta.url).href;
     const script = `
       const fs = await import("node:fs/promises");
       const { ManagedRunStore, RUN_ACTIVE_FILE } = await import(${JSON.stringify(moduleUrl)});
+      const { managedRunStoreTestOptions } = await import(${JSON.stringify(supportUrl)});
       let paused = false;
       const metadataFileSystem = {
         async open(path, flags, mode) {
@@ -376,7 +386,9 @@ describe("bounded deterministic retention", () => {
         rename: fs.rename,
         unlink: fs.unlink,
       };
-      const lease = await new ManagedRunStore({ root: ${JSON.stringify(path)}, metadataFileSystem }).create();
+      const lease = await new ManagedRunStore(managedRunStoreTestOptions({
+        root: ${JSON.stringify(path)}, metadataFileSystem,
+      })).create();
       await lease.lifecycle.onManifest("run_" + "b".repeat(64));
       process.stdout.write("READY " + lease.name + "\\n");
       await new Promise(() => {});
@@ -404,15 +416,17 @@ describe("bounded deterministic retention", () => {
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
     const name = await terminalFixture(producer, "completed", "process-cleaners", 1);
     const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const supportUrl = new URL("./run-retention-test-support.ts", import.meta.url).href;
     const script = `
       const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
-      const store = new ManagedRunStore({
+      const { managedRunStoreTestOptions } = await import(${JSON.stringify(supportUrl)});
+      const store = new ManagedRunStore(managedRunStoreTestOptions({
         root: ${JSON.stringify(path)},
         beforeCleanupDecision: async () => {
           process.stdout.write("LISTED\\n");
           await Bun.stdin.text();
         },
-      });
+      }));
       const result = await store.cleanup({ force: true });
       process.stdout.write(JSON.stringify({ deleted: result.deleted, skipped: result.skipped }) + "\\n");
     `;

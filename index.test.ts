@@ -10,11 +10,14 @@ import {
   RUN_ACTIVE_FILE,
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
-  type ManagedRunStoreOptions,
   type RunResult,
   type RunRetentionMetadataFileSystem,
 } from "./src/runtime/index.ts";
 import type { ManagedRunListing } from "./src/runtime/run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./src/runtime/run-retention-test-support.ts";
 import type { RunInspectionPage, RunInspectionRequest } from "./src/runtime/run-inspection-types.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
@@ -399,7 +402,7 @@ const releaseFaultFileSystem = (fault: ReleaseFault): RunRetentionMetadataFileSy
 
 const managedStatusRun = async (
   status: ResultStatus,
-  runRetention: ManagedRunStoreOptions,
+  runRetention: ManagedRunStoreTestOptions,
   createRunNonce?: () => string,
 ): Promise<{ readonly result: ToolResult; readonly harness: ReturnType<typeof harness>; readonly journalRunId?: string }> => {
   let started!: () => void;
@@ -433,7 +436,7 @@ const managedStatusRun = async (
     createModel: () => model,
     createController: () => controller,
     createRunNonce,
-    runRetention,
+    runRetention: managedRunStoreTestOptions(runRetention),
   } });
   await h.startTurn(`Run managed ${status} fixture`);
   const owner = new AbortController();
@@ -1331,7 +1334,7 @@ describe("pi-rlm extension wiring", () => {
     "authoritative %s result survives post-run cleanup %s failure with one warning",
     async (status, fault) => {
       const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
-      const retention: ManagedRunStoreOptions = fault === "scan"
+      const retention: ManagedRunStoreTestOptions = fault === "scan"
         ? { root: stateRoot, policy: { maxScanEntries: 1 } }
         : {
             root: stateRoot,

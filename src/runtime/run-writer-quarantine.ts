@@ -8,7 +8,10 @@ import {
   scanArbitrationDirectory,
   type GenerationRecord,
 } from "./run-writer-protocol.ts";
-import type { RunWriterTerminalIdentity } from "./run-writer-arbiter.ts";
+import {
+  RunWriterTerminalAppliedError,
+  type RunWriterTerminalIdentity,
+} from "./run-writer-arbiter.ts";
 import {
   syncPrivateDirectory,
   type PrivateDirectoryFileSystem,
@@ -20,6 +23,15 @@ export interface RunQuarantineResult {
   readonly state: "QUARANTINED";
   readonly name: string;
   readonly path: string;
+}
+
+/** Rename is visible and inode-verified, but managed-root durability was not confirmed. */
+export class RunQuarantineAppliedError extends RunWriterTerminalAppliedError {
+  override readonly name = "RunQuarantineAppliedError";
+  constructor(
+    readonly quarantine: Omit<RunQuarantineResult, "state">,
+    cause: unknown,
+  ) { super("run quarantine rename applied before root sync failed", cause); }
 }
 
 export interface RunQuarantineDirectoryHandle extends PrivateDirectoryHandle {}
@@ -109,7 +121,18 @@ const quarantineRun = async (
   old = await statAttempt(identity.runPath, fileSystem);
   if (old || !moved || !sameRun(moved, generation))
     throw new Error("quarantine rename did not preserve the exact run inode");
-  await syncRoot(identity.managedRoot, generation, fileSystem);
+  let firstSyncFailure: unknown;
+  try { await syncRoot(identity.managedRoot, generation, fileSystem); }
+  catch (error) { firstSyncFailure = error; }
+  if (firstSyncFailure !== undefined) {
+    try { await syncRoot(identity.managedRoot, generation, fileSystem); }
+    catch (retryFailure) {
+      throw new RunQuarantineAppliedError(
+        { name, path },
+        new AggregateError([firstSyncFailure, retryFailure], "managed-root sync retries failed after quarantine rename"),
+      );
+    }
+  }
   state = "QUARANTINED";
   return { state, name, path };
 };

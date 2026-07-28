@@ -24,6 +24,10 @@ import { MANAGED_RUN_PERSISTENCE } from "./run-managed-lifecycle.ts";
 import { assertFailedGenesisRetirement, inspectFailedWriterGenesis } from "./run-genesis-recovery.ts";
 import { selectRetentionCandidates } from "./run-retention-policy.ts";
 import {
+  MANAGED_RUN_STORE_FAULTS,
+  type ManagedRunStoreFaultOptions,
+} from "./run-retention-test-support.ts";
+import {
   acquireRunRetentionLease,
   createRunWriterGenesis,
   recoverFailedRunWriterGenesis,
@@ -43,6 +47,7 @@ import {
   quarantineFailedGenesis,
   quarantineName,
   quarantineOwnedRun,
+  RunQuarantineAppliedError,
   scavengeRunQuarantine,
   type RunQuarantineFileSystem,
 } from "./run-writer-quarantine.ts";
@@ -210,24 +215,6 @@ const nodeMetadataFileSystem: RunRetentionMetadataFileSystem = {
 export interface ManagedRunStoreOptions {
   readonly root?: string;
   readonly policy?: Partial<RunRetentionPolicy>;
-  readonly now?: () => number;
-  readonly createToken?: () => string;
-  /** true: live, false: definitely absent, undefined: unsupported/ambiguous. */
-  readonly processProbe?: (pid: number) => boolean | undefined;
-  /** Fault-test seam for atomic lifecycle metadata publication. */
-  readonly metadataFileSystem?: RunRetentionMetadataFileSystem;
-  /** Fault-test seam. Production default is recursive node:fs removal. */
-  readonly removeDirectory?: (path: string) => Promise<void>;
-  /** Fault-test seam immediately before a selected run's arbitration acquisition. */
-  readonly beforeCleanupDecision?: (path: string) => Promise<void>;
-  /** Fault-test seam after authority acquisition and before global-policy revalidation. */
-  readonly afterCleanupAcquisition?: (path: string) => Promise<void>;
-  /** Internal arbitration and liveness fault-test seams. */
-  readonly writerArbiterOptions?: RunWriterArbiterOptions;
-  /** Dedicated quarantine rename/root-sync fault-test seam. */
-  readonly quarantineFileSystem?: RunQuarantineFileSystem;
-  /** Managed-root mkdir durability fault-test seam. */
-  readonly directoryFileSystem?: PrivateDirectoryFileSystem;
 }
 
 const safeInteger = (value: number, field: string, minimum = 0): number => {
@@ -560,39 +547,52 @@ export class ManagedRunStore {
   private readonly writerOptions: RunWriterArbiterOptions;
   private readonly quarantineFileSystem?: RunQuarantineFileSystem;
   private readonly directoryFileSystem: PrivateDirectoryFileSystem;
+  private readonly persistenceOptions: ConstructorParameters<typeof LeaseOwnedRunPersistence>[1];
   private rootIdentity: RootIdentity | undefined;
 
   constructor(options: ManagedRunStoreOptions = {}) {
+    const faults = (options as ManagedRunStoreOptions & {
+      readonly [MANAGED_RUN_STORE_FAULTS]?: ManagedRunStoreFaultOptions;
+    })[MANAGED_RUN_STORE_FAULTS] ?? {};
     const configured = options.root ?? defaultRunStateRoot();
     if (typeof configured !== "string" || configured.trim().length === 0 || configured.trim() !== configured || !isAbsolute(configured))
       throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "managed run root must be a nonempty absolute path");
     this.root = resolve(configured);
     this.policy = resolvedPolicy(options.policy);
-    this.now = options.now ?? Date.now;
-    this.createToken = options.createToken ?? (() => randomBytes(16).toString("hex"));
-    this.probe = options.processProbe ?? processProbe;
-    this.metadataFileSystem = options.metadataFileSystem ?? nodeMetadataFileSystem;
-    this.remover = options.removeDirectory ?? ((path) => rm(path, { recursive: true, force: false }));
-    this.beforeDecision = options.beforeCleanupDecision ?? (async () => {});
-    this.afterAcquisition = options.afterCleanupAcquisition ?? (async () => {});
-    this.writerOptions = options.writerArbiterOptions ?? {};
-    this.quarantineFileSystem = options.quarantineFileSystem;
-    this.directoryFileSystem = options.directoryFileSystem ?? nodePrivateDirectoryFileSystem;
+    this.now = faults.now ?? Date.now;
+    this.createToken = faults.createToken ?? (() => randomBytes(16).toString("hex"));
+    this.probe = faults.processProbe ?? processProbe;
+    this.metadataFileSystem = faults.metadataFileSystem ?? nodeMetadataFileSystem;
+    this.remover = faults.removeDirectory ?? ((path) => rm(path, { recursive: true, force: false }));
+    this.beforeDecision = faults.beforeCleanupDecision ?? (async () => {});
+    this.afterAcquisition = faults.afterCleanupAcquisition ?? (async () => {});
+    this.writerOptions = faults.writerArbiterOptions ?? {};
+    this.quarantineFileSystem = faults.quarantineFileSystem;
+    this.directoryFileSystem = faults.directoryFileSystem ?? nodePrivateDirectoryFileSystem;
+    this.persistenceOptions = {
+      ...(faults.runDirectoryFileSystem ? { runDirectoryFileSystem: faults.runDirectoryFileSystem } : {}),
+      ...(faults.journalFileSystem ? { journalFileSystem: faults.journalFileSystem } : {}),
+      ...(faults.contextStoreInstrumentation ? { contextStoreInstrumentation: faults.contextStoreInstrumentation } : {}),
+    };
   }
 
   time(): number { return safeInteger(this.now(), "now"); }
 
   retainReleaseAuthority(lease: ManagedRunLease): void {
-    retainedReleaseAuthorities.set(lease.dir, lease);
+    if (!this.rootIdentity) throw new Error("managed root identity is unavailable while retaining release authority");
+    retainedReleaseAuthorities.set(join(this.rootIdentity.real, lease.name), lease);
   }
 
   forgetReleaseAuthority(lease: ManagedRunLease): void {
-    if (retainedReleaseAuthorities.get(lease.dir) === lease) retainedReleaseAuthorities.delete(lease.dir);
+    for (const [key, retained] of retainedReleaseAuthorities) {
+      if (retained === lease) retainedReleaseAuthorities.delete(key);
+    }
   }
 
   private async retryReleaseAuthorities(): Promise<void> {
-    for (const [dir, lease] of retainedReleaseAuthorities) {
-      if (dirname(dir) !== this.root) continue;
+    await this.ensureRoot();
+    for (const [canonicalDir, lease] of retainedReleaseAuthorities) {
+      if (dirname(canonicalDir) !== this.rootIdentity!.real) continue;
       try { await lease.retryReleaseAuthority(); }
       catch (cause) {
         throw new RunRetentionError(
@@ -600,7 +600,7 @@ export class ManagedRunStore {
           "failed to retry retained managed writer release authority",
           cause,
           undefined,
-          [await boundedSurvivor(dir, "run-directory")],
+          [await boundedSurvivor(canonicalDir, "run-directory")],
         );
       }
     }
@@ -614,14 +614,45 @@ export class ManagedRunStore {
 
   private ownedMetadataFileSystem(persistence: LeaseOwnedRunPersistence): RunRetentionMetadataFileSystem {
     const base = this.metadataFileSystem;
+    const guardedClose = async (
+      path: string,
+      close: () => Promise<void>,
+    ): Promise<void> => {
+      let invoked = false;
+      try {
+        await persistence.runPathEffect(path, async () => {
+          invoked = true;
+          await close();
+        });
+      } catch (primary) {
+        if (!invoked) {
+          try { await close(); }
+          catch (cleanup) { throw new AggregateError([primary, cleanup], "metadata close fence and handle cleanup both failed"); }
+        }
+        throw primary;
+      }
+    };
     return {
       open: async (path, flags, mode) => {
-        const handle = await persistence.runPathEffect(path, () => base.open(path, flags, mode));
-        return {
-          writeFile: (data, encoding) => persistence.runPathEffect(path, () => handle.writeFile(data, encoding)),
-          sync: () => persistence.runPathEffect(path, () => handle.sync()),
-          close: () => persistence.runPathEffect(path, () => handle.close()),
-        };
+        let opened: RunRetentionMetadataFileHandle | undefined;
+        try {
+          opened = await persistence.runPathEffect(path, async () => {
+            opened = await base.open(path, flags, mode);
+            return opened;
+          });
+          const handle = opened;
+          return {
+            writeFile: (data, encoding) => persistence.runPathEffect(path, () => handle.writeFile(data, encoding)),
+            sync: () => persistence.runPathEffect(path, () => handle.sync()),
+            close: () => guardedClose(path, () => handle.close()),
+          };
+        } catch (primary) {
+          if (opened) {
+            try { await opened.close(); }
+            catch (cleanup) { throw new AggregateError([primary, cleanup], "guarded metadata open and handle cleanup both failed"); }
+          }
+          throw primary;
+        }
       },
       rename: (oldPath, newPath) => persistence.runPathEffect([oldPath, newPath], () => base.rename(oldPath, newPath)),
       unlink: (path) => persistence.runPathEffect(path, () => base.unlink(path)),
@@ -730,7 +761,7 @@ export class ManagedRunStore {
         { managedRoot: this.root, runName: name },
         this.writerOptions,
       );
-      const persistence = new LeaseOwnedRunPersistence(writer);
+      const persistence = new LeaseOwnedRunPersistence(writer, this.persistenceOptions);
       return new ManagedRunLease(this, name, dir, metadata, writer, persistence);
     } catch (cause) {
       activeOwners.delete(dir);
@@ -1118,6 +1149,7 @@ export class ManagedRunStore {
       );
       return "deleted";
     } catch (cause) {
+      if (cause instanceof RunQuarantineAppliedError) terminal = true;
       if (!terminal && lease.role !== "retirement") {
         try { await lease.release(); }
         catch (release) { throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "retention failure and release both failed", new AggregateError([cause, release])); }
@@ -1159,6 +1191,7 @@ export class ManagedRunStore {
       );
       activeOwners.delete(path);
     } catch (cause) {
+      if (cause instanceof RunQuarantineAppliedError) activeOwners.delete(path);
       if (cause instanceof RunRetentionError && cause.message === "cannot discard an exposed managed run") throw cause;
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "failed to quarantine unused writer genesis", cause);
     }
@@ -1263,6 +1296,7 @@ export class ManagedRunStore {
             this.quarantineFileSystem,
           );
         } catch (cause) {
+          if (cause instanceof RunQuarantineAppliedError) terminal = true;
           if (!terminal && lease.role !== "retirement") {
             try { await lease.release(); }
             catch (release) { cause = new AggregateError([cause, release], "failed-genesis validation and release both failed"); }
