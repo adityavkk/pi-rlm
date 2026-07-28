@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireRunWriterLease,
+  createRunWriterGenesis,
   type RunWriterAcquisitionRole,
 } from "./run-writer-arbiter.ts";
 import { PinnedRunWriterIdentity } from "./run-writer-identity.ts";
@@ -68,6 +69,24 @@ const spawnChild = (script: string) => Bun.spawn({
 });
 
 describe("internal run writer arbiter identity", () => {
+  test("creates ordinal-one writer genesis only in an empty managed run", async () => {
+    const fixture = await arbiterFixture({ arbitration: "missing" });
+    try {
+      const lease = await createRunWriterGenesis(
+        { managedRoot: fixture.root, runName: fixture.runName },
+        { createToken: tokens(), now: () => 1 },
+      );
+      expect(lease.role).toBe("writer");
+      expect(lease.generation).toMatchObject({ ordinal: 1, predecessor: null, role: "writer" });
+      expect(await readdir(fixture.runPath)).toEqual([".pi-rlm-arbitration"]);
+      expect((await scanArbitrationDirectory(fixture.arbitrationPath)).tip?.token).toBe(lease.generation.token);
+      await lease.release();
+      const successor = await acquireRunWriterLease(input(fixture), { createToken: tokens(20) });
+      expect(successor.generation.ordinal).toBe(2);
+      await successor.release();
+    } finally { await fixture.cleanup(); }
+  });
+
   test("opens only exact existing private bigint identities", async () => {
     const fixture = await arbiterFixture();
     try {

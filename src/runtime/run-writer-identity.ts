@@ -1,7 +1,7 @@
 /** Internal pinned-path boundary for writer arbitration. */
 
 import { constants } from "node:fs";
-import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rmdir, type FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   ARBITRATION_DIRECTORY,
@@ -62,6 +62,8 @@ const sameDirectory = (
   && value.dev === expected.dev && value.ino === expected.ino;
 const aggregate = (primary: unknown, cleanup: readonly unknown[], message: string): unknown =>
   cleanup.length === 0 ? primary : new AggregateError([primary, ...cleanup], message);
+const errorCode = (error: unknown): string | undefined =>
+  typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
 
 const openDirectory = async (path: string, label: string): Promise<DirectoryIdentity> => {
   let handle: FileHandle | undefined;
@@ -124,8 +126,7 @@ export class PinnedRunWriterIdentity {
     this.key = runIdentityKey(this.identity);
   }
 
-  /** Opens existing arbitration metadata only. Genesis creation is intentionally a separate, unimplemented authority. */
-  static async openExisting(managedRoot: string, runName: string): Promise<PinnedRunWriterIdentity> {
+  private static validateInput(managedRoot: string, runName: string): string {
     if (typeof managedRoot !== "string" || !isAbsolute(managedRoot) || resolve(managedRoot) !== managedRoot)
       throw new RunWriterIdentityError("WRITER_IDENTITY_INPUT", "managed root must be an absolute normalized path");
     if (typeof runName !== "string" || !RUN_NAME.test(runName))
@@ -133,7 +134,12 @@ export class PinnedRunWriterIdentity {
     const runPath = join(managedRoot, runName);
     if (dirname(runPath) !== managedRoot)
       throw new RunWriterIdentityError("WRITER_IDENTITY_INPUT", "run path is not an exact managed root child");
+    return runPath;
+  }
 
+  /** Pin an existing exact managed run and its already-published arbitration namespace. */
+  static async openExisting(managedRoot: string, runName: string): Promise<PinnedRunWriterIdentity> {
+    const runPath = this.validateInput(managedRoot, runName);
     let root: DirectoryIdentity | undefined;
     let run: DirectoryIdentity | undefined;
     let arbitration: DirectoryIdentity | undefined;
@@ -159,6 +165,53 @@ export class PinnedRunWriterIdentity {
       throw new RunWriterIdentityError(
         "WRITER_IDENTITY_OPEN", "failed to pin managed arbitration paths",
         aggregate(primary, cleanup, "path pinning and descriptor cleanup failed"),
+      );
+    }
+  }
+
+  /** Create the arbitration namespace only for an otherwise-empty pinned managed run. */
+  static async createGenesis(managedRoot: string, runName: string): Promise<PinnedRunWriterIdentity> {
+    const runPath = this.validateInput(managedRoot, runName);
+    let root: DirectoryIdentity | undefined;
+    let run: DirectoryIdentity | undefined;
+    let arbitration: DirectoryIdentity | undefined;
+    let namespaceCreated = false;
+    try {
+      root = await openDirectory(managedRoot, "managed root");
+      run = await openDirectory(runPath, "managed run");
+      if (run.real !== join(root.real, runName)) throw new Error("managed run realpath is not the pinned root child");
+      await verifyDirectory(root, "managed root");
+      await verifyDirectory(run, "managed run");
+      if ((await readdir(runPath)).length !== 0) throw new Error("genesis managed run must be empty");
+      const arbitrationPath = join(runPath, ARBITRATION_DIRECTORY);
+      await mkdir(arbitrationPath, { mode: 0o700 });
+      namespaceCreated = true;
+      await run.handle.sync();
+      await verifyDirectory(root, "managed root");
+      await verifyDirectory(run, "managed run");
+      const entries = await readdir(runPath);
+      if (entries.length !== 1 || entries[0] !== ARBITRATION_DIRECTORY)
+        throw new Error("genesis run changed while creating arbitration metadata");
+      arbitration = await openDirectory(arbitrationPath, "arbitration directory");
+      if (arbitration.real !== join(run.real, ARBITRATION_DIRECTORY))
+        throw new Error("arbitration realpath is not the exact pinned run child");
+      const pinned = new PinnedRunWriterIdentity(root, run, arbitration, runName);
+      await pinned.assertValid();
+      return pinned;
+    } catch (primary) {
+      const cleanup: unknown[] = [];
+      for (const item of [arbitration, run, root]) {
+        if (!item) continue;
+        const closed = await attempt(() => item.handle.close());
+        if (closed.status === "failed") cleanup.push(closed.error);
+      }
+      if (namespaceCreated) {
+        try { await rmdir(join(runPath, ARBITRATION_DIRECTORY)); }
+        catch (error) { if (errorCode(error) !== "ENOTEMPTY") cleanup.push(error); }
+      }
+      throw new RunWriterIdentityError(
+        "WRITER_IDENTITY_OPEN", "failed to create and pin genesis arbitration paths",
+        aggregate(primary, cleanup, "genesis path creation and cleanup failed"),
       );
     }
   }
