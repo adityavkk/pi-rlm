@@ -20,6 +20,7 @@ import {
   type ManagedRunLease,
   type RunLifecycleStatus,
 } from "./run-retention.ts";
+import { managedRunPersistence } from "./run-managed-lifecycle.ts";
 import { ARBITRATION_DIRECTORY } from "./run-writer-protocol.ts";
 
 const root = () => mkdtemp(join(tmpdir(), "pi-rlm-retention-"));
@@ -63,11 +64,20 @@ const publishManifest = async (lease: ManagedRunLease, nonce: string): Promise<s
   await claimRunDirectory(
     lease.dir,
     document,
-    lease.lifecycle.persistence.runDirectoryFileSystem(),
+    managedRunPersistence(lease.lifecycle).runDirectoryFileSystem(),
     lease.lifecycle.claimEntries,
   );
   const id = document.manifest.run.id;
   await lease.lifecycle.onManifest(id);
+  const journal = new JournalStore(lease.dir, managedRunPersistence(lease.lifecycle).journalFileSystem());
+  await journal.append({
+    type: "run_started",
+    runId: id,
+    manifestHash: document.manifestHash,
+    limits: document.manifest.limits,
+    inputRefs: [],
+  });
+  await lease.lifecycle.onRunStarted(id);
   return id;
 };
 
@@ -76,7 +86,7 @@ const appendTerminal = async (
   status: Exclude<RunLifecycleStatus, "active">,
   id: string,
 ): Promise<void> => {
-  const journal = new JournalStore(lease.dir, lease.lifecycle.persistence.journalFileSystem());
+  const journal = new JournalStore(lease.dir, managedRunPersistence(lease.lifecycle).journalFileSystem());
   if (status === "completed") await journal.append({ type: "run_completed", runId: id, completionMode: "answer" });
   else if (status === "failed") await journal.append({ type: "run_failed", runId: id, code: "TEST_FAILURE", message: "fixture failed" });
   else await journal.append({ type: "run_cancelled", runId: id, code: "CANCELLED", message: "run cancelled by owner" });
@@ -235,7 +245,10 @@ const terminalFixture = async (
   const lease = await store.create();
   const payload = join(lease.dir, "payload.bin");
   await publishTerminal(lease, status, `terminal-${id}`, () =>
-    lease.persistence.runPathEffect(payload, () => writeFile(payload, Buffer.alloc(bytes), { mode: 0o600 })));
+    managedRunPersistence(lease.lifecycle).runPathEffect(
+      payload,
+      () => writeFile(payload, Buffer.alloc(bytes), { mode: 0o600 }),
+    ));
   return lease.name;
 };
 

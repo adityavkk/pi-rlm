@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { lstat, open, rename, rm } from "node:fs/promises";
+import { chmod, lstat, open, rename, rm } from "node:fs/promises";
 import {
   acquireRunRetentionLease,
 } from "./run-writer-arbiter.ts";
@@ -13,7 +13,7 @@ import {
 const faultFileSystem = (fault: "rename-applied" | "root-sync-applied"): RunQuarantineFileSystem => {
   let injected = false;
   return {
-    lstat,
+    lstat: (path) => lstat(path, { bigint: true }),
     async rename(oldPath, newPath) {
       await rename(oldPath, newPath);
       if (fault === "rename-applied" && !injected) {
@@ -69,6 +69,41 @@ describe("terminal writer quarantine", () => {
     },
   );
 
+  test("rejects a managed-root mode change after sync and retries the visible quarantine", async () => {
+    const fixture = await arbiterFixture();
+    let changed = false;
+    try {
+      const lease = await acquireRunRetentionLease({
+        managedRoot: fixture.root,
+        runName: fixture.runName,
+        preflightRetirement: async () => {},
+      }, { createToken: tokens() });
+      const fileSystem: RunQuarantineFileSystem = {
+        lstat: (path) => lstat(path, { bigint: true }),
+        rename,
+        async openDirectory(path) {
+          const handle = await open(path, "r");
+          return {
+            stat: (options) => handle.stat(options),
+            close: () => handle.close(),
+            async sync() {
+              await handle.sync();
+              if (!changed) { changed = true; await chmod(fixture.root, 0o755); }
+            },
+          };
+        },
+      };
+      await expect(lease.quarantine((identity) => quarantineOwnedRun(identity, fileSystem))).rejects.toThrow(
+        "private directory descriptor or pathname identity changed during sync",
+      );
+      await chmod(fixture.root, 0o700);
+      const quarantined = await lease.quarantine((identity) => quarantineOwnedRun(identity));
+      await scavengeRunQuarantine({
+        root: fixture.root, name: quarantined.name, remove: (path) => rm(path, { recursive: true }),
+      });
+    } finally { await chmod(fixture.root, 0o700).catch(() => {}); await fixture.cleanup(); }
+  });
+
   test("reconciles a remover that deleted the whole quarantine before throwing", async () => {
     const fixture = await arbiterFixture();
     try {
@@ -108,7 +143,7 @@ describe("terminal writer quarantine", () => {
         ...base,
         async lstat(path) {
           if (failInspection && path === quarantined.path) throw inspectionFailure;
-          return lstat(path);
+          return lstat(path, { bigint: true });
         },
       };
       const thrown = await scavengeRunQuarantine({

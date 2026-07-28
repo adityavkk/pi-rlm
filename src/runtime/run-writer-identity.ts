@@ -216,6 +216,20 @@ export class PinnedRunWriterIdentity {
     }
   }
 
+  mutationIdentity(): {
+    readonly managedRoot: string;
+    readonly runName: string;
+    readonly runPath: string;
+    readonly identity: ArbitrationIdentity;
+  } {
+    return {
+      managedRoot: this.managedRoot,
+      runName: this.runName,
+      runPath: this.runPath,
+      identity: this.identity,
+    };
+  }
+
   async assertValid(): Promise<void> {
     if (this.unusable) throw new RunWriterIdentityError("WRITER_IDENTITY_CHANGED", "pinned run identity is closed");
     // Node has no portable openat-style API. Descriptor plus pathname/realpath checks bind cooperating

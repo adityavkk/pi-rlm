@@ -1,7 +1,6 @@
 /** Lease-owned filesystem composition for managed-run writable state. */
 
-import { realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ContextStoreInstrumentation } from "../shell/context-store-contract.ts";
 import {
   nodeJournalFileSystem,
@@ -15,8 +14,6 @@ import {
 } from "./run-manifest.ts";
 import type { RunWriterLease } from "./run-writer-arbiter.ts";
 
-const RUN_NAME = /^run-[a-f0-9]{32}$/;
-
 export class RunWriterMutationPathError extends Error {
   override readonly name = "RunWriterMutationPathError";
   readonly code = "WRITER_MUTATION_PATH";
@@ -27,20 +24,19 @@ export class RunWriterMutationPathError extends Error {
  * authoritative generation and revalidate pinned root/run/arbitration identities.
  */
 export class LeaseOwnedRunPersistence {
+  readonly managedRoot: string;
+  readonly runName: string;
   readonly runPath: string;
-  private readonly realRunPath: string;
 
-  constructor(
-    readonly managedRoot: string,
-    readonly runName: string,
-    private readonly lease: RunWriterLease,
-  ) {
-    if (!isAbsolute(managedRoot) || resolve(managedRoot) !== managedRoot || !RUN_NAME.test(runName))
-      throw new RunWriterMutationPathError("managed persistence identity is invalid");
-    this.runPath = join(managedRoot, runName);
-    if (dirname(this.runPath) !== managedRoot || lease.runName !== runName)
-      throw new RunWriterMutationPathError("managed persistence is not bound to the lease run");
-    this.realRunPath = realpathSync(this.runPath);
+  constructor(private readonly lease: RunWriterLease) {
+    const identity = lease.mutationIdentity();
+    this.managedRoot = identity.managedRoot;
+    this.runName = identity.runName;
+    this.runPath = identity.runPath;
+    if (!isAbsolute(this.managedRoot) || resolve(this.managedRoot) !== this.managedRoot
+      || !isAbsolute(this.runPath) || resolve(this.runPath) !== this.runPath
+      || dirname(this.runPath) !== this.managedRoot || lease.runName !== this.runName)
+      throw new RunWriterMutationPathError("managed persistence is not bound to the lease-pinned run identity");
   }
 
   private assertPath(path: string): void {
@@ -50,8 +46,13 @@ export class LeaseOwnedRunPersistence {
       const rel = relative(root, path);
       return rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith(sep);
     };
-    if (!contained(this.runPath) && !contained(this.realRunPath))
+    if (!contained(this.runPath))
       throw new RunWriterMutationPathError("managed mutation path escapes the leased run");
+  }
+
+  /** Hold lease admission and one outer fence for a complete logical mutation. */
+  runTransaction<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    return this.lease.runOwnedTransaction(effect);
   }
 
   async runPathEffect<T>(paths: string | readonly string[], effect: () => T | PromiseLike<T>): Promise<T> {
@@ -62,6 +63,8 @@ export class LeaseOwnedRunPersistence {
   contextInstrumentation(base: ContextStoreInstrumentation = {}): ContextStoreInstrumentation {
     return {
       ...base,
+      runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
+        this.runTransaction(() => base.runTransaction?.(effect) ?? effect()),
       runFileSystemOperation: <T>(path: string, effect: () => Promise<T>): Promise<T> =>
         this.runPathEffect(path, () => base.runFileSystemOperation?.(path, effect) ?? effect()),
     };
@@ -69,6 +72,8 @@ export class LeaseOwnedRunPersistence {
 
   runDirectoryFileSystem(base: RunDirectoryFileSystem = nodeRunDirectoryFileSystem): RunDirectoryFileSystem {
     return {
+      runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
+        this.runTransaction(() => base.runTransaction?.(effect) ?? effect()),
       open: async (path, flags, mode) => {
         const handle = await this.runPathEffect(path, () => base.open(path, flags, mode));
         return this.runDirectoryHandle(path, handle);
@@ -82,6 +87,8 @@ export class LeaseOwnedRunPersistence {
 
   journalFileSystem(base: JournalFileSystem = nodeJournalFileSystem): JournalFileSystem {
     return {
+      runTransaction: <T>(effect: () => Promise<T>): Promise<T> =>
+        this.runTransaction(() => base.runTransaction?.(effect) ?? effect()),
       open: async (path, flags, mode) => {
         const handle = await this.runPathEffect(path, () => base.open(path, flags, mode));
         return this.journalHandle(path, handle);

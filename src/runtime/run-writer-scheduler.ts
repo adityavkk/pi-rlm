@@ -69,8 +69,8 @@ export class RunWriterScheduler {
 
   constructor(private readonly hooks: RunWriterSchedulerHooks) {}
 
-  /** Filesystem adapters use inline nesting because their operation promise is always awaited by the owner shell. */
-  runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+  /** Logical transactions nest inline while their outer transaction retains admission. */
+  runOwnedTransaction<T>(effect: () => T | PromiseLike<T>): Promise<T> {
     const inherited = writerScope.getStore();
     if (inherited?.open) {
       if (inherited.scheduler !== this) {
@@ -80,6 +80,24 @@ export class RunWriterScheduler {
         ));
       }
       return invoke(effect);
+    }
+    return this.run(effect);
+  }
+
+  /**
+   * Filesystem pathname effects nest inline so an enclosing logical transaction retains
+   * admission, but each effect still receives its own pre/post identity fence.
+   */
+  runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    const inherited = writerScope.getStore();
+    if (inherited?.open) {
+      if (inherited.scheduler !== this) {
+        return Promise.reject(new RunWriterSchedulerError(
+          "WRITER_SCHEDULER_LOCK_ORDER",
+          "cannot enter a different writer scheduler from an open writer scope",
+        ));
+      }
+      return this.runQueued(effect);
     }
     return this.run(effect);
   }

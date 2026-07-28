@@ -34,6 +34,7 @@ import {
   type RunResult,
   type RunWarning,
 } from "./src/runtime/index.ts";
+import { MANAGED_RUN_PERSISTENCE } from "./src/runtime/run-managed-lifecycle.ts";
 import {
   ManagedRunStore,
   RunRetentionError,
@@ -273,11 +274,12 @@ const executeRun = async (
       onProgressSource: ownership.attachProgress,
       runLifecycle: {
         claimEntries: lease.lifecycle.claimEntries,
-        persistence: lease.lifecycle.persistence,
+        [MANAGED_RUN_PERSISTENCE]: lease.lifecycle[MANAGED_RUN_PERSISTENCE],
         onManifest: async (runId) => {
           requireCoordinatorMutation(ownership.bindRunId(runId), "run-id binding");
           await lease.lifecycle.onManifest(runId);
         },
+        onRunStarted: lease.lifecycle.onRunStarted,
       },
       ...(agentDelegation ? { agentDelegation } : {}),
     });

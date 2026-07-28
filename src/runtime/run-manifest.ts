@@ -362,6 +362,8 @@ export interface RunDirectoryFileHandle {
 }
 
 export interface RunDirectoryFileSystem {
+  /** Optional lease-owned boundary for one complete manifest mutation. */
+  runTransaction?<T>(effect: () => Promise<T>): Promise<T>;
   open(path: string, flags: string, mode?: number): Promise<RunDirectoryFileHandle>;
   readFile(path: string): Promise<Buffer>;
   readdir(path: string): Promise<string[]>;
@@ -437,6 +439,7 @@ export const claimRunDirectory = async (
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
   allowedEntries: readonly string[] = [],
 ): Promise<void> => {
+  const mutation = async (): Promise<void> => {
   const lockPath = join(dir, RUN_LOCK_FILE);
   let lock: RunDirectoryFileHandle;
   try {
@@ -496,6 +499,8 @@ export const claimRunDirectory = async (
       throw new RunDirectoryError("MANIFEST_CLEANUP_FAILED", "failed to clean an incomplete run manifest", cause);
     throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "failed to publish durable run manifest", cause);
   }
+  };
+  await (fileSystem.runTransaction?.(mutation) ?? mutation());
 };
 
 const parseManifestDocument = (input: unknown): RunManifestDocument => {

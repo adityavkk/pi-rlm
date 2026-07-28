@@ -34,6 +34,8 @@ export interface ContextStoreLimits {
 /** Optional allocation and persistence hooks for diagnostics and deterministic tests. */
 export interface ContextStoreInstrumentation {
   readonly onMaterialize?: (descriptor: ContextDescriptor) => void;
+  /** Hold writer admission across one complete context mutation. */
+  readonly runTransaction?: <T>(effect: () => Promise<T>) => Promise<T>;
   /** Guard every filesystem call. Managed runs use this to fence and revalidate pinned run identity. */
   readonly runFileSystemOperation?: <T>(path: string, effect: () => Promise<T>) => Promise<T>;
   readonly hasher?: (value: string | Uint8Array) => string;

@@ -12,6 +12,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   unlink,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -19,6 +20,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { RlmEvent } from "../core/journal.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import { readRunManifest, RUN_MANIFEST_FILE } from "./run-manifest.ts";
+import { MANAGED_RUN_PERSISTENCE } from "./run-managed-lifecycle.ts";
+import { assertBareGenesisRetirement, inspectBareWriterGenesis } from "./run-genesis-recovery.ts";
+import { selectRetentionCandidates } from "./run-retention-policy.ts";
 import {
   acquireRunRetentionLease,
   createRunWriterGenesis,
@@ -26,6 +30,11 @@ import {
   type RunWriterArbiterOptions,
   type RunWriterLease,
 } from "./run-writer-arbiter.ts";
+import {
+  nodePrivateDirectoryFileSystem,
+  syncPrivateDirectory,
+  type PrivateDirectoryFileSystem,
+} from "./run-writer-directory.ts";
 import { LeaseOwnedRunPersistence } from "./run-writer-mutation.ts";
 import { ARBITRATION_DIRECTORY, scanArbitrationDirectory } from "./run-writer-protocol.ts";
 import {
@@ -210,10 +219,14 @@ export interface ManagedRunStoreOptions {
   readonly removeDirectory?: (path: string) => Promise<void>;
   /** Fault-test seam immediately before a selected run's arbitration acquisition. */
   readonly beforeCleanupDecision?: (path: string) => Promise<void>;
+  /** Fault-test seam after authority acquisition and before global-policy revalidation. */
+  readonly afterCleanupAcquisition?: (path: string) => Promise<void>;
   /** Internal arbitration and liveness fault-test seams. */
   readonly writerArbiterOptions?: RunWriterArbiterOptions;
   /** Dedicated quarantine rename/root-sync fault-test seam. */
   readonly quarantineFileSystem?: RunQuarantineFileSystem;
+  /** Managed-root mkdir durability fault-test seam. */
+  readonly directoryFileSystem?: PrivateDirectoryFileSystem;
 }
 
 const safeInteger = (value: number, field: string, minimum = 0): number => {
@@ -372,8 +385,8 @@ const readBoundedJson = async (path: string, limit = METADATA_LIMIT_BYTES): Prom
   return JSON.parse((await readFile(path, "utf8")).trim()) as unknown;
 };
 
-interface RootIdentity { readonly real: string; readonly dev: number; readonly ino: number }
-interface RunIdentity { readonly dev: number; readonly ino: number }
+interface RootIdentity { readonly real: string; readonly dev: bigint; readonly ino: bigint }
+interface RunIdentity { readonly dev: bigint; readonly ino: bigint }
 interface ScanBudget { entries: number; bytes: number }
 interface InternalListing extends ManagedRunListing { readonly runs: readonly ScannedRunInfo[] }
 
@@ -385,6 +398,8 @@ export class ManagedRunLease {
   private runId: string | undefined;
   private closed = false;
   private manifestBound = false;
+  private genesisComplete = false;
+  private markerReleased = false;
 
   constructor(
     private readonly store: ManagedRunStore,
@@ -392,11 +407,11 @@ export class ManagedRunLease {
     readonly dir: string,
     private metadata: RunLifecycleMetadata,
     private readonly writer: RunWriterLease,
-    readonly persistence: LeaseOwnedRunPersistence,
+    private readonly persistence: LeaseOwnedRunPersistence,
   ) {
     this.lifecycle = {
       claimEntries: MANAGED_RUN_CLAIM_ENTRIES,
-      persistence,
+      [MANAGED_RUN_PERSISTENCE]: persistence,
       onManifest: async (runId: string): Promise<void> => {
         if (this.closed || !RUN_ID.test(runId))
           throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "invalid managed run identity");
@@ -404,35 +419,63 @@ export class ManagedRunLease {
         this.runId = runId;
         this.manifestBound = true;
       },
+      onRunStarted: async (runId: string): Promise<void> => {
+        if (this.closed || !this.manifestBound || runId !== this.runId)
+          throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "durable run start does not match managed genesis");
+        this.genesisComplete = true;
+      },
     };
   }
 
   readonly lifecycle: {
     readonly claimEntries: readonly string[];
-    readonly persistence: LeaseOwnedRunPersistence;
+    readonly [MANAGED_RUN_PERSISTENCE]: LeaseOwnedRunPersistence;
     readonly onManifest: (runId: string) => Promise<void>;
+    readonly onRunStarted: (runId: string) => Promise<void>;
   };
 
+  private combine(primary: unknown, secondary: unknown): unknown {
+    return primary === undefined ? secondary : new AggregateError([primary, secondary]);
+  }
+
   private async releaseOwned(primary: unknown): Promise<unknown> {
-    if (this.manifestBound) {
-      try { await this.store.releaseLease(this.dir, this.metadata, this.persistence); }
-      catch (release) { primary = primary === undefined ? release : new AggregateError([primary, release]); }
+    if (this.manifestBound && !this.markerReleased) {
+      try {
+        await this.store.releaseLease(this.dir, this.metadata, this.persistence);
+        this.markerReleased = true;
+      } catch (release) { primary = this.combine(primary, release); }
     }
-    try { await this.writer.release(); }
-    catch (release) { primary = primary === undefined ? release : new AggregateError([primary, release]); }
+    try {
+      await this.writer.release();
+      this.closed = true;
+      return primary;
+    } catch (firstRelease) {
+      // Arbiter release/descriptor-close faults are explicitly retryable. Keep this
+      // managed lease open unless a fresh reconciliation attempt succeeds.
+      try {
+        await this.writer.release();
+        this.closed = true;
+        return primary;
+      } catch (secondRelease) {
+        return this.combine(primary, new AggregateError([firstRelease, secondRelease], "managed writer release retries failed"));
+      }
+    }
+  }
+
+  private async discardGenesis(): Promise<void> {
+    await this.store.discardOwned(this.name, this.dir, this.metadata, this.writer);
     this.closed = true;
-    return primary;
   }
 
   async finish(status: Exclude<RunLifecycleStatus, "active">, runId?: string): Promise<void> {
     if (this.closed) return;
-    if (!this.manifestBound) {
+    if (!this.genesisComplete) {
       let primary: unknown = new RunRetentionError(
         "RUN_RETENTION_METADATA_FAILED",
-        "terminal lifecycle requires the bound manifest run identity",
+        "terminal lifecycle requires a durable run_started genesis event",
       );
-      try { await this.discard(); }
-      catch (discard) { primary = new AggregateError([primary, discard], "invalid terminal lifecycle and genesis discard both failed"); }
+      try { await this.discardGenesis(); }
+      catch (discard) { primary = new AggregateError([primary, discard], "invalid terminal lifecycle and genesis quarantine both failed"); }
       if (primary instanceof RunRetentionError) throw primary;
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed terminal finalization failed", primary);
     }
@@ -449,10 +492,10 @@ export class ManagedRunLease {
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed terminal finalization failed", primary);
   }
 
-  /** Release a run which threw after genesis but before an authoritative terminal result. */
+  /** Release a run which threw after completed genesis but before an authoritative terminal result. */
   async abandon(): Promise<void> {
     if (this.closed) return;
-    if (!this.manifestBound) return this.discard();
+    if (!this.genesisComplete) return this.discardGenesis();
     let primary: unknown;
     try { this.metadata = await this.store.abandonLease(this.dir, this.metadata, this.persistence); }
     catch (error) { primary = error; }
@@ -462,11 +505,12 @@ export class ManagedRunLease {
       throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "managed abandonment failed", primary);
   }
 
-  /** Quarantine an allocation that never completed managed genesis. */
+  /** Quarantine only an allocation which has never exposed a durable manifest. */
   async discard(): Promise<void> {
     if (this.closed) return;
-    await this.store.discardOwned(this.name, this.dir, this.metadata, this.writer);
-    this.closed = true;
+    if (this.manifestBound)
+      throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "cannot discard an exposed managed run");
+    await this.discardGenesis();
   }
 }
 
@@ -479,8 +523,10 @@ export class ManagedRunStore {
   private readonly metadataFileSystem: RunRetentionMetadataFileSystem;
   private readonly remover: (path: string) => Promise<void>;
   private readonly beforeDecision: (path: string) => Promise<void>;
+  private readonly afterAcquisition: (path: string) => Promise<void>;
   private readonly writerOptions: RunWriterArbiterOptions;
   private readonly quarantineFileSystem?: RunQuarantineFileSystem;
+  private readonly directoryFileSystem: PrivateDirectoryFileSystem;
   private rootIdentity: RootIdentity | undefined;
 
   constructor(options: ManagedRunStoreOptions = {}) {
@@ -495,8 +541,10 @@ export class ManagedRunStore {
     this.metadataFileSystem = options.metadataFileSystem ?? nodeMetadataFileSystem;
     this.remover = options.removeDirectory ?? ((path) => rm(path, { recursive: true, force: false }));
     this.beforeDecision = options.beforeCleanupDecision ?? (async () => {});
+    this.afterAcquisition = options.afterCleanupAcquisition ?? (async () => {});
     this.writerOptions = options.writerArbiterOptions ?? {};
     this.quarantineFileSystem = options.quarantineFileSystem;
+    this.directoryFileSystem = options.directoryFileSystem ?? nodePrivateDirectoryFileSystem;
   }
 
   time(): number { return safeInteger(this.now(), "now"); }
@@ -559,10 +607,10 @@ export class ManagedRunStore {
   private async ensureRoot(): Promise<void> {
     try { await mkdir(this.root, { recursive: true, mode: 0o700 }); }
     catch (cause) { throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "failed to create private managed run root", cause); }
-    let info = await lstat(this.root);
+    let info = await lstat(this.root, { bigint: true });
     if (info.isSymbolicLink() || !info.isDirectory())
       throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "managed run root must be a real directory");
-    try { await chmod(this.root, 0o700); info = await lstat(this.root); }
+    try { await chmod(this.root, 0o700); info = await lstat(this.root, { bigint: true }); }
     catch (cause) { throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "failed to secure managed run root", cause); }
     if (info.isSymbolicLink() || !info.isDirectory())
       throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "managed run root identity changed while securing it");
@@ -572,12 +620,21 @@ export class ManagedRunStore {
     this.rootIdentity ??= identity;
   }
 
+  private async syncRoot(): Promise<void> {
+    await this.ensureRoot();
+    await syncPrivateDirectory(
+      this.root,
+      { dev: this.rootIdentity!.dev, ino: this.rootIdentity!.ino },
+      this.directoryFileSystem,
+    );
+  }
+
   private async ensureRunPath(dir: string): Promise<RunIdentity> {
     await this.ensureRoot();
     const name = dir.slice(this.root.length + 1);
     if (!RUN_NAME.test(name) || dir !== join(this.root, name) || dirname(dir) !== this.root || !this.contained(dir))
       throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "run path escapes managed root");
-    const info = await lstat(dir);
+    const info = await lstat(dir, { bigint: true });
     if (info.isSymbolicLink() || !info.isDirectory())
       throw new RunRetentionError("RUN_RETENTION_ROOT_INVALID", "managed run path is not a directory");
     const expectedReal = join(this.rootIdentity!.real, name);
@@ -610,22 +667,22 @@ export class ManagedRunStore {
     try {
       await mkdir(dir, { mode: 0o700 });
       created = true;
+      // The managed-root child entry is part of writer genesis and must survive a crash.
+      await this.syncRoot();
       const writer = await createRunWriterGenesis(
         { managedRoot: this.root, runName: name },
         this.writerOptions,
       );
-      const persistence = new LeaseOwnedRunPersistence(this.root, name, writer);
+      const persistence = new LeaseOwnedRunPersistence(writer);
       return new ManagedRunLease(this, name, dir, metadata, writer, persistence);
     } catch (cause) {
       activeOwners.delete(dir);
       if (created) {
-        let durableGenesis = false;
+        let authoritativeWinner = false;
         try {
+          await lstat(join(dir, ARBITRATION_DIRECTORY));
           const chain = await scanArbitrationDirectory(join(dir, ARBITRATION_DIRECTORY));
-          if (chain.tip) {
-            durableGenesis = true;
-            await quarantineFailedGenesis(this.root, dir, chain.tip, this.quarantineFileSystem);
-          }
+          authoritativeWinner = chain.tip !== null;
         } catch (reconciliation) {
           if (errorCode(reconciliation) !== "ENOENT") {
             throw new RunRetentionError(
@@ -637,17 +694,32 @@ export class ManagedRunStore {
             );
           }
         }
-        if (!durableGenesis) {
-          try { await rm(dir, { recursive: true, force: true }); }
-          catch (cleanup) {
-            throw new RunRetentionError(
-              "RUN_RETENTION_CREATE_FAILED",
-              "run creation and rollback both failed",
-              new AggregateError([cause, cleanup]),
-              undefined,
-              [await boundedSurvivor(dir, "run-directory")],
-            );
+        if (authoritativeWinner) {
+          // The winner may belong to a concurrent creator. Never infer ownership from
+          // the chain tip and never quarantine a generation we did not return.
+          throw new RunRetentionError(
+            "RUN_RETENTION_CREATE_FAILED",
+            "another authoritative genesis winner owns the allocated path",
+            cause,
+            undefined,
+            [await boundedSurvivor(dir, "run-directory")],
+          );
+        }
+        try {
+          try { await rmdir(join(dir, ARBITRATION_DIRECTORY)); }
+          catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
           }
+          await rm(dir, { recursive: true, force: true });
+          await this.syncRoot();
+        } catch (cleanup) {
+          throw new RunRetentionError(
+            "RUN_RETENTION_CREATE_FAILED",
+            "run creation rollback could not prove an empty arbitration namespace",
+            new AggregateError([cause, cleanup]),
+            undefined,
+            [await boundedSurvivor(dir, "run-directory")],
+          );
         }
       }
       throw new RunRetentionError("RUN_RETENTION_CREATE_FAILED", "failed to create managed writer genesis", cause);
@@ -762,34 +834,40 @@ export class ManagedRunStore {
     expected: RunLifecycleMetadata,
     persistence: LeaseOwnedRunPersistence,
   ): Promise<void> {
-    activeOwners.delete(dir);
-    const fileSystem = this.ownedMetadataFileSystem(persistence);
-    const marker = join(dir, RUN_ACTIVE_FILE);
-    try {
-      await fileSystem.unlink(marker);
-      return;
-    } catch (cause) {
-      if (errorCode(cause) === "ENOENT") return;
-      const inactive = join(dir, `${RUN_INACTIVE_FILE_PREFIX}${expected.owner}.json`);
-      try {
-        await fileSystem.rename(marker, inactive);
+    await persistence.runTransaction(async () => {
+      activeOwners.delete(dir);
+      const fileSystem = this.ownedMetadataFileSystem(persistence);
+      const marker = join(dir, RUN_ACTIVE_FILE);
+      const syncDirectory = async (): Promise<void> => {
         const directory = await fileSystem.open(dir, "r");
-        let syncFailure: unknown;
-        try { await directory.sync(); } catch (error) { syncFailure = error; }
+        let primary: unknown;
+        try { await directory.sync(); } catch (error) { primary = error; }
         try { await directory.close(); } catch (cleanup) {
-          syncFailure = syncFailure === undefined ? cleanup : new AggregateError([syncFailure, cleanup]);
+          primary = primary === undefined ? cleanup : new AggregateError([primary, cleanup]);
         }
-        if (syncFailure !== undefined) throw syncFailure;
-      } catch (fallback) {
-        throw new RunRetentionError(
-          "RUN_RETENTION_METADATA_FAILED",
-          "failed to release active run lease",
-          new AggregateError([cause, fallback]),
-          undefined,
-          [await boundedSurvivor(inactive, "temporary-file")],
-        );
+        if (primary !== undefined) throw primary;
+      };
+      try {
+        await fileSystem.unlink(marker);
+        await syncDirectory();
+        return;
+      } catch (cause) {
+        if (errorCode(cause) === "ENOENT") { await syncDirectory(); return; }
+        const inactive = join(dir, `${RUN_INACTIVE_FILE_PREFIX}${expected.owner}.json`);
+        try {
+          await fileSystem.rename(marker, inactive);
+          await syncDirectory();
+        } catch (fallback) {
+          throw new RunRetentionError(
+            "RUN_RETENTION_METADATA_FAILED",
+            "failed to release active run lease",
+            new AggregateError([cause, fallback]),
+            undefined,
+            [await boundedSurvivor(inactive, "temporary-file")],
+          );
+        }
       }
-    }
+    });
   }
 
   private async scanTree(path: string, budget: ScanBudget, depth = 0): Promise<number> {
@@ -843,8 +921,14 @@ export class ManagedRunStore {
         continue;
       }
       try {
-        const info = await lstat(path);
-        if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o777) !== 0o700)
+        // Exact pre-manifest genesis is arbitration-owned, not malformed lifecycle state.
+        // Cleanup handles it through the same successor protocol before this listing.
+        if (await inspectBareWriterGenesis(this.root, name)) {
+          this.stopAtEntryCap(budget);
+          continue;
+        }
+        const info = await lstat(path, { bigint: true });
+        if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o777n) !== 0o700n)
           throw new Error("run entry must be a private real directory");
         if (await realpath(path) !== join(this.rootIdentity!.real, name)) throw new Error("run entry real path escapes managed root");
         const bytes = await this.scanTree(path, budget);
@@ -893,6 +977,21 @@ export class ManagedRunStore {
     return true;
   }
 
+  private async validateSelectedCandidate(
+    run: ScannedRunInfo,
+    now: number,
+    options: RunCleanupOptions,
+    alreadyRetired: boolean,
+  ): Promise<boolean> {
+    if (!await this.validateRemovalCandidate(run, now)) return false;
+    if (alreadyRetired) return true;
+    const current = await this.listInternal();
+    const refreshed = current.runs.find((candidate) => candidate.name === run.name);
+    if (!refreshed || refreshed.identity.dev !== run.identity.dev || refreshed.identity.ino !== run.identity.ino
+      || !this.sameLifecycle(refreshed.metadata, run.metadata)) return false;
+    return selectRetentionCandidates(current.runs, this.policy, now, options).has(run.name);
+  }
+
   private writerContention(error: unknown): boolean {
     return error instanceof RunWriterArbiterError && [
       "WRITER_ARBITER_ALREADY_OWNED",
@@ -907,15 +1006,19 @@ export class ManagedRunStore {
   private async removeCandidate(
     run: ScannedRunInfo,
     now: number,
+    options: RunCleanupOptions,
   ): Promise<"deleted" | "retained" | RunCleanupSkipReason> {
     await this.beforeDecision(run.path);
     let lease: RunWriterLease;
+    let retirementMode: "publishing" | "recovering" | undefined;
     try {
       lease = await acquireRunRetentionLease({
         managedRoot: this.root,
         runName: run.name,
-        preflightRetirement: async () => {
-          if (!await this.validateRemovalCandidate(run, now)) throw new RetentionPreflightChanged();
+        preflightRetirement: async (mode) => {
+          retirementMode = mode;
+          if (!await this.validateSelectedCandidate(run, now, options, mode === "recovering"))
+            throw new RetentionPreflightChanged();
         },
       }, this.writerOptions);
     } catch (error) {
@@ -927,10 +1030,12 @@ export class ManagedRunStore {
 
     let terminal = false;
     try {
-      const eligible = await lease.run(() => this.validateRemovalCandidate(run, now));
+      await this.afterAcquisition(run.path);
+      const retiredRecovery = lease.role === "retirement" && retirementMode === "recovering";
+      const eligible = await lease.run(() => this.validateSelectedCandidate(run, now, options, retiredRecovery));
       if (!eligible) {
         if (lease.role === "retirement")
-          throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "irreversible retirement preflight changed unexpectedly");
+          throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "irreversible retirement policy changed after publication");
         await lease.release();
         return "retained";
       }
@@ -984,9 +1089,67 @@ export class ManagedRunStore {
     const listing = await this.listInternal();
     const run = listing.runs.find((candidate) => candidate.name === name && candidate.path === path);
     if (!run) throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target was not a validated run");
-    const outcome = await this.removeCandidate(run, this.time());
+    const outcome = await this.removeCandidate(run, this.time(), { force: true });
     if (outcome === "retained" || outcome === "already_claimed")
       throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "owned removal target became active or ambiguous");
+  }
+
+  private async scavengeDeadGeneses(): Promise<void> {
+    await this.ensureRoot();
+    const directory = await opendir(this.root, { bufferSize: 1 });
+    let examined = 0;
+    try {
+      for await (const entry of directory) {
+        if (++examined > this.policy.maxScanEntries)
+          throw this.scanLimit("dead genesis scavenging entry limit reached");
+        if (!RUN_NAME.test(entry.name)) continue;
+        let genesis;
+        try { genesis = await inspectBareWriterGenesis(this.root, entry.name); }
+        catch { continue; }
+        if (!genesis) continue;
+        let lease: RunWriterLease;
+        try {
+          lease = await acquireRunRetentionLease({
+            managedRoot: this.root,
+            runName: entry.name,
+            preflightRetirement: async () => {
+              if (!await inspectBareWriterGenesis(this.root, entry.name)) throw new RetentionPreflightChanged();
+            },
+          }, this.writerOptions);
+        } catch (error) {
+          if (this.writerContention(error) || error instanceof RetentionPreflightChanged || errorCode(error) === "ENOENT") continue;
+          throw error;
+        }
+        let terminal = false;
+        try {
+          await lease.run(() => assertBareGenesisRetirement(
+            this.root,
+            entry.name,
+            genesis!.token,
+            lease.generation,
+          ));
+          const quarantined = await lease.quarantine((identity) =>
+            quarantineOwnedRun(identity, this.quarantineFileSystem));
+          terminal = true;
+          await scavengeRunQuarantine(
+            { root: this.root, name: quarantined.name, remove: this.remover },
+            this.quarantineFileSystem,
+          );
+        } catch (cause) {
+          if (!terminal && lease.role !== "retirement") {
+            try { await lease.release(); }
+            catch (release) { cause = new AggregateError([cause, release], "dead genesis validation and release both failed"); }
+          }
+          throw new RunRetentionError(
+            "RUN_RETENTION_CLEANUP_FAILED",
+            "failed to scavenge dead pre-manifest writer genesis",
+            cause,
+            undefined,
+            terminal ? [await boundedSurvivor(join(this.root, quarantineName(lease.generation)), "quarantine")] : [],
+          );
+        }
+      }
+    } finally { try { await directory.close(); } catch { /* Iterator may already have closed it. */ } }
   }
 
   private async scavengeQuarantines(): Promise<void> {
@@ -1017,36 +1180,17 @@ export class ManagedRunStore {
   }
 
   async cleanup(options: RunCleanupOptions = {}): Promise<RunCleanupResult> {
-    if (!options.dryRun) await this.scavengeQuarantines();
+    if (!options.dryRun) {
+      await this.scavengeQuarantines();
+      await this.scavengeDeadGeneses();
+    }
     const internal = await this.listInternal();
     const listing: ManagedRunListing = {
       ...internal,
       runs: internal.runs.map(({ identity: _identity, ...run }) => run),
     };
     const now = this.time();
-    const terminal = internal.runs
-      .filter((run) => run.metadata.status !== "active")
-      .sort((a, b) => (a.metadata.terminalAtMs! - b.metadata.terminalAtMs!) || a.name.localeCompare(b.name));
-    const removable = (run: ManagedRunInfo): boolean => run.activity === "inactive" || run.activity === "stale";
-    const selected = new Set<string>();
-    for (const run of terminal) {
-      if (removable(run) && (options.force || now - run.metadata.terminalAtMs! >= this.policy.terminalMaxAgeMs)) selected.add(run.name);
-    }
-    let remainingCount = terminal.length - selected.size;
-    for (const run of terminal) {
-      if (remainingCount <= this.policy.maxTerminalRuns) break;
-      if (!selected.has(run.name) && removable(run)) { selected.add(run.name); remainingCount--; }
-    }
-    let remainingBytes = terminal.reduce((sum, run) => sum + (selected.has(run.name) ? 0 : run.bytes), 0);
-    for (const run of terminal) {
-      if (remainingBytes <= this.policy.maxTerminalBytes) break;
-      if (!selected.has(run.name) && removable(run)) { selected.add(run.name); remainingBytes -= run.bytes; }
-    }
-    const abandoned = internal.runs
-      .filter((run) => run.metadata.status === "active" && removable(run)
-        && now - run.metadata.updatedAtMs >= this.policy.abandonedGraceMs)
-      .sort((a, b) => (a.metadata.updatedAtMs - b.metadata.updatedAtMs) || a.name.localeCompare(b.name));
-    for (const run of abandoned) selected.add(run.name);
+    const selected = selectRetentionCandidates(internal.runs, this.policy, now, options);
 
     const ordered = internal.runs
       .filter((run) => selected.has(run.name))
@@ -1057,30 +1201,35 @@ export class ManagedRunStore {
       });
     const deleted: string[] = [];
     const skipped: RunCleanupSkipped[] = [];
+    const failedRemovals = new Set<string>();
     const issues = [...listing.issues];
     if (!options.dryRun) {
       for (const run of ordered) {
         try {
-          const outcome = await this.removeCandidate(run, now);
+          const outcome = await this.removeCandidate(run, now, options);
           if (outcome === "deleted") deleted.push(run.name);
           else if (outcome === "already_removed" || outcome === "already_claimed")
             skipped.push({ runName: run.name, reason: outcome });
         } catch (cause) {
+          failedRemovals.add(run.name);
           issues.push({ code: "CLEANUP_FAILED", message: "failed to remove managed run", runName: run.name, cause });
         }
       }
     }
-    const handled = new Set(options.dryRun
-      ? ordered.map((run) => run.name)
-      : [...deleted, ...skipped.map((entry) => entry.runName)]);
-    const retainedRuns = internal.runs.filter((run) => !handled.has(run.name));
+    const finalInternal = options.dryRun ? internal : await this.listInternal();
+    const handled = new Set(options.dryRun ? ordered.map((run) => run.name) : []);
+    const retainedByName = new Map(
+      finalInternal.runs.filter((run) => !handled.has(run.name)).map((run) => [run.name, run] as const),
+    );
+    for (const run of internal.runs) if (failedRemovals.has(run.name)) retainedByName.set(run.name, run);
+    const retainedRuns = [...retainedByName.values()];
     const retainedTerminal = retainedRuns.filter((run) => run.metadata.status !== "active");
     const policyUnsatisfied = retainedTerminal.length > this.policy.maxTerminalRuns
       || retainedTerminal.reduce((sum, run) => sum + run.bytes, 0) > this.policy.maxTerminalBytes
       || retainedTerminal.some((run) => now - run.metadata.terminalAtMs! >= this.policy.terminalMaxAgeMs);
     if (!options.dryRun && policyUnsatisfied)
       issues.push({ code: "POLICY_UNSATISFIED", message: "active, ambiguous, or failed removals prevent terminal retention bounds" });
-    const invalidRetained = listing.issues
+    const invalidRetained = finalInternal.issues
       .filter((issue) => issue.code === "SCAN_FAILED" && issue.runName !== undefined && RUN_NAME.test(issue.runName))
       .map((issue) => issue.runName!);
     const result: RunCleanupResult = {

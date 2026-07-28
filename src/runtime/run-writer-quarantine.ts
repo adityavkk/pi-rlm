@@ -9,6 +9,11 @@ import {
   type GenerationRecord,
 } from "./run-writer-protocol.ts";
 import type { RunWriterTerminalIdentity } from "./run-writer-arbiter.ts";
+import {
+  syncPrivateDirectory,
+  type PrivateDirectoryFileSystem,
+  type PrivateDirectoryHandle,
+} from "./run-writer-directory.ts";
 
 export type RunQuarantineState = "ACTIVE_RETENTION" | "QUARANTINE_VISIBLE_UNSYNCED" | "QUARANTINED";
 export interface RunQuarantineResult {
@@ -17,21 +22,15 @@ export interface RunQuarantineResult {
   readonly path: string;
 }
 
-export interface RunQuarantineDirectoryHandle {
-  stat(options: { readonly bigint: true }): Promise<BigIntStats>;
-  sync(): Promise<void>;
-  close(): Promise<void>;
-}
-export interface RunQuarantineFileSystem {
-  lstat(path: string): ReturnType<typeof lstat>;
+export interface RunQuarantineDirectoryHandle extends PrivateDirectoryHandle {}
+export interface RunQuarantineFileSystem extends PrivateDirectoryFileSystem {
   rename(oldPath: string, newPath: string): Promise<void>;
-  openDirectory(path: string): Promise<RunQuarantineDirectoryHandle>;
 }
 
 const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
 const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
 const nodeFileSystem: RunQuarantineFileSystem = {
-  lstat,
+  lstat: (path) => lstat(path, { bigint: true }),
   rename,
   openDirectory: (path) => open(path, constants.O_RDONLY | directoryFlag | noFollow),
 };
@@ -41,10 +40,10 @@ const QUARANTINE = /^\.pi-rlm-quarantine-([a-f0-9]{64})-([0-9]+)-([0-9]+)$/;
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
 const sameRun = (
-  stat: Awaited<ReturnType<typeof lstat>>,
+  stat: BigIntStats,
   generation: Pick<GenerationRecord, "runDev" | "runIno">,
 ): boolean => !stat.isSymbolicLink() && stat.isDirectory()
-  && BigInt(stat.dev) === generation.runDev && BigInt(stat.ino) === generation.runIno;
+  && stat.dev === generation.runDev && stat.ino === generation.runIno;
 
 export const quarantineName = (generation: GenerationRecord): string => {
   if (!TOKEN.test(generation.token)) throw new TypeError("quarantine generation token is invalid");
@@ -56,7 +55,7 @@ export const isRunQuarantineName = (name: string): boolean => QUARANTINE.test(na
 const statAttempt = async (
   path: string,
   fileSystem: RunQuarantineFileSystem,
-): Promise<Awaited<ReturnType<typeof lstat>> | undefined> => {
+): Promise<BigIntStats | undefined> => {
   try { return await fileSystem.lstat(path); }
   catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
 };
@@ -66,20 +65,11 @@ const syncRoot = async (
   generation: GenerationRecord,
   fileSystem: RunQuarantineFileSystem,
 ): Promise<void> => {
-  const handle = await fileSystem.openDirectory(root);
-  let primary: unknown;
-  try {
-    const before = await handle.stat({ bigint: true });
-    if (!before.isDirectory() || before.dev !== generation.rootDev || before.ino !== generation.rootIno)
-      throw new Error("managed root identity changed during quarantine sync");
-    await handle.sync();
-    const after = await handle.stat({ bigint: true });
-    if (!after.isDirectory() || after.dev !== generation.rootDev || after.ino !== generation.rootIno)
-      throw new Error("managed root identity changed during quarantine sync");
-  } catch (error) { primary = error; }
-  try { await handle.close(); }
-  catch (cleanup) { primary = primary === undefined ? cleanup : new AggregateError([primary, cleanup]); }
-  if (primary !== undefined) throw primary;
+  await syncPrivateDirectory(
+    root,
+    { dev: generation.rootDev, ino: generation.rootIno },
+    fileSystem,
+  );
 };
 
 /** Reconcile rename-applied-then-thrown, then make the deterministic root entry durable. */
@@ -156,7 +146,11 @@ export const scavengeRunQuarantine = async (
   const match = QUARANTINE.exec(input.name);
   if (!match || dirname(join(input.root, input.name)) !== input.root) throw new TypeError("invalid quarantine name");
   const path = join(input.root, input.name);
-  const stat = await fileSystem.lstat(path);
+  const stat = await statAttempt(path, fileSystem);
+  if (!stat) {
+    if (input.syncAfterRemove !== false) await syncPrivateDirectory(input.root, undefined, fileSystem);
+    return;
+  }
   const chain = await scanArbitrationDirectory(join(path, ARBITRATION_DIRECTORY));
   const tip = chain.tip;
   if (!tip || tip.token !== match[1] || tip.runDev.toString(10) !== match[2]
@@ -166,7 +160,7 @@ export const scavengeRunQuarantine = async (
     throw new Error("quarantine name, inode, and terminal arbitration disagree");
   try { await input.remove(path); }
   catch (removal) {
-    let residual: Awaited<ReturnType<typeof lstat>> | undefined;
+    let residual: BigIntStats | undefined;
     try { residual = await statAttempt(path, fileSystem); }
     catch (inspection) {
       throw new AggregateError([removal, inspection], "quarantine removal and residual inspection both failed");

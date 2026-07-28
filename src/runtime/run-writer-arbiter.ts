@@ -81,8 +81,8 @@ export interface AcquireRunWriterLeaseInput {
 export interface AcquireRunRetentionLeaseInput {
   readonly managedRoot: string;
   readonly runName: string;
-  /** Rechecks all deletion evidence before the irreversible final ordinal is published. */
-  readonly preflightRetirement: () => void | PromiseLike<void>;
+  /** Rechecks deletion evidence before publishing or recovering irreversible retirement. */
+  readonly preflightRetirement: (mode: "publishing" | "recovering") => void | PromiseLike<void>;
 }
 export interface CreateRunWriterGenesisInput {
   readonly managedRoot: string;
@@ -328,7 +328,13 @@ const retirePendingAcquisition = (
 ): PendingAcquisition => {
   if (pending.retired.length >= MAX_ARBITRATION_ORPHANS)
     throw new RunWriterArbiterError("WRITER_ARBITER_PENDING_CONFLICT", "retired pending generation budget exceeded");
-  const reserved = reserveAcquisition(pinned, pending.role, owner, options);
+  const reserved = reserveAcquisition(
+    pinned,
+    pending.role,
+    owner,
+    options,
+    pending.record.role === "retirement",
+  );
   const replacement = { ...reserved, retired: [...pending.retired, pending.record] };
   registry.pendingAcquisitions.set(pinned.key, replacement);
   return replacement;
@@ -392,8 +398,14 @@ export class RunWriterLease {
   }
 
   run<T>(effect: () => T | PromiseLike<T>): Promise<T> { return this.scheduler.run(effect); }
+  runOwnedTransaction<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    return this.scheduler.runOwnedTransaction(effect);
+  }
   runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
     return this.scheduler.runOwnedOperation(effect);
+  }
+  mutationIdentity(): ReturnType<PinnedRunWriterIdentity["mutationIdentity"]> {
+    return this.pinned.mutationIdentity();
   }
   release(): Promise<void> {
     if (this.role === "retirement")
@@ -541,7 +553,7 @@ export const createRunWriterGenesis = async (
 const acquireLease = async (
   input: AcquireRunWriterLeaseInput,
   suppliedOptions: RunWriterArbiterOptions,
-  preflightRetirement?: () => void | PromiseLike<void>,
+  preflightRetirement?: (mode: "publishing" | "recovering") => void | PromiseLike<void>,
 ): Promise<RunWriterLease> => {
   if (!isMainThread)
     throw new RunWriterArbiterError("WRITER_ARBITER_UNSUPPORTED_REALM", "writer ownership is restricted to the main thread");
@@ -551,8 +563,15 @@ const acquireLease = async (
   const pinned = await PinnedRunWriterIdentity.openExisting(input.managedRoot, input.runName);
   try {
     return await withRunLock(pinned.key, async () => {
-      if (registry.active.has(pinned.key))
+      const active = registry.active.get(pinned.key);
+      if (active) {
+        if (input.role === "retention" && active.record.role === "retirement" && preflightRetirement) {
+          await preflightRetirement("recovering");
+          await pinned.close();
+          return active.lease;
+        }
         throw new RunWriterArbiterError("WRITER_ARBITER_ALREADY_OWNED", "current process already owns this pinned run");
+      }
       let pending = registry.pendingAcquisitions.get(pinned.key);
       if (pending) assertPendingArbitration(pinned, pending.arbitration);
       let chain = await scanPinned(pinned, options);
@@ -560,14 +579,32 @@ const acquireLease = async (
         throw new RunWriterArbiterError("WRITER_ARBITER_NO_AUTHORITY", "existing run has no authoritative arbitration predecessor");
       if (pending && pending.role !== input.role)
         throw new RunWriterArbiterError("WRITER_ARBITER_PENDING_CONFLICT", "pending acquisition has a different role");
-      if (pending) pending = await reconcilePendingAcquisition(pinned, pending, chain, options);
-      else {
+      if (pending) {
+        pending = await reconcilePendingAcquisition(pinned, pending, chain, options);
+        if (pending.record.role === "retirement") {
+          if (input.role !== "retention" || !preflightRetirement)
+            throw new RunWriterArbiterError("WRITER_ARBITER_ORDINAL_EXHAUSTED", "final ordinal requires preflighted retention");
+          const mode = exactOwnedTip(chain, pending.record) ? "recovering" : "publishing";
+          await preflightRetirement(mode);
+          await pinned.assertValid();
+        }
+      } else {
+        if (chain.tip.role === "retirement") {
+          if (input.role !== "retention" || !preflightRetirement)
+            throw new RunWriterArbiterError("WRITER_ARBITER_ORDINAL_EXHAUSTED", "retirement recovery requires preflighted retention");
+          await assertSuccessorAllowed(pinned, chain, chain.tip, options);
+          await preflightRetirement("recovering");
+          await pinned.assertValid();
+          const lease = new RunWriterLease(chain.tip, pinned, options);
+          registry.active.set(pinned.key, { record: chain.tip, lease });
+          return lease;
+        }
         await assertSuccessorAllowed(pinned, chain, chain.tip, options);
         const needsRetirement = chain.tip.ordinal + 1 === MAX_ARBITRATION_ORDINAL;
         if (needsRetirement) {
           if (input.role !== "retention" || !preflightRetirement)
             throw new RunWriterArbiterError("WRITER_ARBITER_ORDINAL_EXHAUSTED", "final ordinal requires preflighted retention");
-          await preflightRetirement();
+          await preflightRetirement("publishing");
           await pinned.assertValid();
         }
         pending = reserveAcquisition(pinned, input.role, chain.tip, options, needsRetirement);

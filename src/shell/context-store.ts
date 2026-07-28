@@ -397,7 +397,7 @@ export class ContextStore {
     };
   }
 
-  private async beginPrepared(
+  private async beginPreparedMutation(
     prepared: readonly PreparedEntry[],
     control?: ContextOperationControl,
   ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
@@ -649,6 +649,14 @@ export class ContextStore {
       }
       throw error;
     }
+  }
+
+  private beginPrepared(
+    prepared: readonly PreparedEntry[],
+    control?: ContextOperationControl,
+  ): Promise<ContextStoreTransaction<ContextDescriptor[]>> {
+    const mutation = () => this.beginPreparedMutation(prepared, control);
+    return this.instrumentation.runTransaction?.(mutation) ?? mutation();
   }
 
   private async commitPrepared(
