@@ -525,6 +525,7 @@ const resumeCandidate = (overrides: Partial<ManagedResumeCandidateInspection> = 
   nextControllerTurn: 5,
   incompleteTailBytes: 0,
   deadlineMs: 10_000,
+  agentDelegationRequired: false,
   ...overrides,
 });
 const cleanupResult = (overrides: Partial<RunCleanupResult> = {}): RunCleanupResult => ({
@@ -993,6 +994,71 @@ describe("pi-rlm extension wiring", () => {
         : kind === "headless" ? "RLM_RESUME_AUTHORIZATION_REQUIRED"
           : kind === "denied" ? "RLM_RESUME_DENIED" : "RLM_RESUME_AUDIT_FAILED");
     }
+  });
+
+  test("current-process resumed run cancels only through its hidden local coordinator capability", async () => {
+    const coordinator = createRunCoordinator({
+      createLocalId: () => "rlm_resumed_local",
+      createControlToken: () => "t".repeat(32),
+    });
+    let resumeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { resumeStarted = resolve; });
+    let abandons = 0;
+    const backend: InterpreterBackend = {
+      id: "resume-cancel-backend", version: "1",
+      async evalCell() { throw new Error("not used"); }, async dispose() {},
+    };
+    const model: ModelClient = {
+      id: "resume-cancel-model", identity: { id: "test/resume-cancel-model", version: "1", configuration: {} },
+      async complete() { throw new Error("not used"); },
+    };
+    const controller: ControllerDriver = {
+      identity: { id: "test/resume-cancel-controller", version: "1", configuration: {} },
+      async next() { throw new Error("not used"); }, fork() { return this; },
+    };
+    const h = harness({
+      runCoordinator: coordinator,
+      runtime: {
+        resolveProfile: () => DEFAULT_PROFILE,
+        createBackend: () => backend,
+        createModel: () => model,
+        createController: () => controller,
+      },
+      inspectManagedResumeCandidate: async () => resumeCandidate(),
+      acquireManagedResumeLease: async () => ({
+        managedName: MANAGED_NAME,
+        writerIdentity: () => ({
+          managedName: MANAGED_NAME, runId: MANAGED_ID, writerOrdinal: 2, writerTokenSha256: "7".repeat(64),
+        }),
+        inspect: async () => ({
+          runId: MANAGED_ID, manifestHash: MANAGED_HASH, checkpointSequence: 3,
+          checkpointSha256: "4".repeat(64), checkpointPrefixSha256: "5".repeat(64),
+          nextIteration: 4, nextControllerTurn: 5, incompleteTailBytes: 0,
+        }),
+        resume: async (input) => {
+          resumeStarted();
+          return new Promise<RunResult>((_resolve, reject) => {
+            const abort = () => reject(input.signal.reason ?? new Error("cancelled"));
+            if (input.signal.aborted) abort();
+            else input.signal.addEventListener("abort", abort, { once: true });
+          });
+        },
+        finish: async () => {},
+        abandon: async () => { abandons++; },
+      }),
+      cleanupManagedRuns: async () => cleanupResult(),
+      authorizeResume: async () => true,
+    });
+    h.setMode("print");
+    const pending = h.commands.get("rlm")!.handler(`resume ${MANAGED_NAME}`, h.ctx);
+    await started;
+    expect(coordinator.resolve(MANAGED_NAME)?.localId).toBe("rlm_resumed_local");
+    await h.commands.get("rlm")!.handler(`cancel ${MANAGED_NAME}`, h.ctx);
+    expect(coordinator.resolve(MANAGED_NAME)?.state).toBe("running");
+    await h.commands.get("rlm")!.handler("cancel rlm_resumed_local", h.ctx);
+    await pending;
+    expect(abandons).toBe(1);
+    expect(coordinator.resolve("rlm_resumed_local")?.terminal).toMatchObject({ status: "cancelled" });
   });
 
   test("session change during resume approval suppresses late results and releases the exact lease", async () => {

@@ -240,6 +240,17 @@ process.stdout.write(JSON.stringify({
 NODE
 run_pi installed
 
+prepare_case managed-commands
+(
+  cd "$tmp_dir/managed-commands/fixture"
+  runtime_network_denied "$tmp_dir/managed-commands" "$env_bin" \
+    NO_COLOR=1 \
+    PI_OFFLINE=1 \
+    PI_TELEMETRY=0 \
+    PI_SKIP_VERSION_CHECK=1 \
+    bun test "$tmp_dir/managed-commands/fixture/node_modules/pi-rlm/src/extension/managed-commands.public.integration.test.ts"
+)
+
 prepare_case active-subagents
 set -m
 (

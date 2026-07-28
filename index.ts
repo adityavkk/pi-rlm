@@ -193,7 +193,8 @@ const sameResumeCandidate = (
   && left.journalPrefixSha256 === right.journalPrefixSha256
   && left.nextIteration === right.nextIteration
   && left.nextControllerTurn === right.nextControllerTurn
-  && left.deadlineMs === right.deadlineMs;
+  && left.deadlineMs === right.deadlineMs
+  && left.agentDelegationRequired === right.agentDelegationRequired;
 
 const resumeErrorProjection = (error: unknown, managedName: string): RlmManagementMetadata => {
   const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
@@ -905,7 +906,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       const controller = (dependencies.runtime?.createController
         ?? ((client: ModelClient, selectedProfile: Profile) =>
           new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
-      const agentDelegation = extensionAgentDelegation(
+      const agentDelegation = candidate.agentDelegationRequired ? extensionAgentDelegation(
         ctx,
         sessionId,
         generation,
@@ -921,7 +922,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           }),
         },
         dependencies.runtime?.agentPolicy,
-      );
+      ) : undefined;
       preflightRunComponents({ backend, model, controller, ...(agentDelegation ? {
         agentDelegation: prepareAgentDelegation(agentDelegation)!,
       } : {}) });

@@ -36,7 +36,14 @@ Pre-run cleanup fails closed. Once `runProgram` returns an authoritative complet
 
 `ManagedRunStore.list()` and `listManagedRuns()` return lifecycle metadata, activity classification, exact bytes, and typed issues for TUI/host consumption. `ManagedRunStore.cleanup()` and `cleanupManagedRuns()` support `{ dryRun: true }` and `{ force: true }`. Force includes all safely inactive terminal runs, but still preserves live, ambiguous, malformed, and not-yet-abandoned nonterminal runs.
 
-`ManagedRunStore.openForResume(exactRunName)` acquires a writer successor only for an active, manifest-bound managed run. It refreshes the owner marker while holding pinned writer authority and returns the same finalization/abandon lifecycle used by fresh runs. Terminal lifecycle state, custom directories, unsafe names, live or ambiguous writers, and changed metadata are rejected.
+`ManagedRunStore.openForResume(exactRunName)` acquires a writer successor only for an active, manifest-bound managed run. It refreshes the owner marker while holding pinned writer authority and returns the same finalization/abandon lifecycle used by fresh runs. The extension wraps it in an opaque resume lease and exposes only the managed name, run ID, generation ordinal, and SHA-256 of the writer token to authorization. Terminal lifecycle state, custom directories, unsafe names, live or ambiguous writers, and changed metadata are rejected.
+
+The strict textual forms are `/rlm cleanup --dry-run`, `/rlm cleanup`, and
+`/rlm cleanup --force`. Apply and force append a bounded host audit before calling
+this API; audit failure performs no mutation. Dry-run is explicitly advisory.
+All three return bounded names/counts only, never roots, paths, lifecycle owners,
+exception causes, or arbitration tokens. Resume and cleanup contend through the
+same writer/retention generation chain, so only one exact successor wins.
 
 Retention is ordinary filesystem deletion. pi-rlm makes no secure-erasure claim; storage snapshots, journals, and flash translation layers may retain prior blocks.
 

@@ -449,6 +449,7 @@ export interface ManagedResumeCandidateInspection {
   readonly nextControllerTurn: number;
   readonly incompleteTailBytes: number;
   readonly deadlineMs: number;
+  readonly agentDelegationRequired: boolean;
 }
 
 /** Effect-free, metadata-only resume preflight over one exact managed name. */
@@ -484,6 +485,7 @@ export const inspectManagedResumeCandidate = async (
     nextControllerTurn: checkpoint.nextControllerTurn,
     incompleteTailBytes: checkpoint.incompleteTailBytes,
     deadlineMs: snapshot.document.manifest.limits.deadlineMs,
+    agentDelegationRequired: snapshot.document.manifest.components.agentDelegation !== null,
   });
 };
 

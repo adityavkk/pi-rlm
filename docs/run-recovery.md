@@ -27,7 +27,32 @@ Terminal inspection does not invoke a model, controller, interpreter, delegated 
 
 `ManagedRunStore.openForResume(runName)` acquires the exact append-only writer successor and returns a lease-bound lifecycle. `resumeProgram()` accepts only that managed lifecycle. It validates manifest schema v5, permanent claim, exact current backend/model/controller/extractor/delegation identities, the journal-tail checkpoint, every retained payload, and exact hydrated ledger/cache/key/artifact/ordinal state before invoking runtime components. It repairs only a parser-proven incomplete final JSONL record after validation and writer acquisition. Terminal, unresolved-intent, no-checkpoint, authoritative-tail, corrupt, incompatible, and unsupported active states fail typed.
 
-Continuation reopens no run or root frame events. It starts the root at the checkpoint's next iteration and next global controller turn under the original absolute deadline. Host authorization and slash-command integration remain tracked by issue #86.
+Continuation reopens no run or root frame events. It starts the root at the checkpoint's next iteration and next global controller turn under the original absolute deadline.
+
+## Host resume command
+
+`/rlm resume run-<32 lowercase hex>` is the only host continuation form. Paths,
+internal run IDs, local/stale aliases, custom directories, and trailing arguments
+are rejected by routing before source capture. The host performs metadata-only
+inspection before writer acquisition, acquires and holds the exact managed writer
+generation, then rereads manifest/checkpoint authority before authorization.
+
+Resume grants are separate from launch grants. A fresh exact one-shot grant binds
+the Pi session, authorization generation, command nonce/origin, managed name,
+run ID, manifest hash, checkpoint sequence/payload hash/journal-prefix hash,
+writer ordinal/token hash, host mode, and TTL. Only the token hash is displayed or
+audited. Approval and its durable audit precede backend, model, and controller
+construction. Exact component/checkpoint preflight then runs without restore or
+provider invocation. The envelope is rebuilt from the held lease immediately
+before one-shot consumption; `resumeProgram()` is entered next, before hydration
+or any external operation.
+
+TUI uses an exact confirmation dialog. RPC, print, and JSON fail closed unless the
+embedding host explicitly supplies `authorizeResume`. Switch, fork, resume,
+shutdown, abort, denial, expiry, stale identity, and replay invalidate authority
+and release the held lease. Late async work cannot publish into a replacement
+session. The coordinator binds the existing managed name/run ID; cancellation is
+available only through its current-process local alias capability.
 
 ## Limits
 
