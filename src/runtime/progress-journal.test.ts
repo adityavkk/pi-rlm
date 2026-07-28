@@ -112,7 +112,9 @@ const rejectCompleteCellBatchFileSystem = (dir: string): JournalFileSystem => {
       await handle.appendFile(data, encoding);
     },
     close: () => handle.close(),
+    read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
     readFile: () => handle.readFile(),
+    stat: () => handle.stat(),
     sync: () => handle.sync(),
     truncate: (length) => handle.truncate(length),
     writeFile: (data, encoding) => handle.writeFile(data, encoding),
@@ -139,7 +141,9 @@ const delayedFirstCellBatchFileSystem = (dir: string): {
       await handle.appendFile(data, encoding);
     },
     close: () => handle.close(),
+    read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
     readFile: () => handle.readFile(),
+    stat: () => handle.stat(),
     sync: () => handle.sync(),
     truncate: (length) => handle.truncate(length),
     writeFile: (data, encoding) => handle.writeFile(data, encoding),

@@ -36,6 +36,8 @@ Pre-run cleanup fails closed. Once `runProgram` returns an authoritative complet
 
 `ManagedRunStore.list()` and `listManagedRuns()` return lifecycle metadata, activity classification, exact bytes, and typed issues for TUI/host consumption. `ManagedRunStore.cleanup()` and `cleanupManagedRuns()` support `{ dryRun: true }` and `{ force: true }`. Force includes all safely inactive terminal runs, but still preserves live, ambiguous, malformed, and not-yet-abandoned nonterminal runs.
 
+`ManagedRunStore.openForResume(exactRunName)` acquires a writer successor only for an active, manifest-bound managed run. It refreshes the owner marker while holding pinned writer authority and returns the same finalization/abandon lifecycle used by fresh runs. Terminal lifecycle state, custom directories, unsafe names, live or ambiguous writers, and changed metadata are rejected.
+
 Retention is ordinary filesystem deletion. pi-rlm makes no secure-erasure claim; storage snapshots, journals, and flash translation layers may retain prior blocks.
 
 Node does not expose `openat`/`renameat`-style directory-handle-relative operations. Deterministic inode-bound quarantines, no-follow checks, pinned identities, and pre/post operation validation narrow path-swap windows but cannot eliminate malicious same-user filesystem swaps. This is retention hardening, not an OS sandbox or a claim that pi-rlm isolates hostile local processes.

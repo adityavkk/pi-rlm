@@ -16,12 +16,13 @@ import { RunRecoveryError } from "./run-recovery-types.ts";
 type TerminalEvent = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
 type AnswerEvent = Extract<RlmEvent, { type: "answer_committed" }>;
 type CallEvent = Extract<RlmEvent, { type: "call_committed" }>;
+type CheckpointEvent = Extract<RlmEvent, { type: "checkpoint_committed" }>;
 export interface RecoveryContentReference {
-  readonly role: "input" | "workspace" | "call" | "answer";
+  readonly role: "input" | "workspace" | "call" | "answer" | "checkpoint";
   readonly id: string;
   readonly sha256: string;
   readonly bytes: number;
-  readonly event?: CallEvent | AnswerEvent;
+  readonly event?: CallEvent | AnswerEvent | CheckpointEvent;
 }
 
 export interface RecoveryJournalModel {
@@ -74,6 +75,26 @@ const semanticError = (message: string): never => {
   throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", message);
 };
 
+const recoveryKeyRegistryId = (runId: string, event: Extract<RlmEvent, { type: "key_bound" }>): string => {
+  if (event.kind !== "recurse") return `${event.kind}\0${event.key}`;
+  if (event.frameId === `${runId}:f0`) return `${event.kind}\0${event.frameId}\0${event.key}`;
+  const prefix = `${runId}:frame:`;
+  const match = event.frameId.startsWith(prefix)
+    ? /^(call_recurse_[a-f0-9]{64}):e[1-9][0-9]*$/.exec(event.frameId.slice(prefix.length))
+    : null;
+  if (!match?.[1]) return semanticError("recurse key binding has an invalid frame lineage");
+  return `${event.kind}\0${match[1]}\0${event.key}`;
+};
+
+const operationKeyRegistryId = (kind: "llm" | "agent", key: string): string => `${kind}\0${key}`;
+
+/** Global llm/agent executions may legitimately retry from another frame. */
+export const recoveryCallRetryFrameCompatible = (
+  prior: Pick<CallEvent, "frameId" | "kind">,
+  current: Pick<CallEvent, "frameId" | "kind">,
+): boolean => prior.kind === current.kind
+  && ((current.kind === "llm" || current.kind === "agent") || prior.frameId === current.frameId);
+
 const rememberExact = <K, T>(registry: Map<K, T>, key: K, event: T, label: string): boolean => {
   const existing = registry.get(key);
   if (!existing) {
@@ -89,11 +110,44 @@ const reference = (
   id: string | undefined,
   digest: string | undefined,
   bytes: number | undefined,
-  event?: CallEvent | AnswerEvent,
+  event?: CallEvent | AnswerEvent | CheckpointEvent,
 ): RecoveryContentReference => {
   if (id === undefined || digest === undefined || bytes === undefined || id !== `ctx_${digest}`)
     throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", `${role} event lacks complete content identity`);
   return { role, id, sha256: digest, bytes, ...(event ? { event } : {}) };
+};
+
+const validateRecurseExecutionBijection = (
+  runId: string,
+  frames: ReadonlyMap<string, FrameRecord>,
+  calls: ReadonlyMap<string, readonly CallEvent[]>,
+): void => {
+  const childExecutions = new Map<string, Array<{ ordinal: number; frame: FrameRecord }>>();
+  for (const frame of frames.values()) {
+    if (frame.opened.parentFrameId === null) continue;
+    const prefix = `${runId}:frame:`;
+    const suffix = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
+    const match = /^(call_recurse_[a-f0-9]{64}):e([1-9][0-9]*)$/.exec(suffix);
+    if (!match || !frame.closed) semanticError("closed child frame has an invalid recurse execution identity");
+    const callId = match![1]!;
+    const grouped = childExecutions.get(callId) ?? [];
+    grouped.push({ ordinal: Number(match![2]), frame });
+    childExecutions.set(callId, grouped);
+  }
+  for (const [callId, executions] of calls) {
+    const last = executions.at(-1)!;
+    if (last.kind !== "recurse") continue;
+    const children = (childExecutions.get(callId) ?? []).sort((left, right) => left.ordinal - right.ordinal);
+    if (children.length !== executions.length) semanticError("recurse call executions do not match child frames");
+    children.forEach((child, index) => {
+      const call = executions[index]!;
+      if (child.ordinal !== index + 1 || call.frameId !== child.frame.opened.parentFrameId
+        || call.kind !== "recurse" || call.ok !== (child.frame.closed?.state === "answered"))
+        semanticError("recurse call execution does not match its child frame");
+    });
+    childExecutions.delete(callId);
+  }
+  if (childExecutions.size > 0) semanticError("closed child frame lacks its recurse call execution");
 };
 
 /** Strict semantic fold. It does not trust the lossy status projection. */
@@ -145,6 +199,7 @@ export const validateRecoveryJournal = (
   let tokensReserved = 0;
   let tokensUsed = 0;
   let childFrames = 0;
+  let checkpointSequence = 0;
   let terminal: TerminalEvent | undefined;
 
   const requireFrame = (frameId: string): FrameRecord => {
@@ -229,7 +284,7 @@ export const validateRecoveryJournal = (
         break;
       }
       case "key_bound":
-        rememberExact(keys, `${event.frameId}\0${event.kind}\0${event.key}`, event, "key binding");
+        rememberExact(keys, recoveryKeyRegistryId(runId, event), event, "key binding");
         break;
       case "agent_approval":
         rememberExact(approvals, `${event.frameId}\0${event.callId}`, event, "agent approval");
@@ -277,7 +332,7 @@ export const validateRecoveryJournal = (
             semanticError("extractor operation lacks its authoritative fallback projection");
         } else {
           const expectedPrefix = event.kind === "llm" ? "call_llm_" : "call_agent_";
-          const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
+          const binding = keys.get(operationKeyRegistryId(event.kind, event.key));
           const expectedCallId = binding ? `${expectedPrefix}${sha256(canonicalStringify({
             runId,
             kind: event.kind,
@@ -355,14 +410,42 @@ export const validateRecoveryJournal = (
         settlements.set(event.intentId, event);
         break;
       }
+      case "checkpoint_committed": {
+        if (event.runId !== runId || event.manifestHash !== document.manifestHash || event.frameId !== rootFrameId)
+          throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "checkpoint identity does not match the run manifest");
+        if (event.checkpointSequence !== checkpointSequence + 1)
+          semanticError("checkpoint sequences are not contiguous");
+        if (event.nextIteration !== (frames.get(rootFrameId)?.cells.size ?? 0) + 1
+          || event.nextControllerTurn !== committedControllerTurns + 1)
+          semanticError("checkpoint continuation does not match the next controller turn");
+        if ([...intents.keys()].some((intentId) => !settlements.has(intentId)) || tokensReserved !== 0)
+          semanticError("checkpoint was committed with an unsettled external operation");
+        const openFrames = [...frames.values()].filter((candidate) => !candidate.closed);
+        if (openFrames.length !== 1 || openFrames[0]?.opened.frameId !== rootFrameId)
+          semanticError("checkpoint was not committed at a quiescent root-frame boundary");
+        validateRecurseExecutionBijection(runId, frames, calls);
+        checkpointSequence = event.checkpointSequence;
+        content.push(reference(
+          "checkpoint",
+          event.checkpointRef,
+          event.checkpointSha256,
+          event.checkpointBytes,
+          event,
+        ));
+        break;
+      }
       case "call_committed": {
-        const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
+        const binding = event.kind === "llm" || event.kind === "agent"
+          ? keys.get(operationKeyRegistryId(event.kind, event.key))
+          : keys.get(recoveryKeyRegistryId(runId, event as unknown as Extract<RlmEvent, { type: "key_bound" }>));
         if (!binding || event.cached) semanticError("committed call lacks one prior key binding");
         const executions = calls.get(event.callId) ?? [];
         const prior = executions.at(-1);
-        if (prior && same(prior, event)) break;
-        if (prior && (prior.frameId !== event.frameId || prior.kind !== event.kind || prior.key !== event.key
-          || prior.ok)) semanticError("invalid repeated call execution");
+        // Recurse retries may produce byte-identical failed executions while opening
+        // distinct child frame IDs. Preserve each execution for frame/call bijection.
+        if (prior && event.kind !== "recurse" && same(prior, event)) break;
+        if (prior && (!recoveryCallRetryFrameCompatible(prior, event) || prior.key !== event.key || prior.ok))
+          semanticError("invalid repeated call execution");
         if (event.kind === "llm" || event.kind === "agent") {
           const expectedCallId = `call_${event.kind}_${sha256(canonicalStringify({
             runId,
@@ -372,8 +455,9 @@ export const validateRecoveryJournal = (
           }))}`;
           const operation = operations.get(`${event.frameId}\0${event.callId}`);
           const segment = operation?.segments.at(-1);
-          if (event.callId !== expectedCallId || !event.ok || operation?.kind !== event.kind || !segment
-            || segment.settlements !== segment.intents.length || segment.outcomes.at(-1)?.outcome !== "ok"
+          const operationSucceeded = segment?.outcomes.at(-1)?.outcome === "ok";
+          if (event.callId !== expectedCallId || operation?.kind !== event.kind || !segment
+            || segment.settlements !== segment.intents.length || event.ok !== operationSucceeded
             || !same(event.usage, segment.usage))
             semanticError("committed call identity or usage does not match authoritative operation settlements");
         }
@@ -448,32 +532,7 @@ export const validateRecoveryJournal = (
   if (terminal) {
     for (const frame of frames.values()) if (!frame.closed) semanticError("terminal run has an open frame");
     if (terminal.type === "run_completed") {
-      const childExecutions = new Map<string, Array<{ ordinal: number; frame: FrameRecord }>>();
-      for (const frame of frames.values()) {
-        if (frame.opened.parentFrameId === null) continue;
-        const prefix = `${runId}:frame:`;
-        const suffix = frame.opened.frameId.startsWith(prefix) ? frame.opened.frameId.slice(prefix.length) : "";
-        const match = /^(call_recurse_[a-f0-9]{64}):e([1-9][0-9]*)$/.exec(suffix);
-        if (!match)
-          throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "completed child frame has an invalid execution identity");
-        const grouped = childExecutions.get(match[1]!) ?? [];
-        grouped.push({ ordinal: Number(match[2]), frame });
-        childExecutions.set(match[1]!, grouped);
-      }
-      for (const [callId, executions] of calls) {
-        const last = executions.at(-1)!;
-        if (last.kind !== "recurse") continue;
-        const children = (childExecutions.get(callId) ?? []).sort((left, right) => left.ordinal - right.ordinal);
-        if (children.length !== executions.length) semanticError("recurse call executions do not match child frames");
-        children.forEach((child, index) => {
-          const call = executions[index]!;
-          if (child.ordinal !== index + 1 || call.frameId !== child.frame.opened.parentFrameId
-            || call.kind !== "recurse" || call.ok !== (child.frame.closed?.state === "answered"))
-            semanticError("recurse call execution does not match its child frame");
-        });
-        childExecutions.delete(callId);
-      }
-      if (childExecutions.size > 0) semanticError("completed child frame lacks its recurse call execution");
+      validateRecurseExecutionBijection(runId, frames, calls);
       if (!root?.answer || root.closed?.state !== "answered" || root.answer.completionMode !== terminal.completionMode
         || terminal.outputRef === undefined || terminal.outputRef !== root.answer.outputRef)
         throw new RunRecoveryError("RECOVERY_TERMINAL_INCONSISTENT", "completed terminal lacks one matching root answer");

@@ -30,6 +30,7 @@ import { errResult, type GuestCallResult, okResult } from "./call-result.ts";
 import { outputContractErrorMessage, validateOutputContract } from "./output-validation.ts";
 import type { Cell, ControllerDriver } from "./controller.ts";
 import type { FrameRef, InternalRunState } from "./state.ts";
+import type { FrameCheckpointContinuation } from "./checkpoint-types.ts";
 import { notifyControllerTurnReserved } from "./testing/controller-turn-observer.ts";
 
 export interface FrameResult {
@@ -92,16 +93,28 @@ export const runFrame = async (
   controller: ControllerDriver,
   signal: AbortSignal,
   ownerDeadlineMs = Number.POSITIVE_INFINITY,
+  continuation?: FrameCheckpointContinuation,
 ): Promise<FrameResult> => {
-  let workspace: JsonValue = {};
-  let entries: readonly TrajectoryEntry[] = [];
-  let lastOutcome: { kind: string; preview?: string; message?: string } | undefined;
+  if (continuation && (continuation.frame.frameId !== frame.frameId || continuation.frame.depth !== frame.depth))
+    throw new Error("frame continuation identity mismatch");
+  let workspace: JsonValue = continuation?.workspace ?? {};
+  let entries: readonly TrajectoryEntry[] = continuation?.entries ?? [];
+  let lastOutcome: { kind: string; preview?: string; message?: string } | undefined = continuation?.lastOutcome;
+  const commitCheckpoint = async (nextIteration: number): Promise<void> => {
+    await state.checkpoint?.commit({
+      frame,
+      nextIteration,
+      workspace,
+      entries,
+      ...(lastOutcome ? { lastOutcome } : {}),
+    });
+  };
 
   const cancelled = (): FrameResult => ({ exhausted: false, cancelled: true, workspace, entries });
   const recurseFn = (args: JsonValue, cellSignal: AbortSignal, deadlineMs: number): Promise<GuestCallResult> =>
     runChild(state, frame, controller, args, cellSignal, deadlineMs);
 
-  for (let iteration = 1; ; iteration++) {
+  for (let iteration = continuation?.nextIteration ?? 1; ; iteration++) {
     if (signal?.aborted) return cancelled();
     if (state.clock.now() >= state.ledger.current.limits.deadlineMs)
       return { exhausted: false, deadline: true, workspace, entries };
@@ -172,6 +185,7 @@ export const runFrame = async (
       });
       if (signal?.aborted) return cancelled();
       lastOutcome = { kind: "parse_error", message: transformed.error.message };
+      await commitCheckpoint(iteration + 1);
       continue;
     }
 
@@ -353,6 +367,7 @@ export const runFrame = async (
     }]);
     if (signal?.aborted) return cancelled();
     lastOutcome = error ? { kind: "error", message: error.message } : { kind: "value", preview };
+    await commitCheckpoint(iteration + 1);
   }
 };
 
@@ -415,6 +430,7 @@ const runChild = async (
       state.scopeUsage.set(callId, ZERO_CALL_USAGE);
       const execution = (state.recurseExecutions.get(callId) ?? 0) + 1;
       state.recurseExecutions.set(callId, execution);
+      state.frameSeq.current += 1;
       const childFrameId = `${state.runId}:frame:${callId}:e${execution}`;
       await state.journal.append({ type: "frame_opened", frameId: childFrameId, parentFrameId: parentFrame.frameId, depth: parentFrame.depth + 1, objective });
       state.progress?.frameOpened();

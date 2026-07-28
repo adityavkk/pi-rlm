@@ -23,7 +23,7 @@ import {
   prepareAgentDelegation,
   type AgentDelegationConfig,
 } from "./agent-delegation.ts";
-import type { ControllerDriver } from "./controller.ts";
+import { inspectControllerResumeCapability, type ControllerDriver } from "./controller.ts";
 import {
   buildExtractorModelRequest,
   normalizeExtractorResult,
@@ -58,6 +58,8 @@ import {
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 import { MANAGED_RUN_PERSISTENCE, type ManagedRunPersistenceCarrier } from "./run-managed-lifecycle.ts";
+import { RunCheckpointWriter } from "./checkpoint-persistence.ts";
+import { RunCheckpointStore } from "./checkpoint-store.ts";
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
@@ -131,8 +133,8 @@ export interface RunResult {
   readonly ledger: Ledger;
 }
 
-type Phase = "journal" | "source" | "controller" | "extractor" | "context";
-type PlannedResult = Omit<RunResult, "ledger">;
+export type Phase = "journal" | "source" | "controller" | "extractor" | "context";
+export type PlannedResult = Omit<RunResult, "ledger">;
 
 const safeCause = (error: unknown): RunError["cause"] => {
   if (!error || typeof error !== "object") return undefined;
@@ -146,7 +148,7 @@ const safeCause = (error: unknown): RunError["cause"] => {
   return { name, ...(code ? { code } : {}) };
 };
 
-const failure = (runId: string, code: string, message: string, cause?: unknown): PlannedResult => ({
+export const failure = (runId: string, code: string, message: string, cause?: unknown): PlannedResult => ({
   runId,
   status: "failed",
   error: {
@@ -156,13 +158,13 @@ const failure = (runId: string, code: string, message: string, cause?: unknown):
   },
 });
 
-const cancellation = (runId: string): PlannedResult => ({
+export const cancellation = (runId: string): PlannedResult => ({
   runId,
   status: "cancelled",
   error: { code: "CANCELLED", message: "run cancelled by owner" },
 });
 
-const exceptionResult = (
+export const exceptionResult = (
   runId: string,
   phase: Phase,
   error: unknown,
@@ -301,7 +303,7 @@ const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): Plann
 };
 
 /** Close every successfully opened frame, then append the sole run terminal. */
-const finalize = async (
+export const finalize = async (
   journal: JournalStore,
   rootFrameId: string,
   initial: PlannedResult,
@@ -430,6 +432,7 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
     ...(input.extractor ? { extractor: input.extractor } : {}),
     ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
   });
+  const controllerResume = inspectControllerResumeCapability(input.controller);
   const clock = input.clock ?? systemClock;
   const profile = input.profile ?? DEFAULT_PROFILE;
   const startMs = clock.now();
@@ -585,6 +588,10 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
 
     const controllerTurnObserver = resolveControllerTurnObserver(input.signal);
     const agentDelegationRuntime = bindAgentDelegationRuntime(preparedAgentDelegation, scope.signal);
+    let checkpointWriter: RunCheckpointWriter | undefined;
+    const checkpoint = managedPersistence ? {
+      commit: (continuation: Parameters<RunCheckpointWriter["commit"]>[0]) => checkpointWriter!.commit(continuation),
+    } : undefined;
     const state: InternalRunState = {
       runId,
       startMs,
@@ -611,8 +618,18 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
       agentAttempts: new Map(),
       recurseExecutions: new Map(),
       frameSeq: { current: 1 },
+      ...(checkpoint ? { checkpoint } : {}),
       progress,
     };
+    if (managedPersistence) {
+      checkpointWriter = new RunCheckpointWriter({
+        state,
+        document,
+        checkpointStore: new RunCheckpointStore(input.dir, profile.storedByteLimit, contextInstrumentation),
+        ...(controllerResume ? { controllerResume } : {}),
+        signal: scope.signal,
+      });
+    }
     progress.setRuntimeGetter(() => ({ activeCalls: state.inflight.size }));
     const rootFrame: FrameRef = {
       frameId: rootFrameId,

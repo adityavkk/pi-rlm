@@ -78,6 +78,8 @@ export interface RunProgressTrackerOptions {
   readonly ledger: () => Ledger;
   readonly now: () => number;
   readonly observer?: RunProgressObserver;
+  /** Recovery-only exact historical frame count; root remains the sole active frame. */
+  readonly initialFramesTotal?: number;
 }
 
 const PHASES = new Set<string>(RUN_PROGRESS_PHASES);
@@ -122,7 +124,7 @@ export const createRunProgressTracker = (options: RunProgressTrackerOptions): Ru
   let phase: RunProgressPhase = "initializing";
   let status: RunProgressStatus = "running";
   let runId: string | undefined;
-  let framesTotal = 1;
+  let framesTotal = integer(options.initialFramesTotal ?? 1);
   let framesActive = 1;
   const failedCallIds = new Set<string>();
   let runtimeGetter: (() => RuntimeCounters) | undefined;

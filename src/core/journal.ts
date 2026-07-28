@@ -104,6 +104,24 @@ export type RlmEvent =
   | OperationIntendedEvent
   | OperationSettledEvent
   | {
+      readonly type: "checkpoint_committed";
+      readonly schemaVersion: 1;
+      readonly checkpointVersion: "pi-rlm.checkpoint.v1";
+      readonly checkpointId: string;
+      readonly runId: string;
+      readonly frameId: string;
+      readonly manifestHash: string;
+      readonly checkpointSequence: number;
+      readonly checkpointRef: string;
+      readonly checkpointSha256: string;
+      readonly checkpointBytes: number;
+      readonly journalPrefixSha256: string;
+      readonly journalPrefixBytes: number;
+      readonly journalPrefixEventCount: number;
+      readonly nextIteration: number;
+      readonly nextControllerTurn: number;
+    }
+  | {
       readonly type: "call_committed";
       readonly frameId: string;
       readonly callId: string;
@@ -249,9 +267,12 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       case "fallback_evidence_cited":
       case "operation_intended":
       case "operation_settled":
+      case "checkpoint_committed":
         break;
       case "key_bound": {
-        const registryKey = `${event.frameId}\u0000${event.kind}\u0000${event.key}`;
+        const registryKey = event.kind === "recurse"
+          ? `${event.frameId}\u0000${event.kind}\u0000${event.key}`
+          : `${event.kind}\u0000${event.key}`;
         if (!keyBindings.has(registryKey)) keyBindings.set(registryKey, {
           frameId: event.frameId,
           kind: event.kind,

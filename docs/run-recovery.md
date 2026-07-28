@@ -23,8 +23,12 @@ Completed runs return the exact answer and content identity from the authoritati
 
 Terminal inspection does not invoke a model, controller, interpreter, delegated agent, or retention write. Terminal runs remain immutable.
 
-## Limits
+## Managed continuation
 
-This API does not acquire writer ownership or continue execution. Issues #83 to #86 add the writer lease, operation intents, state checkpoint, runtime hydration, authorization, and host commands.
+`ManagedRunStore.openForResume(runName)` acquires the exact append-only writer successor and returns a lease-bound lifecycle. `resumeProgram()` accepts only that managed lifecycle. It validates manifest schema v5, permanent claim, exact current backend/model/controller/extractor/delegation identities, the journal-tail checkpoint, every retained payload, and exact hydrated ledger/cache/key/artifact/ordinal state before invoking runtime components. It repairs only a parser-proven incomplete final JSONL record after validation and writer acquisition. Terminal, unresolved-intent, no-checkpoint, authoritative-tail, corrupt, incompatible, and unsupported active states fail typed.
+
+Continuation reopens no run or root frame events. It starts the root at the checkpoint's next iteration and next global controller turn under the original absolute deadline. Host authorization and slash-command integration remain tracked by issue #86.
+
+## Limits
 
 Node cannot open a path relative to a retained directory descriptor through `openat`. The code checks the opened file descriptor and rereads the journal, but a process with the same user account can still replace a parent pathname between checks. This extension does not claim to be an operating system sandbox.

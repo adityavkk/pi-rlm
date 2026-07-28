@@ -15,6 +15,7 @@ import type { Profile } from "./profile.ts";
 import type { RunOperationAuthority } from "./operation-authority.ts";
 import type { RunProgressTracker } from "./run-progress.ts";
 import type { Semaphore } from "./semaphore.ts";
+import type { FrameCheckpointContinuation } from "./checkpoint-types.ts";
 
 export interface ArtifactDescriptor {
   readonly id: string;
@@ -25,7 +26,8 @@ export interface ArtifactDescriptor {
 }
 
 export interface KeyIdentityBinding {
-  readonly canonicalIdentity: string;
+  /** Present for live claims; recovered durable bindings retain only their non-secret hash. */
+  readonly canonicalIdentity?: string;
   readonly identityHash: string;
   readonly ready: Promise<void>;
   state: "pending" | "durable" | "durable_failed";
@@ -72,6 +74,8 @@ export interface RunState {
   /** Stable per-call recurse execution ordinal. Retries must not reopen one frame identity. */
   readonly recurseExecutions: Map<string, number>;
   readonly frameSeq: { current: number };
+  /** Managed root-frame checkpoint sink. Returns false when global quiescence is not proven. */
+  readonly checkpoint?: { commit(continuation: FrameCheckpointContinuation): Promise<boolean> };
   readonly progress?: RunProgressTracker;
 }
 

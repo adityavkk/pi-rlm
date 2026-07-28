@@ -1,8 +1,10 @@
 /** Source-bound run identity, durable directory claim, and resume-validation hooks. */
 
 import { randomUUID } from "node:crypto";
+import { constants, type Stats } from "node:fs";
 import { open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { checkpointControlFailure } from "./checkpoint-failure.ts";
 import type { BudgetLimits } from "../core/budget.ts";
 import type { RuntimeComponentIdentity } from "../core/identity.ts";
 import { canonicalStringify, parseJsonValue, type JsonValue } from "../core/json.ts";
@@ -10,7 +12,12 @@ import { normalizeProgram, type RlmProgram } from "../core/program.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
 import type { ModelClient } from "../shell/model/client.ts";
-import type { ControllerDriver } from "./controller.ts";
+import {
+  CONTROLLER_RESUME_CAPABILITY_VERSION,
+  inspectControllerResumeCapability,
+  type ControllerDriver,
+  type ControllerResumeCapabilityIdentityV1,
+} from "./controller.ts";
 import {
   buildBasePrompt,
   CELL_SCHEMA,
@@ -25,12 +32,15 @@ import {
 } from "./extractor.ts";
 import { validateProfile, type Profile } from "./profile.ts";
 
-export const RUN_MANIFEST_SCHEMA_VERSION = 3;
+export const RUN_MANIFEST_SCHEMA_VERSION = 5;
 export const RLM_RUNTIME_VERSION = "0.0.2";
 export const RLM_DSL_VERSION = "0.2.0";
 export { CONTROLLER_PROMPT_VERSION, CONTROLLER_TURN_VERSION, EXTRACTOR_PROMPT_VERSION };
 export const RUN_MANIFEST_FILE = "manifest.json";
 export const RUN_LOCK_FILE = ".pi-rlm-run.lock";
+export const MAX_RUN_MANIFEST_BYTES = 2 * 1024 * 1024;
+export const MAX_RUN_LOCK_BYTES = 4096;
+const noFollow = constants.O_NOFOLLOW ?? 0;
 
 export type LaunchAuthorizationMode = "confirmed" | "slash_command" | "direct";
 
@@ -62,6 +72,7 @@ export interface RunManifest {
   readonly components: {
     readonly model: RuntimeComponentIdentity;
     readonly controller: RuntimeComponentIdentity;
+    readonly controllerResume: ControllerResumeCapabilityIdentityV1 | null;
     readonly extractor: RuntimeComponentIdentity | null;
     readonly agentDelegation: RuntimeComponentIdentity | null;
   };
@@ -276,6 +287,7 @@ export const preflightRunComponents = (input: RunComponentPreflightInput): RunCo
       components: {
         model: suppliedIdentity(input.model, "model"),
         controller: suppliedIdentity(input.controller, "controller"),
+        controllerResume: inspectControllerResumeCapability(input.controller)?.identity ?? null,
         extractor: input.extractor ? suppliedIdentity(input.extractor, "extractor") : null,
         agentDelegation: input.agentDelegation ? suppliedIdentity(input.agentDelegation, "agentDelegation") : null,
       },
@@ -320,6 +332,19 @@ const promptBindings = (
 const computeManifestHash = (manifest: unknown): string =>
   sha256(canonicalStringify(plainJson(manifest, "run manifest")));
 
+/** Require exact behavior-affecting component identity for checkpoint continuation. */
+export const assertRunComponentsCompatible = (
+  document: RunManifestDocument,
+  input: RunComponentPreflightInput,
+): void => {
+  const current = preflightRunComponents(input);
+  if (canonicalStringify(plainJson(current.backend, "current backend identity"))
+      !== canonicalStringify(plainJson(document.manifest.backend, "manifest backend identity"))
+    || canonicalStringify(plainJson(current.components, "current component identities"))
+      !== canonicalStringify(plainJson(document.manifest.components, "manifest component identities")))
+    throw new RunManifestCompatibilityError("runtime components do not exactly match the resumable manifest");
+};
+
 /** Build the complete canonical identity before any run-owned effect. */
 export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocument => {
   if (input.dslVersion !== RLM_DSL_VERSION) throw new TypeError(`unsupported DSL version ${input.dslVersion}`);
@@ -357,6 +382,8 @@ export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocum
 
 export interface RunDirectoryFileHandle {
   close(): Promise<void>;
+  read?(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ readonly bytesRead: number }>;
+  stat?(): Promise<Stats>;
   sync(): Promise<void>;
   writeFile(data: string, encoding: BufferEncoding): Promise<void>;
 }
@@ -364,7 +391,7 @@ export interface RunDirectoryFileHandle {
 export interface RunDirectoryFileSystem {
   /** Optional lease-owned boundary for one complete manifest mutation. */
   runTransaction?<T>(effect: () => Promise<T>): Promise<T>;
-  open(path: string, flags: string, mode?: number): Promise<RunDirectoryFileHandle>;
+  open(path: string, flags: string | number, mode?: number): Promise<RunDirectoryFileHandle>;
   readFile(path: string): Promise<Buffer>;
   readdir(path: string): Promise<string[]>;
   rename(oldPath: string, newPath: string): Promise<void>;
@@ -377,6 +404,44 @@ export const nodeRunDirectoryFileSystem: RunDirectoryFileSystem = {
   readdir,
   rename,
   unlink,
+};
+
+const stableFileStat = (before: Stats, after: Stats): boolean =>
+  before.dev === after.dev && before.ino === after.ino && before.size === after.size
+  && before.mode === after.mode && before.nlink === after.nlink
+  && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+
+/** Bounded no-follow authority read through one stable private regular-file handle. */
+export const readBoundedRunDirectoryFile = async (
+  path: string,
+  maximum: number,
+  fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
+  checkpoint: () => void = () => {},
+): Promise<Buffer> => {
+  checkpoint();
+  const handle = await fileSystem.open(path, constants.O_RDONLY | noFollow);
+  try {
+    if (!handle.stat || !handle.read)
+      throw new TypeError("authority filesystem handle lacks bounded-read operations");
+    const before = await handle.stat();
+    if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o077) !== 0
+      || before.size < 1 || before.size > maximum)
+      throw new TypeError("authority file is not one bounded private regular file");
+    checkpoint();
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      checkpoint();
+      const result = await handle.read(bytes, offset, Math.min(64 * 1024, bytes.length - offset), offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const after = await handle.stat();
+    if (offset !== before.size || !stableFileStat(before, after))
+      throw new TypeError("authority file changed during its bounded read");
+    checkpoint();
+    return bytes;
+  } finally { await handle.close(); }
 };
 
 export type RunDirectoryErrorCode =
@@ -439,6 +504,11 @@ export const claimRunDirectory = async (
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
   allowedEntries: readonly string[] = [],
 ): Promise<void> => {
+  let serialized: string;
+  try { serialized = `${canonicalStringify(plainJson(document, "run manifest document"))}\n`; }
+  catch (cause) { throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "run manifest cannot be serialized", cause); }
+  if (Buffer.byteLength(serialized, "utf8") > MAX_RUN_MANIFEST_BYTES)
+    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "run manifest exceeds its resume authority byte limit");
   const mutation = async (): Promise<void> => {
   const lockPath = join(dir, RUN_LOCK_FILE);
   let lock: RunDirectoryFileHandle;
@@ -479,7 +549,7 @@ export const claimRunDirectory = async (
     const temp = await fileSystem.open(tempPath, "wx", 0o600);
     tempCreated = true;
     await closeAfter(temp, async () => {
-      await temp.writeFile(`${canonicalStringify(plainJson(document, "run manifest document"))}\n`, "utf8");
+      await temp.writeFile(serialized, "utf8");
       await temp.sync();
     });
     await fileSystem.rename(tempPath, manifestPath);
@@ -539,10 +609,24 @@ const parseManifestDocument = (input: unknown): RunManifestDocument => {
   const backend = record(manifest.backend, "manifest.backend", ["id", "version"]);
   string(backend.id, "manifest.backend.id");
   string(backend.version, "manifest.backend.version");
-  const rawComponents = record(manifest.components, "manifest.components", ["model", "controller", "extractor", "agentDelegation"]);
+  const rawComponents = record(manifest.components, "manifest.components", [
+    "model", "controller", "controllerResume", "extractor", "agentDelegation",
+  ]);
+  let controllerResume: ControllerResumeCapabilityIdentityV1 | null = null;
+  if (rawComponents.controllerResume !== null) {
+    const resume = record(rawComponents.controllerResume, "manifest.components.controllerResume", ["version", "strategy"]);
+    if (resume.version !== CONTROLLER_RESUME_CAPABILITY_VERSION
+      || (resume.strategy !== "trajectory-derived" && resume.strategy !== "state-token"))
+      throw new RunManifestCompatibilityError("manifest controller resume capability is unsupported");
+    controllerResume = {
+      version: CONTROLLER_RESUME_CAPABILITY_VERSION,
+      strategy: resume.strategy as ControllerResumeCapabilityIdentityV1["strategy"],
+    };
+  }
   const components: RunManifest["components"] = {
     model: runtimeIdentity(rawComponents.model, "manifest.components.model"),
     controller: runtimeIdentity(rawComponents.controller, "manifest.components.controller"),
+    controllerResume,
     extractor: rawComponents.extractor === null
       ? null
       : runtimeIdentity(rawComponents.extractor, "manifest.components.extractor"),
@@ -583,11 +667,23 @@ export const parseRunManifestDocument = (input: unknown): RunManifestDocument =>
 export const readRunManifest = async (
   dir: string,
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
+  checkpoint: () => void = () => {},
 ): Promise<RunManifestDocument> => {
   try {
-    const parsed = JSON.parse((await fileSystem.readFile(join(dir, RUN_MANIFEST_FILE))).toString("utf8")) as unknown;
-    return parseManifestDocument(parsed);
+    const text = (await readBoundedRunDirectoryFile(
+      join(dir, RUN_MANIFEST_FILE),
+      MAX_RUN_MANIFEST_BYTES,
+      fileSystem,
+      checkpoint,
+    )).toString("utf8");
+    const parsed = JSON.parse(text) as unknown;
+    const document = parseManifestDocument(parsed);
+    if (`${canonicalStringify(plainJson(document, "stored run manifest"))}\n` !== text)
+      throw new TypeError("stored run manifest is not canonical strict JSON");
+    return document;
   } catch (error) {
+    const control = checkpointControlFailure(error);
+    if (control !== undefined) throw control;
     if (error instanceof RunDirectoryError) throw error;
     if (error instanceof RunManifestCompatibilityError)
       throw new RunDirectoryError("MANIFEST_INCOMPATIBLE", "stored run manifest is incompatible", error);

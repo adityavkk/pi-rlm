@@ -20,7 +20,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { RlmEvent } from "../core/journal.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import { readRunManifest, RUN_MANIFEST_FILE } from "./run-manifest.ts";
-import { MANAGED_RUN_PERSISTENCE } from "./run-managed-lifecycle.ts";
+import { MANAGED_RUN_PERSISTENCE, MANAGED_RUN_RESUME } from "./run-managed-lifecycle.ts";
 import { assertFailedGenesisRetirement, inspectFailedWriterGenesis } from "./run-genesis-recovery.ts";
 import { selectRetentionCandidates } from "./run-retention-policy.ts";
 import {
@@ -29,6 +29,7 @@ import {
 } from "./run-retention-test-support.ts";
 import {
   acquireRunRetentionLease,
+  acquireRunWriterLease,
   createRunWriterGenesis,
   recoverFailedRunWriterGenesis,
   RunWriterArbiterError,
@@ -172,6 +173,7 @@ export interface RunCleanupResult extends ManagedRunListing {
 export type RunRetentionErrorCode =
   | "RUN_RETENTION_ROOT_INVALID"
   | "RUN_RETENTION_CREATE_FAILED"
+  | "RUN_RETENTION_RESUME_FAILED"
   | "RUN_RETENTION_METADATA_FAILED"
   | "RUN_RETENTION_SCAN_LIMIT"
   | "RUN_RETENTION_CLEANUP_FAILED"
@@ -396,10 +398,19 @@ export class ManagedRunLease {
     private metadata: RunLifecycleMetadata,
     private readonly writer: RunWriterLease,
     private readonly persistence: LeaseOwnedRunPersistence,
+    resumed = false,
   ) {
+    if (resumed) {
+      if (metadata.status !== "active" || !metadata.runId)
+        throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "resumed lifecycle requires one active manifest identity");
+      this.runId = metadata.runId;
+      this.manifestBound = true;
+      this.genesisComplete = true;
+    }
     this.lifecycle = {
       claimEntries: MANAGED_RUN_CLAIM_ENTRIES,
       [MANAGED_RUN_PERSISTENCE]: persistence,
+      ...(resumed ? { [MANAGED_RUN_RESUME]: { runId: metadata.runId!, runName: name } } : {}),
       onManifest: async (runId: string): Promise<void> => {
         if (this.closed || !RUN_ID.test(runId))
           throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "invalid managed run identity");
@@ -422,6 +433,7 @@ export class ManagedRunLease {
   readonly lifecycle: {
     readonly claimEntries: readonly string[];
     readonly [MANAGED_RUN_PERSISTENCE]: LeaseOwnedRunPersistence;
+    readonly [MANAGED_RUN_RESUME]?: { readonly runId: string; readonly runName: string };
     readonly onManifest: (runId: string) => Promise<void>;
     readonly onRunStarted: (runId: string) => Promise<void>;
   };
@@ -532,7 +544,10 @@ export class ManagedRunLease {
   }
 }
 
-const retainedReleaseAuthorities = new Map<string, ManagedRunLease>();
+interface RetainedReleaseAuthority {
+  retryReleaseAuthority(): Promise<void>;
+}
+const retainedReleaseAuthorities = new Map<string, RetainedReleaseAuthority>();
 
 export class ManagedRunStore {
   readonly root: string;
@@ -587,6 +602,18 @@ export class ManagedRunStore {
     for (const [key, retained] of retainedReleaseAuthorities) {
       if (retained === lease) retainedReleaseAuthorities.delete(key);
     }
+  }
+
+  private retainWriterReleaseAuthority(name: string, writer: RunWriterLease): void {
+    if (!this.rootIdentity) throw new Error("managed root identity is unavailable while retaining writer authority");
+    const key = join(this.rootIdentity.real, name);
+    const authority: RetainedReleaseAuthority = {
+      retryReleaseAuthority: async (): Promise<void> => {
+        await writer.release();
+        if (retainedReleaseAuthorities.get(key) === authority) retainedReleaseAuthorities.delete(key);
+      },
+    };
+    retainedReleaseAuthorities.set(key, authority);
   }
 
   private async retryReleaseAuthorities(): Promise<void> {
@@ -811,6 +838,72 @@ export class ManagedRunStore {
         }
       }
       throw new RunRetentionError("RUN_RETENTION_CREATE_FAILED", "failed to create managed writer genesis", cause);
+    }
+  }
+
+  /** Acquire writer authority for one exact managed nonterminal run name. */
+  async openForResume(name: string): Promise<ManagedRunLease> {
+    await this.ensureRoot();
+    const dir = join(this.root, name);
+    if (!RUN_NAME.test(name) || dir !== join(this.root, name) || dirname(dir) !== this.root || !this.contained(dir))
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "invalid managed run name for resume");
+    try { await this.ensureRunPath(dir); }
+    catch (cause) { throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed resume path is invalid", cause); }
+
+    let metadata: RunLifecycleMetadata;
+    try { metadata = parseLifecycle(await readBoundedJson(join(dir, RUN_LIFECYCLE_FILE))); }
+    catch (cause) { throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed resume lifecycle is invalid", cause); }
+    if (metadata.status !== "active" || !metadata.runId)
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "only active manifest-bound managed runs can resume");
+
+    let writer: RunWriterLease;
+    try {
+      writer = await acquireRunWriterLease(
+        { managedRoot: this.root, runName: name, role: "writer" },
+        this.writerOptions,
+      );
+    } catch (cause) {
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "failed to acquire managed resume writer authority", cause);
+    }
+    const persistence = new LeaseOwnedRunPersistence(writer, this.persistenceOptions);
+    const marker: ActiveMarker = {
+      schemaVersion: 1,
+      pid: process.pid,
+      owner: metadata.owner,
+      startedAtMs: metadata.createdAtMs,
+    };
+    let lease: ManagedRunLease | undefined;
+    try {
+      await persistence.runTransaction(async () => {
+        await this.ensureRunPath(dir);
+        const current = parseLifecycle(await readBoundedJson(join(dir, RUN_LIFECYCLE_FILE)));
+        if (!this.sameLifecycle(current, metadata) || current.status !== "active" || current.runId !== metadata.runId)
+          throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed lifecycle changed during resume acquisition");
+        lease = new ManagedRunLease(this, name, dir, metadata, writer, persistence, true);
+        try {
+          await privateJson(dir, RUN_ACTIVE_FILE, marker, this.token(), this.ownedMetadataFileSystem(persistence));
+        } catch (cause) {
+          let applied = false;
+          try { applied = JSON.stringify(parseMarker(await readBoundedJson(join(dir, RUN_ACTIVE_FILE)), metadata)) === JSON.stringify(marker); }
+          catch { /* The replacement did not become exact authority. */ }
+          if (!applied) throw cause;
+        }
+        activeOwners.set(dir, metadata.owner);
+      });
+      return lease!;
+    } catch (cause) {
+      activeOwners.delete(dir);
+      let releaseFailure: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { await writer.release(); releaseFailure = undefined; break; }
+        catch (error) { releaseFailure = releaseFailure === undefined ? error : new AggregateError([releaseFailure, error]); }
+      }
+      if (releaseFailure !== undefined) this.retainWriterReleaseAuthority(name, writer);
+      throw new RunRetentionError(
+        "RUN_RETENTION_RESUME_FAILED",
+        "failed to bind managed resume lifecycle",
+        releaseFailure === undefined ? cause : new AggregateError([cause, releaseFailure]),
+      );
     }
   }
 

@@ -18,6 +18,8 @@ const MAX_EVENT_STRING = 1_048_576;
 const MAX_EVENT_KEYS = 32;
 const HASH = /^[0-9a-f]{64}$/;
 const OPERATION_INTENT_ID = /^op_[0-9a-f]{64}$/;
+const CHECKPOINT_ID = /^cp_[0-9a-f]{64}$/;
+const CHECKPOINT_VERSION = "pi-rlm.checkpoint.v1";
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const CONTEXT_REF = /^ctx_[0-9a-f]{64}$/;
 const CALL_KINDS = new Set(["llm", "agent", "recurse", "tool", "artifact", "context"]);
@@ -234,6 +236,21 @@ const validEvent = (event: RecordValue): boolean => {
         ? !own(event, "errorCode")
         : own(event, "errorCode") && string(event, "errorCode", false) && ERROR_CODE.test(event["errorCode"] as string);
     }
+    case "checkpoint_committed":
+      return exact(event, [
+        "type", "schemaVersion", "checkpointVersion", "checkpointId", "runId", "frameId", "manifestHash",
+        "checkpointSequence", "checkpointRef", "checkpointSha256", "checkpointBytes", "journalPrefixSha256",
+        "journalPrefixBytes", "journalPrefixEventCount", "nextIteration", "nextControllerTurn",
+      ])
+        && event["schemaVersion"] === 1 && event["checkpointVersion"] === CHECKPOINT_VERSION
+        && string(event, "checkpointId", false) && CHECKPOINT_ID.test(event["checkpointId"] as string)
+        && string(event, "runId", false) && string(event, "frameId", false) && hash(event, "manifestHash")
+        && integer(event, "checkpointSequence", true) && contextRef(event, "checkpointRef")
+        && hash(event, "checkpointSha256") && integer(event, "checkpointBytes")
+        && event["checkpointRef"] === `ctx_${event["checkpointSha256"]}`
+        && hash(event, "journalPrefixSha256") && integer(event, "journalPrefixBytes")
+        && integer(event, "journalPrefixEventCount", true) && integer(event, "nextIteration", true)
+        && integer(event, "nextControllerTurn", true);
     case "call_committed":
       return exact(event, ["type", "frameId", "callId", "kind", "key", "cached", "ok", "usage"],
         ["outputRef", "outputSha256", "outputBytes"])
