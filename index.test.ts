@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { RlmEvent } from "./src/core/journal.ts";
+import { createLedger } from "./src/core/budget.ts";
 import type { Cell, ControllerDriver, FrameState } from "./src/runtime/controller.ts";
 import {
   DEFAULT_PROFILE,
@@ -10,10 +11,18 @@ import {
   RUN_ACTIVE_FILE,
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
+  resolveLimits,
   type RunResult,
   type RunRetentionMetadataFileSystem,
 } from "./src/runtime/index.ts";
-import type { ManagedRunListing } from "./src/runtime/run-retention.ts";
+import type {
+  ManagedResumeCandidateInspection,
+  RunCleanupOptions,
+  RunCleanupResult,
+  ManagedRunListing,
+} from "./src/runtime/index.ts";
+import type { ManagedResumeLease } from "./src/extension/managed-resume-lease.ts";
+import type { RlmResumeAuthorizationRequest } from "./index.ts";
 import {
   managedRunStoreTestOptions,
   type ManagedRunStoreTestOptions,
@@ -73,6 +82,10 @@ const harness = (options: {
   runCoordinator?: RunCoordinator;
   listManagedRuns?: () => Promise<ManagedRunListing>;
   inspectManagedRunPage?: (request: RunInspectionRequest) => Promise<RunInspectionPage>;
+  inspectManagedResumeCandidate?: (managedName: string) => Promise<ManagedResumeCandidateInspection>;
+  acquireManagedResumeLease?: (managedName: string) => Promise<ManagedResumeLease>;
+  cleanupManagedRuns?: (options: RunCleanupOptions) => Promise<RunCleanupResult>;
+  authorizeResume?: (request: RlmResumeAuthorizationRequest, signal: AbortSignal) => boolean | Promise<boolean>;
   setUiInterval?: RlmExtensionDependencies["setUiInterval"];
   clearUiInterval?: RlmExtensionDependencies["clearUiInterval"];
 } = {}) => {
@@ -166,6 +179,11 @@ const harness = (options: {
     runCoordinator: options.runCoordinator,
     ...(options.listManagedRuns ? { listManagedRuns: options.listManagedRuns } : {}),
     ...(options.inspectManagedRunPage ? { inspectManagedRunPage: options.inspectManagedRunPage } : {}),
+    ...(options.inspectManagedResumeCandidate
+      ? { inspectManagedResumeCandidate: options.inspectManagedResumeCandidate } : {}),
+    ...(options.acquireManagedResumeLease ? { acquireManagedResumeLease: options.acquireManagedResumeLease } : {}),
+    ...(options.cleanupManagedRuns ? { cleanupManagedRuns: options.cleanupManagedRuns } : {}),
+    ...(options.authorizeResume ? { authorizeResume: options.authorizeResume } : {}),
     ...(options.setUiInterval ? { setUiInterval: options.setUiInterval } : {}),
     ...(options.clearUiInterval ? { clearUiInterval: options.clearUiInterval } : {}),
   })(pi as never);
@@ -495,6 +513,25 @@ const managementListing = (runName = MANAGED_NAME): ManagedRunListing => ({
   }],
   issues: [], scannedBytes: 10, scannedEntries: 1,
 }) as ManagedRunListing;
+const resumeCandidate = (overrides: Partial<ManagedResumeCandidateInspection> = {}): ManagedResumeCandidateInspection => ({
+  managedName: MANAGED_NAME,
+  runId: MANAGED_ID,
+  manifestHash: MANAGED_HASH,
+  checkpointSequence: 3,
+  checkpointSha256: "4".repeat(64),
+  checkpointPrefixSha256: "5".repeat(64),
+  journalPrefixSha256: "6".repeat(64),
+  nextIteration: 4,
+  nextControllerTurn: 5,
+  incompleteTailBytes: 0,
+  deadlineMs: 10_000,
+  ...overrides,
+});
+const cleanupResult = (overrides: Partial<RunCleanupResult> = {}): RunCleanupResult => ({
+  ...managementListing(),
+  deleted: [], skipped: [], wouldDelete: [], retained: [MANAGED_NAME],
+  ...overrides,
+});
 const managementPage = (request: RunInspectionRequest): RunInspectionPage => ({
   version: 1,
   runName: request.runName,
@@ -708,8 +745,9 @@ describe("pi-rlm extension wiring", () => {
       component.handleInput?.(call === 1 ? "\r" : "\u001b");
     });
     await h.commands.get("rlm")!.handler("runs", h.ctx);
-    expect(listings).toBe(2);
+    expect(listings).toBe(3);
     expect(requests).toEqual([{ version: 1, runName: MANAGED_NAME, view: "summary", pageSize: 50 }]);
+    expect(h.resultMessages.some(({ message }) => message["customType"] === "pi-rlm-management-result")).toBe(true);
     expect(h.customCalls).toBe(3);
     expect(h.runs).toHaveLength(0);
 
@@ -723,7 +761,7 @@ describe("pi-rlm extension wiring", () => {
     const before = requests.length;
     await h.commands.get("rlm")!.handler("inspect rlm_local", h.ctx);
     expect(requests).toHaveLength(before);
-    expect(h.notifications.at(-1)).toContain("exact managed name or bound local alias");
+    expect(h.resultMessages.at(-1)?.message["content"]).toContain("RLM_INSPECTION_TARGET_INVALID");
   });
 
   test("navigator refresh authorizes selection against the refreshed bounded snapshot", async () => {
@@ -757,9 +795,10 @@ describe("pi-rlm extension wiring", () => {
     h.setMode("print");
     await h.commands.get("rlm")!.handler("runs", h.ctx);
     await h.commands.get("rlm")!.handler(`inspect ${MANAGED_NAME}`, h.ctx);
-    expect(listings).toBe(0);
-    expect(inspections).toBe(0);
+    expect(listings).toBe(1);
+    expect(inspections).toBe(1);
     expect(h.customCalls).toBe(0);
+    expect(h.resultMessages.filter(({ message }) => message["customType"] === "pi-rlm-management-result")).toHaveLength(2);
 
     h.setMode("tui");
     for (const malformed of ["runs/extra", "inspect:bad", "cancel\u200b rlm_local", "launch\u0000payload"])
@@ -774,7 +813,7 @@ describe("pi-rlm extension wiring", () => {
     await expect(h.commands.get("rlm")!.handler("runs", h.ctx)).resolves.toBeUndefined();
     h.setCustomBehavior((_component, _done, reject) => { reject(new Error("custom rejected")); });
     await expect(h.commands.get("rlm")!.handler("runs", h.ctx)).resolves.toBeUndefined();
-    expect(inspections).toBe(0);
+    expect(inspections).toBe(1);
     expect(h.runs).toHaveLength(0);
   });
 
@@ -796,6 +835,202 @@ describe("pi-rlm extension wiring", () => {
     await customHarness.emit("session_before_fork", { entryId: "entry", position: "at" });
     await expect(pendingCustom).resolves.toBeUndefined();
     expect(customHarness.customComponents).toHaveLength(1);
+  });
+
+  test("textual cleanup audits before mutation and dry-run remains advisory", async () => {
+    const calls: RunCleanupOptions[] = [];
+    let h!: ReturnType<typeof harness>;
+    h = harness({
+      cleanupManagedRuns: async (options) => {
+        if (!options.dryRun)
+          expect(h.audits.some((entry) => entry.type === "pi-rlm-cleanup-audit")).toBe(true);
+        calls.push(options);
+        return cleanupResult(options.dryRun ? { wouldDelete: [MANAGED_NAME], retained: [] }
+          : { deleted: [MANAGED_NAME], retained: [] });
+      },
+    });
+    h.setMode("print");
+    await h.commands.get("rlm")!.handler("cleanup --dry-run", h.ctx);
+    expect(h.audits.some((entry) => entry.type === "pi-rlm-cleanup-audit")).toBe(false);
+    await h.commands.get("rlm")!.handler("cleanup", h.ctx);
+    await h.commands.get("rlm")!.handler("cleanup --force", h.ctx);
+    expect(calls).toEqual([{ dryRun: true }, {}, { force: true }]);
+    expect(h.confirmations).toHaveLength(0);
+    expect(h.customCalls).toBe(0);
+    const outputs = h.resultMessages.filter(({ message }) => message["customType"] === "pi-rlm-management-result");
+    expect(outputs).toHaveLength(3);
+    expect(outputs[0]?.message["content"]).toContain("RLM_CLEANUP_DRY_RUN");
+
+    const denied = harness({ cleanupManagedRuns: async () => { throw new Error("must not mutate"); } });
+    denied.setAppendFaultType("pi-rlm-cleanup-audit");
+    await denied.commands.get("rlm")!.handler("cleanup", denied.ctx);
+    expect(denied.resultMessages.at(-1)?.message["content"]).toContain("RLM_CLEANUP_AUDIT_FAILED");
+  });
+
+  test("resume approval binds exact checkpoint and writer identity before factories and consumes before continuation", async () => {
+    const events: string[] = [];
+    const authorizationRequests: RlmResumeAuthorizationRequest[] = [];
+    const result: RunResult = {
+      runId: MANAGED_ID,
+      status: "completed",
+      completionMode: "answer",
+      answer: { answer: "RAW RESUMED ANSWER" },
+      ledger: createLedger(resolveLimits(DEFAULT_PROFILE, 0)),
+    };
+    let h!: ReturnType<typeof harness>;
+    const lease: ManagedResumeLease = {
+      managedName: MANAGED_NAME,
+      writerIdentity: () => ({
+        managedName: MANAGED_NAME, runId: MANAGED_ID, writerOrdinal: 8, writerTokenSha256: "7".repeat(64),
+      }),
+      inspect: async () => {
+        events.push("inspect-compatible");
+        return {
+          runId: MANAGED_ID, manifestHash: MANAGED_HASH, checkpointSequence: 3,
+          checkpointSha256: "4".repeat(64), checkpointPrefixSha256: "5".repeat(64),
+          nextIteration: 4, nextControllerTurn: 5, incompleteTailBytes: 0,
+        };
+      },
+      resume: async () => {
+        expect(h.audits.some((entry) => entry.type === "pi-rlm-resume-grant")).toBe(true);
+        events.push("resume");
+        return result;
+      },
+      finish: async () => { events.push("finish"); },
+      abandon: async () => { events.push("abandon"); },
+    };
+    const backend: InterpreterBackend = {
+      id: "resume-test-backend", version: "1",
+      async evalCell() { throw new Error("not used"); }, async dispose() {},
+    };
+    const model: ModelClient = {
+      id: "resume-test-model",
+      identity: { id: "test/resume-model", version: "1", configuration: {} },
+      async complete() { throw new Error("not used"); },
+    };
+    const controller: ControllerDriver = {
+      identity: { id: "test/resume-controller", version: "1", configuration: {} },
+      async next() { throw new Error("not used"); }, fork() { return this; },
+    };
+    h = harness({
+      runtime: {
+        resolveProfile: () => DEFAULT_PROFILE,
+        createBackend: () => { events.push("factory-backend"); return backend; },
+        createModel: () => { events.push("factory-model"); return model; },
+        createController: () => { events.push("factory-controller"); return controller; },
+      },
+      inspectManagedResumeCandidate: async () => { events.push("inspect-metadata"); return resumeCandidate(); },
+      acquireManagedResumeLease: async () => { events.push("acquire-writer"); return lease; },
+      cleanupManagedRuns: async () => { events.push("cleanup"); return cleanupResult(); },
+      authorizeResume: async (request) => {
+        events.push("approve");
+        authorizationRequests.push(request);
+        return true;
+      },
+    });
+    h.setMode("print");
+    await h.commands.get("rlm")!.handler(`resume ${MANAGED_NAME}`, h.ctx);
+
+    expect(events).toEqual([
+      "inspect-metadata", "acquire-writer", "inspect-metadata", "approve", "inspect-metadata",
+      "factory-backend", "factory-model", "factory-controller", "inspect-compatible",
+      "inspect-metadata", "resume", "finish", "cleanup",
+    ]);
+    expect(authorizationRequests).toHaveLength(1);
+    expect(authorizationRequests[0]).toMatchObject({
+      sessionId: "session-1", authorizationGeneration: 0, managedName: MANAGED_NAME, runId: MANAGED_ID,
+      manifestHash: MANAGED_HASH, checkpointSequence: 3, checkpointSha256: "4".repeat(64),
+      checkpointPrefixSha256: "5".repeat(64), writerOrdinal: 8, writerTokenSha256: "7".repeat(64), mode: "print",
+    });
+    const audit = h.audits.find((entry) => entry.type === "pi-rlm-resume-grant")?.data;
+    expect(audit).toMatchObject({ managedName: MANAGED_NAME, writerOrdinal: 8, writerTokenSha256: "7".repeat(64) });
+    const output = String(h.resultMessages.at(-1)?.message["content"]);
+    expect(output).toContain("RLM_RESUME_COMPLETED");
+    expect(output).not.toContain("RAW RESUMED ANSWER");
+    expect(events).not.toContain("abandon");
+  });
+
+  test("resume terminal, non-TUI policy absence, denial, and audit failure construct no factories", async () => {
+    const cases = ["terminal", "headless", "denied", "audit"] as const;
+    for (const kind of cases) {
+      let factories = 0;
+      let acquisitions = 0;
+      let abandons = 0;
+      const h = harness({
+        runtime: {
+          resolveProfile: () => DEFAULT_PROFILE,
+          createBackend: () => { factories++; throw new Error("must not construct"); },
+          createModel: () => { factories++; throw new Error("must not construct"); },
+        },
+        inspectManagedResumeCandidate: async () => {
+          if (kind === "terminal") throw Object.assign(new Error("RAW terminal"), { code: "RECOVERY_TERMINAL" });
+          return resumeCandidate();
+        },
+        acquireManagedResumeLease: async () => {
+          acquisitions++;
+          return {
+            managedName: MANAGED_NAME,
+            writerIdentity: () => ({
+              managedName: MANAGED_NAME, runId: MANAGED_ID, writerOrdinal: 2, writerTokenSha256: "7".repeat(64),
+            }),
+            inspect: async () => { throw new Error("must not inspect components"); },
+            resume: async () => { throw new Error("must not resume"); },
+            finish: async () => {},
+            abandon: async () => { abandons++; },
+          };
+        },
+        ...(kind === "headless" ? {} : { authorizeResume: async () => kind !== "denied" }),
+      });
+      h.setMode("print");
+      if (kind === "audit") h.setAppendFaultType("pi-rlm-resume-grant");
+      await h.commands.get("rlm")!.handler(`resume ${MANAGED_NAME}`, h.ctx);
+      expect(factories).toBe(0);
+      expect(acquisitions).toBe(kind === "terminal" || kind === "headless" ? 0 : 1);
+      expect(abandons).toBe(kind === "denied" || kind === "audit" ? 1 : 0);
+      const content = String(h.resultMessages.at(-1)?.message["content"]);
+      expect(content).not.toContain("RAW terminal");
+      expect(content).toContain(kind === "terminal" ? "RLM_RESUME_TERMINAL"
+        : kind === "headless" ? "RLM_RESUME_AUTHORIZATION_REQUIRED"
+          : kind === "denied" ? "RLM_RESUME_DENIED" : "RLM_RESUME_AUDIT_FAILED");
+    }
+  });
+
+  test("session change during resume approval suppresses late results and releases the exact lease", async () => {
+    let resolveApproval!: (approved: boolean) => void;
+    const approval = new Promise<boolean>((resolve) => { resolveApproval = resolve; });
+    let approvalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { approvalStarted = resolve; });
+    let abandons = 0;
+    let factories = 0;
+    const h = harness({
+      runtime: {
+        createBackend: () => { factories++; throw new Error("late factory"); },
+        createModel: () => { factories++; throw new Error("late factory"); },
+      },
+      inspectManagedResumeCandidate: async () => resumeCandidate(),
+      acquireManagedResumeLease: async () => ({
+        managedName: MANAGED_NAME,
+        writerIdentity: () => ({
+          managedName: MANAGED_NAME, runId: MANAGED_ID, writerOrdinal: 2, writerTokenSha256: "7".repeat(64),
+        }),
+        inspect: async () => { throw new Error("must not inspect"); },
+        resume: async () => { throw new Error("must not resume"); },
+        finish: async () => {},
+        abandon: async () => { abandons++; },
+      }),
+      authorizeResume: () => { approvalStarted(); return approval; },
+    });
+    h.setMode("print");
+    const pending = h.commands.get("rlm")!.handler(`resume ${MANAGED_NAME}`, h.ctx);
+    await started;
+    await h.emit("session_before_switch", { reason: "resume" });
+    h.setSessionId("session-2");
+    resolveApproval(true);
+    await pending;
+    expect(abandons).toBe(1);
+    expect(factories).toBe(0);
+    expect(h.audits.filter((entry) => entry.type === "pi-rlm-resume-grant")).toHaveLength(0);
+    expect(h.resultMessages.filter(({ message }) => message["customType"] === "pi-rlm-management-result")).toHaveLength(0);
   });
 
   test("positive prompt wording still requires confirmation of exact normalized identity", async () => {
