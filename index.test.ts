@@ -70,6 +70,8 @@ const harness = (options: {
   runCoordinator?: RunCoordinator;
   listManagedRuns?: () => Promise<ManagedRunListing>;
   inspectManagedRunPage?: (request: RunInspectionRequest) => Promise<RunInspectionPage>;
+  setUiInterval?: RlmExtensionDependencies["setUiInterval"];
+  clearUiInterval?: RlmExtensionDependencies["clearUiInterval"];
 } = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
@@ -161,6 +163,8 @@ const harness = (options: {
     runCoordinator: options.runCoordinator,
     ...(options.listManagedRuns ? { listManagedRuns: options.listManagedRuns } : {}),
     ...(options.inspectManagedRunPage ? { inspectManagedRunPage: options.inspectManagedRunPage } : {}),
+    ...(options.setUiInterval ? { setUiInterval: options.setUiInterval } : {}),
+    ...(options.clearUiInterval ? { clearUiInterval: options.clearUiInterval } : {}),
   })(pi as never);
 
   const emit = async (name: string, event: Record<string, unknown> = {}) => {
@@ -545,6 +549,131 @@ describe("pi-rlm extension wiring", () => {
 
     tui.setWidgetFault(true);
     await expect(tui.emit("session_start", { reason: "resume" })).resolves.toBeUndefined();
+  });
+
+  test("one unrefed refresh timer exists only for a live TUI widget and cleans every boundary", async () => {
+    const coordinator = createRunCoordinator();
+    let callback: (() => void) | undefined;
+    let starts = 0;
+    let clears = 0;
+    let unrefs = 0;
+    const timer = { unref: () => { unrefs += 1; } } as unknown as ReturnType<typeof setInterval>;
+    const h = harness({
+      runCoordinator: coordinator,
+      setUiInterval: (value, intervalMs) => {
+        starts += 1; callback = value; expect(intervalMs).toBe(1_000); return timer;
+      },
+      clearUiInterval: (value) => { expect(value).toBe(timer); clears += 1; callback = undefined; },
+    });
+    await h.emit("session_start", { reason: "startup" });
+    let renders = 0;
+    const factory = h.widgets[0]?.content as (tui: { requestRender(): void }) => {
+      dispose?(): void; render(width: number): string[];
+    };
+    const widget = factory({ requestRender: () => { renders += 1; } });
+    coordinator.setSession("session-1", 0);
+    const first = coordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: "active" });
+    expect({ starts, unrefs }).toEqual({ starts: 1, unrefs: 1 });
+    callback?.();
+    expect(renders).toBeGreaterThan(1);
+    first.fail();
+    expect(clears).toBe(1);
+
+    coordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: "again" });
+    expect(starts).toBe(2);
+    widget.dispose?.();
+    expect(clears).toBe(2);
+    expect(factory({ requestRender() {} }).render(80)).toEqual([]);
+    expect(starts).toBe(2);
+
+    for (const mode of ["rpc", "print", "json"] as const) {
+      let nonTuiStarts = 0;
+      const isolated = harness({ setUiInterval: () => { nonTuiStarts += 1; return timer; } });
+      isolated.setMode(mode);
+      await isolated.emit("session_start", { reason: "startup" });
+      expect(isolated.widgets).toHaveLength(0);
+      expect(nonTuiStarts).toBe(0);
+    }
+
+    for (const [event, payload] of [
+      ["session_before_fork", { entryId: "entry", position: "at" }],
+      ["session_start", { reason: "resume" }],
+      ["session_shutdown", {}],
+    ] as const) {
+      const boundaryCoordinator = createRunCoordinator();
+      boundaryCoordinator.setSession("session-1", 0);
+      boundaryCoordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: event });
+      let boundaryClears = 0;
+      const boundary = harness({
+        runCoordinator: boundaryCoordinator,
+        setUiInterval: () => timer,
+        clearUiInterval: () => { boundaryClears += 1; },
+      });
+      await boundary.emit("session_start", { reason: "startup" });
+      const boundaryFactory = boundary.widgets[0]?.content as (tui: { requestRender(): void }) => unknown;
+      boundaryFactory({ requestRender() {} });
+      await boundary.emit(event, payload);
+      expect(boundaryClears).toBe(1);
+    }
+  });
+
+  test("refresh publication, throwing renders, and stale factories cannot orphan timers", async () => {
+    const timer = { unref() {} } as unknown as ReturnType<typeof setInterval>;
+
+    const reentrantCoordinator = createRunCoordinator();
+    reentrantCoordinator.setSession("session-1", 0);
+    const reentrantRun = reentrantCoordinator.create({
+      sessionId: "session-1", authorizationGeneration: 0, objective: "race",
+    });
+    let reentrantClears = 0;
+    const reentrant = harness({
+      runCoordinator: reentrantCoordinator,
+      setUiInterval: () => { reentrantRun.fail(); return timer; },
+      clearUiInterval: () => { reentrantClears += 1; },
+    });
+    await reentrant.emit("session_start", { reason: "startup" });
+    const reentrantFactory = reentrant.widgets[0]?.content as (tui: { requestRender(): void }) => unknown;
+    reentrantFactory({ requestRender() {} });
+    expect(reentrantClears).toBe(1);
+
+    const throwingCoordinator = createRunCoordinator();
+    let throwingClears = 0;
+    const throwing = harness({
+      runCoordinator: throwingCoordinator,
+      setUiInterval: () => timer,
+      clearUiInterval: () => { throwingClears += 1; },
+    });
+    await throwing.emit("session_start", { reason: "startup" });
+    const throwingFactory = throwing.widgets[0]?.content as
+      (tui: { requestRender(): void }) => { dispose(): void };
+    const throwingWidget = throwingFactory({ requestRender: () => { throw new Error("render failed"); } });
+    throwingCoordinator.setSession("session-1", 0);
+    expect(() => throwingCoordinator.create({
+      sessionId: "session-1", authorizationGeneration: 0, objective: "active",
+    })).not.toThrow();
+    expect(() => throwingWidget.dispose()).toThrow("render failed");
+    expect(throwingClears).toBe(1);
+
+    const stale = harness({ setUiInterval: () => { throw new Error("stale timer"); } });
+    await stale.emit("session_start", { reason: "startup" });
+    const staleFactory = stale.widgets[0]?.content as
+      (tui: { requestRender(): void }) => { render(width: number): string[] };
+    await stale.emit("session_before_switch");
+    expect(staleFactory({ requestRender() {} }).render(80)).toEqual([]);
+
+    const unrefCoordinator = createRunCoordinator();
+    let unrefClears = 0;
+    const unrefFailure = harness({
+      runCoordinator: unrefCoordinator,
+      setUiInterval: () => ({ unref: () => { throw new Error("unref failed"); } }),
+      clearUiInterval: () => { unrefClears += 1; },
+    });
+    await unrefFailure.emit("session_start", { reason: "startup" });
+    const unrefFactory = unrefFailure.widgets[0]?.content as (tui: { requestRender(): void }) => unknown;
+    unrefFactory({ requestRender() {} });
+    unrefCoordinator.setSession("session-1", 0);
+    unrefCoordinator.create({ sessionId: "session-1", authorizationGeneration: 0, objective: "active" });
+    expect(unrefClears).toBe(1);
   });
 
   test("management handlers integrate runs, inspect, and exact current local cancellation authority", async () => {

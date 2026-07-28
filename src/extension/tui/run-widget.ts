@@ -14,13 +14,16 @@ export class RunWidget implements Component {
   private runs: readonly RunDisplayItem[] = Object.freeze([]);
   private disposed = false;
   private readonly requestRender: RunWidgetRequestRender;
+  private readonly onDispose: () => void;
 
   constructor(requestRender?: RunWidgetRequestRender);
-  constructor(runs?: readonly CoordinatedRun[], requestRender?: RunWidgetRequestRender);
+  constructor(runs?: readonly CoordinatedRun[], requestRender?: RunWidgetRequestRender, onDispose?: () => void);
   constructor(
     runsOrRequest: readonly CoordinatedRun[] | RunWidgetRequestRender = [],
     requestRender: RunWidgetRequestRender = () => {},
+    onDispose: () => void = () => {},
   ) {
+    this.onDispose = onDispose;
     if (typeof runsOrRequest === "function") {
       this.requestRender = runsOrRequest;
     } else {
@@ -48,11 +51,13 @@ export class RunWidget implements Component {
     if (this.disposed) return;
     this.disposed = true;
     this.runs = Object.freeze([]);
-    this.requestRender();
+    try { this.requestRender(); }
+    finally { this.onDispose(); }
   }
 }
 
 export const createRunWidget = (
   requestRender?: RunWidgetRequestRender,
   runs: readonly CoordinatedRun[] = [],
-): RunWidget => new RunWidget(runs, requestRender);
+  onDispose?: () => void,
+): RunWidget => new RunWidget(runs, requestRender, onDispose);
