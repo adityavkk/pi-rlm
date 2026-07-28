@@ -444,13 +444,26 @@ export class RunWriterLease {
         if (!(error instanceof RunWriterTerminalAppliedError)) throw error;
         outcome = { status: "applied-failure", error };
       }
+      let cleanupFailure: unknown;
       try { await this.pinned.close(); }
-      catch (cleanup) {
-        throw outcome.status === "applied-failure"
-          ? new AggregateError([outcome.error, cleanup], "applied terminal transition and pinned-handle close both failed")
-          : cleanup;
+      catch (firstCleanup) {
+        try { await this.pinned.close(); }
+        catch (secondCleanup) {
+          cleanupFailure = new AggregateError(
+            [firstCleanup, secondCleanup],
+            "terminal transition pinned-handle close retry failed",
+          );
+        }
+      } finally {
+        // The terminal path transition has already been applied. Its old pathname can no
+        // longer recover this lease, so process authority must not remain registered.
+        if (registry.active.get(this.pinned.key)?.lease === this) registry.active.delete(this.pinned.key);
       }
-      if (registry.active.get(this.pinned.key)?.lease === this) registry.active.delete(this.pinned.key);
+      if (cleanupFailure !== undefined) {
+        throw outcome.status === "applied-failure"
+          ? new AggregateError([outcome.error, cleanupFailure], "applied terminal transition and pinned-handle close both failed")
+          : cleanupFailure;
+      }
       return outcome;
     }, guard);
     return transition.then((outcome) => {

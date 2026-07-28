@@ -83,6 +83,34 @@ describe("irreversible retirement recovery", () => {
     } finally { await fixture.cleanup(); }
   });
 
+  test("drops unreachable process authority after repeated pinned-close failure", async () => {
+    const fixture = await arbiterFixture({ arbitration: "empty" });
+    const chain = await finalChain(fixture, MAX_ARBITRATION_ORDINAL);
+    try {
+      const acquire = () => acquireRunRetentionLease({
+        managedRoot: fixture.root,
+        runName: fixture.runName,
+        preflightRetirement: () => {},
+      }, { scan: async () => chain, livenessProbe: () => "absent" });
+      const lease = await acquire();
+      const pinned = (lease as unknown as {
+        pinned: { arbitration: { handle: { close(): Promise<void> } } };
+      }).pinned;
+      const close = pinned.arbitration.handle.close.bind(pinned.arbitration.handle);
+      let failures = 2;
+      pinned.arbitration.handle.close = async () => {
+        if (failures-- > 0) throw new Error("injected pinned close failure");
+        await close();
+      };
+      await expect(lease.quarantine(async () => undefined)).rejects.toThrow(
+        "terminal transition pinned-handle close retry failed",
+      );
+      const recovered = await acquire();
+      expect(recovered).not.toBe(lease);
+      await recovered.quarantine(async () => undefined);
+    } finally { await fixture.cleanup(); }
+  });
+
   test("recovers a crash-stranded final generation without publishing an impossible successor", async () => {
     const fixture = await arbiterFixture({ arbitration: "empty" });
     const chain = await finalChain(fixture, MAX_ARBITRATION_ORDINAL);
