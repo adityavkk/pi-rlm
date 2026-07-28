@@ -37,8 +37,16 @@ import {
 import {
   ManagedRunStore,
   RunRetentionError,
+  type ManagedRunListing,
   type ManagedRunStoreOptions,
 } from "./src/runtime/run-retention.ts";
+import {
+  inspectManagedRunPage as inspectManagedRunPageDefault,
+} from "./src/runtime/run-inspection.ts";
+import type {
+  RunInspectionPage,
+  RunInspectionRequest,
+} from "./src/runtime/run-inspection-types.ts";
 import { throwIfAborted, waitForAbort, wasAborted } from "./src/runtime/abort.ts";
 import type { ControllerDriver } from "./src/runtime/controller.ts";
 import type { InterpreterBackend } from "./src/shell/interpreter/backend.ts";
@@ -66,6 +74,14 @@ import {
   type RlmResultProjection,
 } from "./src/extension/result.ts";
 import { RunWidget } from "./src/extension/tui/run-widget.ts";
+import { openRunNavigator } from "./src/extension/tui/run-navigator.ts";
+import { openRunInspector } from "./src/extension/tui/run-inspector.ts";
+import {
+  cancelLocalRun,
+  resolveInspectionRunName,
+  routeRlmCommand,
+} from "./src/extension/run-command.ts";
+import { truncateDisplayLine } from "./src/extension/run-display.ts";
 import {
   renderRlmRunCallComponent,
   renderRlmToolResultComponent,
@@ -292,6 +308,10 @@ export interface RlmExtensionDependencies {
   readonly now?: () => number;
   readonly createId?: () => string;
   readonly grantTtlMs?: number;
+  /** Host-managed listing seam, already bound to its retention options. */
+  readonly listManagedRuns?: () => Promise<ManagedRunListing>;
+  /** Host-managed inspection seam, already bound to the same retention options. */
+  readonly inspectManagedRunPage?: (request: RunInspectionRequest) => Promise<RunInspectionPage>;
   /** Pi-neutral ownership registry injection for deterministic tests/hosts. */
   readonly runCoordinator?: RunCoordinator;
 }
@@ -348,12 +368,25 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
   const createId = dependencies.createId ?? randomUUID;
   const grantTtlMs = dependencies.grantTtlMs ?? 120_000;
   const runCoordinator = dependencies.runCoordinator ?? createRunCoordinator();
+  const listManagedRuns = dependencies.listManagedRuns
+    ?? (() => new ManagedRunStore(dependencies.runtime?.runRetention).list());
+  const inspectManagedRunPage = dependencies.inspectManagedRunPage
+    ?? ((request: RunInspectionRequest) => inspectManagedRunPageDefault(request, dependencies.runtime?.runRetention));
+  const notifyCommand = (ctx: ExtensionContext, message: string, level: "info" | "error" = "info"): void => {
+    try { ctx.ui.notify(truncateDisplayLine(message, 160), level); } catch { /* Non-TUI hosts may expose a no-op UI. */ }
+  };
   let inputCorrelation: InputCorrelation | undefined;
   let grantStore = emptyGrantStore();
   let authorizationGeneration = 0;
   const pendingToolCalls = new Set<string>();
   const consumedToolCalls = new Set<string>();
   const activeCommandRuns = new Set<OwnedRunHandle>();
+  const managementControllers = new Set<AbortController>();
+
+  const invalidateManagement = (): void => {
+    for (const controller of managementControllers) controller.abort(new Error("management session invalidated"));
+    managementControllers.clear();
+  };
 
   const invalidateAuthorization = (): void => {
     authorizationGeneration += 1;
@@ -591,38 +624,90 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     }
   };
 
-  pi.on("session_before_switch", () => { invalidateAuthorization(); clearWidget(); });
-  pi.on("session_before_fork", () => { invalidateAuthorization(); clearWidget(); });
+  pi.on("session_before_switch", () => { invalidateManagement(); invalidateAuthorization(); clearWidget(); });
+  pi.on("session_before_fork", () => { invalidateManagement(); invalidateAuthorization(); clearWidget(); });
   pi.on("session_start", (event, ctx) => {
+    invalidateManagement();
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") invalidateAuthorization();
     installWidget(ctx);
   });
   pi.on("session_shutdown", () => {
+    invalidateManagement();
     invalidateAuthorization();
     clearWidget();
     unsubscribeWidget();
   });
 
   pi.registerCommand("rlm", {
-    description: "Start a host-authorized pi-rlm run with an explicit source.",
+    description: "Launch, list, inspect, or cancel host-managed pi-rlm runs.",
     handler: async (args, ctx) => {
-      // Bind ownership before the first asynchronous source-capture checkpoint.
+      // Every command route is bound before its first host or UI effect.
       let sessionId: string;
       try { sessionId = ctx.sessionManager.getSessionId(); }
       catch { return; }
+      const entryGeneration = authorizationGeneration;
+      const authority = { sessionId, authorizationGeneration: entryGeneration };
+      const route = routeRlmCommand(args);
+      if (route.kind !== "launch") {
+        if (route.kind === "invalid-management") {
+          notifyCommand(ctx, "Invalid RLM management command.", "error");
+          return;
+        }
+        if (route.kind === "cancel") {
+          const cancelled = cancelLocalRun(route.target, runCoordinator, authority);
+          notifyCommand(ctx, cancelled.ok
+            ? (cancelled.alreadyRequested ? "RLM cancellation was already requested." : "RLM cancellation requested.")
+            : "RLM local run alias was not found.", cancelled.ok ? "info" : "error");
+          return;
+        }
+        const managementController = new AbortController();
+        managementControllers.add(managementController);
+        const isCurrent = (): boolean => {
+          if (managementController.signal.aborted || entryGeneration !== authorizationGeneration || ctx.mode !== "tui") return false;
+          try { return ctx.sessionManager.getSessionId() === sessionId; } catch { return false; }
+        };
+        try {
+          if (route.kind === "inspect") {
+            const runName = resolveInspectionRunName(route.target, runCoordinator, authority);
+            if (!runName) {
+              notifyCommand(ctx, "RLM inspection target must be an exact managed name or bound local alias.", "error");
+              return;
+            }
+            await openRunInspector(ctx, runName, inspectManagedRunPage, managementController.signal, isCurrent);
+            return;
+          }
+          await openRunNavigator(ctx, {
+            listLocalRuns: () => runCoordinator.list().filter((run) =>
+              run.sessionId === sessionId && run.authorizationGeneration === entryGeneration),
+            listManagedRuns,
+            inspect: (runName) => openRunInspector(
+              ctx, runName, inspectManagedRunPage, managementController.signal, isCurrent,
+            ),
+          }, managementController.signal, isCurrent);
+          return;
+        } catch {
+          // Management UI/listing seams cannot reject the registered command handler.
+          return;
+        } finally {
+          managementControllers.delete(managementController);
+          managementController.abort(new Error("management command completed"));
+        }
+      }
+
+      // Bind ownership before the first asynchronous source-capture checkpoint.
       let commandController: OwnedRunHandle;
       try {
-        runCoordinator.setSession(sessionId, authorizationGeneration);
+        runCoordinator.setSession(sessionId, entryGeneration);
         commandController = runCoordinator.create({
           sessionId,
-          authorizationGeneration,
+          authorizationGeneration: entryGeneration,
           objective: "",
         });
       } catch {
         deliverBoundCommandResult(
           failureProjection("RLM_RUN_LIMIT", "pi-rlm could not allocate a local run handle."),
           sessionId,
-          authorizationGeneration,
+          entryGeneration,
           undefined,
           ctx,
         );
@@ -631,7 +716,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       const lifecycle: CommandLifecycle = {
         ownership: commandController,
         sessionId,
-        authorizationGeneration,
+        authorizationGeneration: entryGeneration,
       };
       activeCommandRuns.add(commandController);
       requireCoordinatorMutation(commandController.setPhase("source_capture"), "source capture");

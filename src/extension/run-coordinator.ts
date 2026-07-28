@@ -82,6 +82,8 @@ export interface RunCoordinator {
   resolve(alias: string): CoordinatedRun | undefined;
   list(): readonly CoordinatedRun[];
   cancel(control: LocalRunControl): CoordinatorCancelResult;
+  /** Host-only exact local alias lookup; never exposes the stored control token. */
+  cancelLocalAlias(alias: string): CoordinatorCancelResult;
   subscribe(subscriber: (runs: readonly CoordinatedRun[]) => void): () => void;
 }
 
@@ -408,6 +410,12 @@ export const createRunCoordinator = (options: RunCoordinatorOptions = {}): RunCo
     },
     list: listing,
     cancel,
+    cancelLocalAlias: (alias) => {
+      if (!SAFE_ALIAS.test(alias)) return { ok: false, code: "RUN_NOT_FOUND" };
+      const record = aliases.get(alias);
+      if (!record || record.localId !== alias) return { ok: false, code: "RUN_NOT_FOUND" };
+      return cancel({ localId: record.localId, token: record.controlToken });
+    },
     subscribe: (subscriber) => {
       if (subscribers.size >= RUN_COORDINATOR_MAX_SUBSCRIBERS)
         throw coordinatorError("COORDINATOR_SUBSCRIBER_LIMIT", "subscriber limit reached");
