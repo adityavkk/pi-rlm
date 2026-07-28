@@ -162,8 +162,10 @@ previews, workspace/trajectory objects, and serialization buffers are transient
 and not additional charges. `events.jsonl`, rebuildable `status.json`,
 run-manifest hashes, and control metadata are excluded: this journal is the
 authoritative control plane and must remain writable to record exhaustion and
-terminal state. The v1 checkpoint bridge stores no snapshots. Provider-token
-accounting remains separate from stored bytes.
+terminal state. Version-1 runtime checkpoints are control-plane snapshots and
+are excluded from the hydrated retained-byte ledger; every runtime context and
+artifact in the checkpoint remains charged exactly. Provider-token accounting
+remains separate from stored bytes.
 
 ## Context filesystem boundary
 

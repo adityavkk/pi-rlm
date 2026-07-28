@@ -132,8 +132,8 @@ export interface RunResult {
   readonly ledger: Ledger;
 }
 
-type Phase = "journal" | "source" | "controller" | "extractor" | "context";
-type PlannedResult = Omit<RunResult, "ledger">;
+export type Phase = "journal" | "source" | "controller" | "extractor" | "context";
+export type PlannedResult = Omit<RunResult, "ledger">;
 
 const safeCause = (error: unknown): RunError["cause"] => {
   if (!error || typeof error !== "object") return undefined;
@@ -147,7 +147,7 @@ const safeCause = (error: unknown): RunError["cause"] => {
   return { name, ...(code ? { code } : {}) };
 };
 
-const failure = (runId: string, code: string, message: string, cause?: unknown): PlannedResult => ({
+export const failure = (runId: string, code: string, message: string, cause?: unknown): PlannedResult => ({
   runId,
   status: "failed",
   error: {
@@ -157,13 +157,13 @@ const failure = (runId: string, code: string, message: string, cause?: unknown):
   },
 });
 
-const cancellation = (runId: string): PlannedResult => ({
+export const cancellation = (runId: string): PlannedResult => ({
   runId,
   status: "cancelled",
   error: { code: "CANCELLED", message: "run cancelled by owner" },
 });
 
-const exceptionResult = (
+export const exceptionResult = (
   runId: string,
   phase: Phase,
   error: unknown,
@@ -302,7 +302,7 @@ const resultFromTerminal = (event: TerminalEvent, initial: PlannedResult): Plann
 };
 
 /** Close every successfully opened frame, then append the sole run terminal. */
-const finalize = async (
+export const finalize = async (
   journal: JournalStore,
   rootFrameId: string,
   initial: PlannedResult,

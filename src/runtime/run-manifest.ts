@@ -25,7 +25,7 @@ import {
 } from "./extractor.ts";
 import { validateProfile, type Profile } from "./profile.ts";
 
-export const RUN_MANIFEST_SCHEMA_VERSION = 3;
+export const RUN_MANIFEST_SCHEMA_VERSION = 4;
 export const RLM_RUNTIME_VERSION = "0.0.2";
 export const RLM_DSL_VERSION = "0.2.0";
 export { CONTROLLER_PROMPT_VERSION, CONTROLLER_TURN_VERSION, EXTRACTOR_PROMPT_VERSION };
@@ -320,6 +320,19 @@ const promptBindings = (
 const computeManifestHash = (manifest: unknown): string =>
   sha256(canonicalStringify(plainJson(manifest, "run manifest")));
 
+/** Require exact behavior-affecting component identity for checkpoint continuation. */
+export const assertRunComponentsCompatible = (
+  document: RunManifestDocument,
+  input: RunComponentPreflightInput,
+): void => {
+  const current = preflightRunComponents(input);
+  if (canonicalStringify(plainJson(current.backend, "current backend identity"))
+      !== canonicalStringify(plainJson(document.manifest.backend, "manifest backend identity"))
+    || canonicalStringify(plainJson(current.components, "current component identities"))
+      !== canonicalStringify(plainJson(document.manifest.components, "manifest component identities")))
+    throw new RunManifestCompatibilityError("runtime components do not exactly match the resumable manifest");
+};
+
 /** Build the complete canonical identity before any run-owned effect. */
 export const buildRunManifest = (input: BuildRunManifestInput): RunManifestDocument => {
   if (input.dslVersion !== RLM_DSL_VERSION) throw new TypeError(`unsupported DSL version ${input.dslVersion}`);
@@ -585,8 +598,12 @@ export const readRunManifest = async (
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
 ): Promise<RunManifestDocument> => {
   try {
-    const parsed = JSON.parse((await fileSystem.readFile(join(dir, RUN_MANIFEST_FILE))).toString("utf8")) as unknown;
-    return parseManifestDocument(parsed);
+    const text = (await fileSystem.readFile(join(dir, RUN_MANIFEST_FILE))).toString("utf8");
+    const parsed = JSON.parse(text) as unknown;
+    const document = parseManifestDocument(parsed);
+    if (`${canonicalStringify(plainJson(document, "stored run manifest"))}\n` !== text)
+      throw new TypeError("stored run manifest is not canonical strict JSON");
+    return document;
   } catch (error) {
     if (error instanceof RunDirectoryError) throw error;
     if (error instanceof RunManifestCompatibilityError)

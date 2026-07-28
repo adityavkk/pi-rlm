@@ -254,6 +254,12 @@ export interface JournalBatchAppendOutcome extends JournalStatusCacheOutcome {
 
 export interface JournalAuthoritySnapshot extends ParsedJournalSnapshot {
   readonly prefixSha256: string;
+  /** Exact verified JSONL bytes. Returned as an owned copy for prefix binding. */
+  readonly verifiedPrefix: Uint8Array;
+}
+
+export interface JournalTailInspection extends JournalAuthoritySnapshot {
+  readonly incompleteTailBytes: number;
 }
 
 export interface JournalTailRepairOutcome extends JournalAuthoritySnapshot {
@@ -296,6 +302,24 @@ export class JournalStore {
     return this.enqueue(parsed, true);
   }
 
+  /** Read one verified prefix without repairing its incomplete final record. */
+  inspectTail(): Promise<JournalTailInspection> {
+    return this.enqueueControl(async () => {
+      const raw = await this.fileSystem.readFile(this.eventsPath);
+      const scanned = scanJournal(raw);
+      if (!scanned.ok) throw scanned.error;
+      const prefix = raw.subarray(0, scanned.value.verifiedBytes);
+      return {
+        events: scanned.value.events,
+        eventPositions: scanned.value.eventPositions,
+        verifiedBytes: scanned.value.verifiedBytes,
+        prefixSha256: sha256Raw(prefix),
+        verifiedPrefix: Buffer.from(prefix),
+        incompleteTailBytes: raw.length - scanned.value.verifiedBytes,
+      };
+    });
+  }
+
   /** Stable complete prefix used to bind a content checkpoint before its commit event. */
   authoritySnapshot(): Promise<JournalAuthoritySnapshot> {
     return this.enqueueControl(async () => {
@@ -309,6 +333,7 @@ export class JournalStore {
         eventPositions: scanned.value.eventPositions,
         verifiedBytes: scanned.value.verifiedBytes,
         prefixSha256: sha256Raw(raw),
+        verifiedPrefix: Buffer.from(raw),
       };
     });
   }
@@ -334,6 +359,7 @@ export class JournalStore {
           eventPositions: scanned.value.eventPositions,
           verifiedBytes: scanned.value.verifiedBytes,
           prefixSha256: sha256Raw(prefix),
+          verifiedPrefix: Buffer.from(prefix),
           removedBytes,
         };
       } catch (error) {

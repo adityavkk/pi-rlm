@@ -18,3 +18,4 @@ export * from "./run-recovery.ts";
 export * from "./run-inspection.ts";
 export * from "./run-progress.ts";
 export { runProgram, RLM_DSL_VERSION, type RunInput, type RunLifecycleHooks, type RunResult, type RunWarning } from "./run.ts";
+export { resumeProgram, type ResumeInput } from "./run-resume.ts";

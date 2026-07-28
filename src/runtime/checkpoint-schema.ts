@@ -2,6 +2,7 @@
 
 import { CALL_ERROR_CODES, INTERPRETER_ERROR_CODES, isRetryable } from "../core/errors.ts";
 import { canonicalStringify, isJsonObject, type JsonObject, type JsonValue } from "../core/json.ts";
+import { sha256 as sha256Text } from "../shell/hash.ts";
 import { normalizeProgram } from "../core/program.ts";
 import { normalizeCallUsage, type CallUsage } from "../core/usage.ts";
 import { validateWorkspace } from "../core/workspace.ts";
@@ -169,7 +170,8 @@ const artifact = (value: unknown, path: string): CheckpointArtifactV1 => {
     mimeType: text(raw["mimeType"], `${path}.descriptor.mimeType`, false, 1024),
   };
   const artifactText = text(item["text"], `${path}.text`, true, Number.MAX_SAFE_INTEGER);
-  if (descriptorValue.id !== `art_${sha256}` || Buffer.byteLength(artifactText, "utf8") !== descriptorValue.bytes)
+  if (descriptorValue.id !== `art_${sha256}` || sha256 !== sha256Text(artifactText)
+    || Buffer.byteLength(artifactText, "utf8") !== descriptorValue.bytes)
     invalid(path);
   return { descriptor: descriptorValue, text: artifactText };
 };
