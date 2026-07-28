@@ -41,6 +41,11 @@ export class ResumeFixtureController implements ControllerDriver {
     version: CONTROLLER_RESUME_CAPABILITY_VERSION,
     strategy: "state-token",
     capture: (boundary) => ({ index: this.index, nextIteration: boundary.nextIteration }),
+    validate: (state, boundary) => {
+      if (!isJsonObject(state) || Object.keys(state).length !== 2 || state["index"] !== 1
+        || state["nextIteration"] !== boundary.nextIteration)
+        throw new TypeError("resume fixture controller cursor is invalid");
+    },
     restore: (state, boundary) => {
       if (!isJsonObject(state) || Object.keys(state).length !== 2 || state["index"] !== 1
         || state["nextIteration"] !== boundary.nextIteration)

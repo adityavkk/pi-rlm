@@ -31,9 +31,9 @@ const directoryFlag = constants.O_DIRECTORY ?? 0;
 export interface JournalFileHandle {
   appendFile(data: string, encoding: BufferEncoding): Promise<void>;
   close(): Promise<void>;
-  read?(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ readonly bytesRead: number }>;
+  read(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ readonly bytesRead: number }>;
   readFile(): Promise<Buffer>;
-  stat?(): Promise<Stats>;
+  stat(): Promise<Stats>;
   sync(): Promise<void>;
   truncate(length: number): Promise<void>;
   writeFile(data: string, encoding: BufferEncoding): Promise<void>;
@@ -131,7 +131,11 @@ interface JournalScan {
 const corruptLine = (lineNumber: number, line: string): InterpreterError =>
   interpreterError("JOURNAL_CORRUPT", `corrupt journal line ${lineNumber} (${lineHash(line)})`);
 
-const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => {
+const scanJournal = (
+  raw: Uint8Array,
+  control: JournalAuthorityControl = {},
+): Result<JournalScan, InterpreterError> => {
+  control.checkpoint?.();
   const verifiedBytes = raw.length === 0 || raw[raw.length - 1] === 0x0a
     ? raw.length
     : raw.lastIndexOf(0x0a) + 1;
@@ -142,12 +146,15 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
   let lineNumber = 0;
 
   for (let i = 0; i < verifiedBytes; i++) {
+    if (i % (64 * 1024) === 0) control.checkpoint?.();
     if (raw[i] !== 0x0a) continue;
     const line = Buffer.from(raw.subarray(lineStart, i)).toString("utf8");
     if (line.length === 0) return err(corruptLine(lineNumber, line));
     let parsed: unknown;
     try {
+      control.checkpoint?.();
       parsed = JSON.parse(line);
+      control.checkpoint?.();
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
         && Object.getOwnPropertyDescriptor(parsed, "type")?.value === BATCH_RECORD_TYPE) {
         const envelope = parsed as Record<string, unknown>;
@@ -187,6 +194,7 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
     lineNumber++;
   }
 
+  control.checkpoint?.();
   return ok({ events, eventPositions, verifiedBytes, batchIds });
 };
 
@@ -205,16 +213,9 @@ const readBoundedJournalHandle = async (
   requirePrivate = false,
 ): Promise<Buffer> => {
   control.checkpoint?.();
-  if (!handle.stat || !handle.read) {
-    const fallback = await handle.readFile();
-    if (fallback.length > MAX_JOURNAL_AUTHORITY_BYTES)
-      throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
-    control.checkpoint?.();
-    return fallback;
-  }
   const before = await handle.stat();
   if (!before.isFile() || before.nlink !== 1 || (requirePrivate && (before.mode & 0o077) !== 0)
-    || before.size > MAX_JOURNAL_AUTHORITY_BYTES)
+    || !Number.isSafeInteger(before.size) || before.size < 0 || before.size > MAX_JOURNAL_AUTHORITY_BYTES)
     throw interpreterError("JOURNAL_CORRUPT", "journal is not one bounded private regular file");
   control.checkpoint?.();
   const raw = Buffer.alloc(before.size);
@@ -357,7 +358,7 @@ export class JournalStore {
       let raw: Buffer;
       try { raw = await readBoundedJournalHandle(handle, control, true); }
       finally { await handle.close(); }
-      const scanned = scanJournal(raw);
+      const scanned = scanJournal(raw, control);
       if (!scanned.ok) throw scanned.error;
       const prefix = raw.subarray(0, scanned.value.verifiedBytes);
       return {
@@ -378,7 +379,7 @@ export class JournalStore {
       let raw: Buffer;
       try { raw = await readBoundedJournalHandle(handle, control, true); }
       finally { await handle.close(); }
-      const scanned = scanJournal(raw);
+      const scanned = scanJournal(raw, control);
       if (!scanned.ok) throw scanned.error;
       if (scanned.value.verifiedBytes !== raw.length)
         throw interpreterError("JOURNAL_CORRUPT", "journal has an incomplete tail at checkpoint boundary");
@@ -400,13 +401,15 @@ export class JournalStore {
       try {
         handle = await this.fileSystem.open(this.eventsPath, constants.O_RDWR | noFollow);
         const raw = await readBoundedJournalHandle(handle, control, true);
-        const scanned = scanJournal(raw);
+        const scanned = scanJournal(raw, control);
         if (!scanned.ok) throw scanned.error;
         const removedBytes = raw.length - scanned.value.verifiedBytes;
         if (removedBytes > 0) {
           control.checkpoint?.();
           await handle.truncate(scanned.value.verifiedBytes);
+          control.checkpoint?.();
           await handle.sync();
+          control.checkpoint?.();
         }
         const prefix = raw.subarray(0, scanned.value.verifiedBytes);
         return {
@@ -578,9 +581,7 @@ export class JournalStore {
     line: string,
     expectedBatchId?: string,
   ): Promise<boolean> {
-    const raw = handle.stat && handle.read
-      ? await readBoundedJournalHandle(handle)
-      : await this.fileSystem.readFile(this.eventsPath);
+    const raw = await readBoundedJournalHandle(handle);
     if (raw.length > MAX_JOURNAL_AUTHORITY_BYTES)
       throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
     const expected = Buffer.from(line, "utf8");
@@ -604,15 +605,15 @@ export class JournalStore {
 
   private async readEventsInternal(): Promise<Result<RlmEvent[], InterpreterError>> {
     const read = async (): Promise<Result<RlmEvent[], InterpreterError>> => {
-      let raw: Buffer;
-      try {
-        raw = await this.fileSystem.readFile(this.eventsPath);
-        if (raw.length > MAX_JOURNAL_AUTHORITY_BYTES)
-          throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
-      } catch (error) {
+      let handle: JournalFileHandle;
+      try { handle = await this.fileSystem.open(this.eventsPath, constants.O_RDONLY | noFollow); }
+      catch (error) {
         if (isMissing(error)) return ok([]);
         throw error;
       }
+      let raw: Buffer;
+      try { raw = await readBoundedJournalHandle(handle); }
+      finally { await handle.close(); }
       const scanned = scanJournal(raw);
       return scanned.ok ? ok(scanned.value.events) : scanned;
     };

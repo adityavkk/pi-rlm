@@ -25,6 +25,8 @@ export interface ControllerResumeCapabilityV1 {
   /** `trajectory-derived` has no private cursor; `state-token` checkpoints one bounded JSON cursor. */
   readonly strategy: "trajectory-derived" | "state-token";
   capture(boundary: ControllerResumeBoundary): JsonValue;
+  /** Effect-free validation used before journal repair or runtime restoration. */
+  validate(state: JsonValue, boundary: ControllerResumeBoundary): void;
   restore(state: JsonValue, boundary: ControllerResumeBoundary): void;
 }
 
@@ -71,6 +73,13 @@ export class ControllerResumeCapabilityError extends TypeError {
   readonly code = "CONTROLLER_RESUME_UNSUPPORTED";
 }
 
+const capabilityData = (value: object, key: keyof ControllerResumeCapabilityV1): unknown => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor || !("value" in descriptor) || descriptor.get || descriptor.set)
+    throw new ControllerResumeCapabilityError(`controller resume capability.${key} must be an own data property`);
+  return descriptor.value;
+};
+
 /** Effect-free own-data inspection. Accessors cannot run during component preflight. */
 export const inspectControllerResumeCapability = (
   controller: ControllerDriver,
@@ -79,15 +88,28 @@ export const inspectControllerResumeCapability = (
   if (!descriptor) return undefined;
   if (!("value" in descriptor) || descriptor.value === undefined || descriptor.get || descriptor.set)
     throw new ControllerResumeCapabilityError("controller resume capability must be an own data property");
-  const capability = descriptor.value as Partial<ControllerResumeCapabilityV1>;
-  if (capability === null || typeof capability !== "object"
-    || capability.version !== CONTROLLER_RESUME_CAPABILITY_VERSION
-    || (capability.strategy !== "trajectory-derived" && capability.strategy !== "state-token")
-    || typeof capability.capture !== "function" || typeof capability.restore !== "function")
+  const source = descriptor.value;
+  if (source === null || typeof source !== "object")
     throw new ControllerResumeCapabilityError("controller resume capability is malformed or unsupported");
+  const version = capabilityData(source, "version");
+  const strategy = capabilityData(source, "strategy");
+  const capture = capabilityData(source, "capture");
+  const validate = capabilityData(source, "validate");
+  const restore = capabilityData(source, "restore");
+  if (version !== CONTROLLER_RESUME_CAPABILITY_VERSION
+    || (strategy !== "trajectory-derived" && strategy !== "state-token")
+    || typeof capture !== "function" || typeof validate !== "function" || typeof restore !== "function")
+    throw new ControllerResumeCapabilityError("controller resume capability is malformed or unsupported");
+  const capability: ControllerResumeCapabilityV1 = Object.freeze({
+    version: CONTROLLER_RESUME_CAPABILITY_VERSION,
+    strategy,
+    capture: capture.bind(source) as ControllerResumeCapabilityV1["capture"],
+    validate: validate.bind(source) as ControllerResumeCapabilityV1["validate"],
+    restore: restore.bind(source) as ControllerResumeCapabilityV1["restore"],
+  });
   return {
-    identity: { version: CONTROLLER_RESUME_CAPABILITY_VERSION, strategy: capability.strategy },
-    capability: capability as ControllerResumeCapabilityV1,
+    identity: { version: CONTROLLER_RESUME_CAPABILITY_VERSION, strategy },
+    capability,
   };
 };
 

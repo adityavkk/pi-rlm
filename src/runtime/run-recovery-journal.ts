@@ -88,6 +88,13 @@ const recoveryKeyRegistryId = (runId: string, event: Extract<RlmEvent, { type: "
 
 const operationKeyRegistryId = (kind: "llm" | "agent", key: string): string => `${kind}\0${key}`;
 
+/** Global llm/agent executions may legitimately retry from another frame. */
+export const recoveryCallRetryFrameCompatible = (
+  prior: Pick<CallEvent, "frameId" | "kind">,
+  current: Pick<CallEvent, "frameId" | "kind">,
+): boolean => prior.kind === current.kind
+  && ((current.kind === "llm" || current.kind === "agent") || prior.frameId === current.frameId);
+
 const rememberExact = <K, T>(registry: Map<K, T>, key: K, event: T, label: string): boolean => {
   const existing = registry.get(key);
   if (!existing) {
@@ -401,8 +408,8 @@ export const validateRecoveryJournal = (
         const executions = calls.get(event.callId) ?? [];
         const prior = executions.at(-1);
         if (prior && same(prior, event)) break;
-        if (prior && (prior.frameId !== event.frameId || prior.kind !== event.kind || prior.key !== event.key
-          || prior.ok)) semanticError("invalid repeated call execution");
+        if (prior && (!recoveryCallRetryFrameCompatible(prior, event) || prior.key !== event.key || prior.ok))
+          semanticError("invalid repeated call execution");
         if (event.kind === "llm" || event.kind === "agent") {
           const expectedCallId = `call_${event.kind}_${sha256(canonicalStringify({
             runId,
@@ -412,8 +419,9 @@ export const validateRecoveryJournal = (
           }))}`;
           const operation = operations.get(`${event.frameId}\0${event.callId}`);
           const segment = operation?.segments.at(-1);
-          if (event.callId !== expectedCallId || !event.ok || operation?.kind !== event.kind || !segment
-            || segment.settlements !== segment.intents.length || segment.outcomes.at(-1)?.outcome !== "ok"
+          const operationSucceeded = segment?.outcomes.at(-1)?.outcome === "ok";
+          if (event.callId !== expectedCallId || operation?.kind !== event.kind || !segment
+            || segment.settlements !== segment.intents.length || event.ok !== operationSucceeded
             || !same(event.usage, segment.usage))
             semanticError("committed call identity or usage does not match authoritative operation settlements");
         }

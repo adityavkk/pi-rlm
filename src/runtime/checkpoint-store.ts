@@ -22,6 +22,7 @@ import {
   runCheckpointAggregateByteLimit,
   runCheckpointPayloadByteLimit,
 } from "./checkpoint-types.ts";
+import { checkpointControlFailure, isOptionalCheckpointStorageFailure } from "./checkpoint-failure.ts";
 
 export const RUN_CHECKPOINT_DIRECTORY = "checkpoints";
 const PENDING_FILE = ".pending.tmp";
@@ -44,7 +45,12 @@ export interface RunCheckpointPhysicalUsage {
 }
 
 export class RunCheckpointStoreError extends Error {
-  override readonly name = "RunCheckpointStoreError";
+  override readonly name: string = "RunCheckpointStoreError";
+}
+
+export class RunCheckpointCapacityError extends RunCheckpointStoreError {
+  override readonly name = "RunCheckpointCapacityError";
+  readonly code = "CHECKPOINT_CAPACITY";
 }
 
 const checkpointPath = (dir: string, sequence: number): string =>
@@ -106,12 +112,12 @@ export class RunCheckpointStore {
     } finally { await directory.close(); }
   }
 
-  private async privateFileSize(path: string): Promise<number> {
+  private async privateFileSize(path: string, allowEmpty = false): Promise<number> {
     const handle = await this.operation(path, () => open(path, constants.O_RDONLY | noFollow));
     try {
       const before = await this.operation(path, () => handle.stat());
       if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o077) !== 0
-        || before.size < 1 || before.size > this.payloadLimit)
+        || before.size < (allowEmpty ? 0 : 1) || before.size > this.payloadLimit)
         throw new RunCheckpointStoreError("checkpoint entry is not one bounded private regular file");
       const after = await this.operation(path, () => handle.stat());
       if (!stable(before, after)) throw new RunCheckpointStoreError("checkpoint entry changed during inspection");
@@ -125,9 +131,11 @@ export class RunCheckpointStore {
     for (const name of names) {
       if (name !== PENDING_FILE && !SLOT.test(name))
         throw new RunCheckpointStoreError("checkpoint directory contains an unexpected entry");
-      const size = await this.privateFileSize(join(this.directory, name));
+      // O_CREAT|O_EXCL may leave exactly zero bytes after a crash. Only the
+      // fixed pending leaf receives that tolerance; authoritative slots do not.
+      const size = await this.privateFileSize(join(this.directory, name), name === PENDING_FILE);
       if (bytes > this.aggregateLimit - size)
-        throw new RunCheckpointStoreError("checkpoint storage exceeds its aggregate byte limit");
+        throw new RunCheckpointCapacityError("checkpoint storage exceeds its aggregate byte limit");
       bytes += size;
     }
     return {
@@ -141,7 +149,7 @@ export class RunCheckpointStore {
   private async removePending(): Promise<void> {
     const path = join(this.directory, PENDING_FILE);
     try {
-      await this.privateFileSize(path);
+      await this.privateFileSize(path, true);
       const remove = this.instrumentation.unlink ?? unlink;
       await this.operation(path, () => remove(path));
       await this.syncDirectory();
@@ -227,9 +235,17 @@ export class RunCheckpointStore {
         bytes: prepared.bytes,
       };
     } catch (error) {
-      try { await this.removePending(); } catch { /* A fixed pending name remains within the aggregate cap. */ }
+      let cleanupError: unknown;
+      try { await this.removePending(); } catch (cleanup) { cleanupError = cleanup; }
       checkpoint();
-      return undefined;
+      const controlFailure = checkpointControlFailure(error)
+        ?? (cleanupError === undefined ? undefined : checkpointControlFailure(cleanupError));
+      if (controlFailure !== undefined) throw controlFailure;
+      if (isOptionalCheckpointStorageFailure(error)
+        && (cleanupError === undefined || isOptionalCheckpointStorageFailure(cleanupError))) return undefined;
+      if (cleanupError !== undefined)
+        throw new AggregateError([error, cleanupError], "checkpoint publication and pending cleanup both failed");
+      throw error;
     }
   }
 

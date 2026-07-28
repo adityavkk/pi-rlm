@@ -19,6 +19,12 @@ export class MockController implements ControllerDriver {
     version: CONTROLLER_RESUME_CAPABILITY_VERSION,
     strategy: "state-token",
     capture: (boundary) => ({ index: this.index, nextIteration: boundary.nextIteration }),
+    validate: (state, boundary) => {
+      if (!isJsonObject(state) || Object.keys(state).length !== 2
+        || !Number.isSafeInteger(state["index"]) || (state["index"] as number) < 0
+        || state["nextIteration"] !== boundary.nextIteration)
+        throw new TypeError("MockController checkpoint cursor is invalid");
+    },
     restore: (state, boundary) => {
       if (!isJsonObject(state) || Object.keys(state).length !== 2
         || !Number.isSafeInteger(state["index"]) || (state["index"] as number) < 0

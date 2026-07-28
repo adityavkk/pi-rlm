@@ -351,7 +351,9 @@ export class ContextStore {
     path: string,
     directory: string,
     reference: ContextContentReference,
+    control?: ContextOperationControl,
   ): Promise<Uint8Array> {
+    control?.checkpoint?.();
     const handle = await this.openPayload(path, directory, reference.id, true);
     try {
       const before = await this.fileOperation(path, () => handle.stat());
@@ -359,12 +361,14 @@ export class ContextStore {
         throw new ContextIntegrityError(reference.id, "type");
       if (before.size !== reference.bytes || reference.bytes > MAX_VERIFIED_CONTEXT_BYTES)
         throw new ContextIntegrityError(reference.id, "length");
+      control?.checkpoint?.();
       const buffer = Buffer.alloc(reference.bytes);
       let offset = 0;
       while (offset < buffer.length) {
+        control?.checkpoint?.();
         const { bytesRead } = await this.fileOperation(
           path,
-          () => handle.read(buffer, offset, buffer.length - offset, offset),
+          () => handle.read(buffer, offset, Math.min(64 * 1024, buffer.length - offset), offset),
         );
         if (bytesRead === 0) break;
         offset += bytesRead;
@@ -376,7 +380,9 @@ export class ContextStore {
         || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
         throw new ContextIntegrityError(reference.id, "length");
       const bytes = new Uint8Array(buffer);
+      control?.checkpoint?.();
       if (this.contentHash(bytes) !== reference.sha256) throw new ContextIntegrityError(reference.id, "hash");
+      control?.checkpoint?.();
       await this.revalidateDirectory(directory, reference.id);
       return bytes;
     } finally {
@@ -709,8 +715,9 @@ export class ContextStore {
   }
 
   /** Verify and atomically install an exact descriptor catalog into a fresh process store. */
-  hydrateFromDisk(descriptors: readonly ContextDescriptor[]): Promise<void> {
+  hydrateFromDisk(descriptors: readonly ContextDescriptor[], control?: ContextOperationControl): Promise<void> {
     const hydrate = async (): Promise<void> => {
+      control?.checkpoint?.();
       const release = await this.acquireMutation();
       try {
         if (this.entries.size !== 0 || this.orphans.size !== 0 || this.uniqueBytes !== 0)
@@ -720,6 +727,7 @@ export class ContextStore {
         let total = 0;
         let previous = "";
         for (const descriptor of descriptors) {
+          control?.checkpoint?.();
           if (typeof descriptor !== "object" || descriptor === null
             || !/^ctx_[0-9a-f]{64}$/.test(descriptor.id)
             || !/^[0-9a-f]{64}$/.test(descriptor.sha256)
@@ -732,7 +740,7 @@ export class ContextStore {
             throw new ContextSpecError("context hydration descriptor catalog is invalid");
           if (total > Number.MAX_SAFE_INTEGER - descriptor.bytes)
             throw new ContextSpecError("context hydration byte total is too large");
-          const bytesArray = await this.loadFromDisk(descriptor);
+          const bytesArray = await this.loadFromDisk(descriptor, control);
           hydrated.push({ descriptor: { ...descriptor }, bytesArray });
           ids.add(descriptor.id);
           previous = descriptor.id;
@@ -1090,7 +1098,7 @@ export class ContextStore {
     };
   }
 
-  async loadFromDisk(reference: ContextContentReference): Promise<Uint8Array> {
+  async loadFromDisk(reference: ContextContentReference, control?: ContextOperationControl): Promise<Uint8Array> {
     if (typeof reference !== "object" || reference === null)
       throw new ContextSpecError("context reference must be an object");
     if (!/^ctx_[0-9a-f]{64}$/.test(reference.id))
@@ -1098,11 +1106,13 @@ export class ContextStore {
     if (!/^[0-9a-f]{64}$/.test(reference.sha256) || reference.id !== this.makeId(reference.sha256))
       throw new ContextSpecError("context id and SHA-256 must be the same fixed lowercase hexadecimal digest");
     boundedInteger(reference.bytes, "bytes", 0, Number.MAX_SAFE_INTEGER);
+    control?.checkpoint?.();
     const directory = await this.contentDirectory(reference.id, false);
     const path = this.payloadPath(directory, `${reference.sha256}.bin`, reference.id);
     await this.revalidateDirectory(directory, reference.id);
-    const bytes = await this.verifyPayload(path, directory, reference);
+    const bytes = await this.verifyPayload(path, directory, reference, control);
     await this.revalidateDirectory(directory, reference.id);
+    control?.checkpoint?.();
     return bytes;
   }
 }

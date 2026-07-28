@@ -94,7 +94,9 @@ const operationFaultFileSystem = (target: EventKind, seam: FaultSeam): JournalFi
       const handle = await nodeJournalFileSystem.open(path, flags, mode);
       let targetAppend = false;
       return {
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
         readFile: () => handle.readFile(),
+        stat: () => handle.stat(),
         truncate: (length) => handle.truncate(length),
         writeFile: (data, encoding) => handle.writeFile(data, encoding),
         appendFile: async (data, encoding) => {

@@ -272,6 +272,7 @@ const resumeProgramOwned = async (
   const checkpointStore = new RunCheckpointStore(input.dir, profile.storedByteLimit, contextInstrumentation);
   const recovered = await recoverLatestRunCheckpoint(document, journal, store, checkpointStore, {
     checkpoint: () => throwIfAborted(scope.signal),
+    validateControllerState: (state, boundary) => controllerResume.capability.validate(state, boundary),
   });
   const payload = recovered.payload;
 
@@ -383,7 +384,7 @@ export interface ResumableManagedRunInspection {
 
 const inspectResumableManagedRunOwned = async (input: ResumeInput): Promise<ResumableManagedRunInspection> => {
   throwIfAborted(input.signal);
-  requireControllerResumeCapability(input.controller);
+  const controllerResume = requireControllerResumeCapability(input.controller);
   const binding = recoveredBinding(input);
   const clock = input.clock ?? systemClock;
   const { document } = await readCompatibleManifest(input, () => throwIfAborted(input.signal));
@@ -401,7 +402,11 @@ const inspectResumableManagedRunOwned = async (input: ResumeInput): Promise<Resu
       new JournalStore(input.dir, persistence.journalFileSystem()),
       new ContextStore(input.dir, contextStoreLimits(profile), instrumentation),
       new RunCheckpointStore(input.dir, profile.storedByteLimit, instrumentation),
-      { repair: false, checkpoint: () => throwIfAborted(scope.signal) },
+      {
+        repair: false,
+        checkpoint: () => throwIfAborted(scope.signal),
+        validateControllerState: (state, boundary) => controllerResume.capability.validate(state, boundary),
+      },
     );
     return {
       runId: document.manifest.run.id,

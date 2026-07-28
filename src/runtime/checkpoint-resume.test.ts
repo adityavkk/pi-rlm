@@ -12,6 +12,7 @@ import { sha256 } from "../shell/hash.ts";
 import { JournalStore } from "../shell/journal-store.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
+import { OperationAbortedError } from "./abort.ts";
 import { ResumeFixtureController } from "./checkpoint-resume-fixture.ts";
 import { runCheckpointPayloadPath } from "./checkpoint-store.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
@@ -260,6 +261,19 @@ describe("managed checkpoint continuation", () => {
       lease = await new ManagedRunStore({ root }).openForResume(name);
       const eventsPath = join(lease.dir, "events.jsonl");
       const originalEvents = await readFile(eventsPath, "utf8");
+      const originalCheckpointEvent = JSON.parse(originalEvents.trim().split("\n").at(-1)!) as { checkpointSequence: number };
+      const checkpointPath = runCheckpointPayloadPath(lease.dir, originalCheckpointEvent.checkpointSequence);
+      const originalPayload = await readFile(checkpointPath);
+      await rewriteCheckpointPayload(lease.dir, (payload) => {
+        (payload["controller"] as Record<string, unknown>)["state"] = { index: 99, nextIteration: 2 };
+      });
+      await expectRecoveryCode(inspectResumableManagedRun({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend, dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
+      }), "RECOVERY_CONTROLLER_STATE_INVALID");
+      await writeFile(checkpointPath, originalPayload, { mode: 0o600 });
+      await writeFile(eventsPath, originalEvents, { mode: 0o600 });
       const mutations: Array<(payload: Record<string, unknown>) => void> = [
         (payload) => { ((payload["root"] as Record<string, unknown>)["workspace"] as Record<string, unknown>)["count"] = 9; },
         (payload) => { (((payload["root"] as Record<string, unknown>)["trajectory"] as Array<Record<string, unknown>>)[0]!)["code"] = "tampered"; },
@@ -267,6 +281,10 @@ describe("managed checkpoint continuation", () => {
         (payload) => { (((payload["keyBindings"] as Array<Record<string, unknown>>)[0]!)["identityHash"]) = "0".repeat(64); },
         (payload) => { (((payload["callCache"] as Array<Record<string, unknown>>)[0]!["result"] as Record<string, unknown>)["value"]) = "tampered"; },
         (payload) => { const ordinals = payload["ordinals"] as Record<string, number>; ordinals["frameSequence"] = (ordinals["frameSequence"] ?? 0) + 1; },
+        (payload) => {
+          const attempts = (payload["ordinals"] as Record<string, unknown>)["operationAttempts"] as Array<Record<string, number>>;
+          attempts[0]!["value"] = (attempts[0]!["value"] ?? 0) + 1;
+        },
         (payload) => { (((payload["artifacts"] as Array<Record<string, unknown>>)[0]!["text"])) = "tampered artifact"; },
       ];
       const model = new MockModelClient(() => "must-not-run", modelIdentity);
@@ -409,6 +427,14 @@ describe("managed checkpoint continuation", () => {
         backend, dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
       });
       expect(inspected.incompleteTailBytes).toBe(Buffer.byteLength('{"type":'));
+      expect(await readFile(path)).toEqual(before);
+      await expect(resumeProgram({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend, dir: lease.dir, signal: new AbortController().signal,
+        clock: { now: () => Number.MAX_SAFE_INTEGER },
+        runLifecycle: lease.lifecycle,
+      })).rejects.toBeInstanceOf(OperationAbortedError);
       expect(await readFile(path)).toEqual(before);
       await lease.abandon();
       lease = undefined;

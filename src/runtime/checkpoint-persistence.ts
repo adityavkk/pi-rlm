@@ -7,6 +7,7 @@ import type { RunManifestDocument } from "./run-manifest.ts";
 import { validateRecoveryJournal } from "./run-recovery-journal.ts";
 import type { InternalRunState } from "./state.ts";
 import { throwIfAborted } from "./abort.ts";
+import { checkpointControlFailure, isOptionalCheckpointStorageFailure } from "./checkpoint-failure.ts";
 import { parseRunCheckpointPayload, RunCheckpointValidationError } from "./checkpoint-schema.ts";
 import { RunCheckpointStore } from "./checkpoint-store.ts";
 import type { ControllerResumeCapabilityIdentityV1, ControllerResumeCapabilityV1 } from "./controller.ts";
@@ -75,6 +76,16 @@ export interface RunCheckpointWriterOptions {
   };
   readonly signal: AbortSignal;
 }
+
+export const classifyCheckpointJournalFailure = (error: unknown): boolean => {
+  const controlFailure = checkpointControlFailure(error);
+  if (controlFailure !== undefined) throw controlFailure;
+  if (error instanceof JournalAppendError) {
+    if (error.eventDurable) return true;
+    if (isOptionalCheckpointStorageFailure(error)) return false;
+  }
+  throw error;
+};
 
 export class RunCheckpointWriter {
   constructor(private readonly options: RunCheckpointWriterOptions) {}
@@ -213,10 +224,10 @@ export class RunCheckpointWriter {
         const appended = await state.journal.append({ type: "checkpoint_committed", checkpointId, ...identity });
         return appended.event === "committed" || appended.event === "deduplicated";
       } catch (error) {
-        // Checkpoint publication is optional. A durable append is authoritative;
-        // a rejected append leaves the prior parity slot and prior checkpoint intact.
-        if (error instanceof JournalAppendError) return error.eventDurable;
-        throw error;
+        // Authority loss and cancellation are never optional. A durable event is
+        // authoritative despite ordinary storage cleanup failures; only explicit
+        // nondurable storage exhaustion may safely leave the prior checkpoint.
+        return classifyCheckpointJournalFailure(error);
       }
     } finally {
       release();

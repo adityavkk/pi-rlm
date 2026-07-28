@@ -503,6 +503,11 @@ export const claimRunDirectory = async (
   fileSystem: RunDirectoryFileSystem = nodeRunDirectoryFileSystem,
   allowedEntries: readonly string[] = [],
 ): Promise<void> => {
+  let serialized: string;
+  try { serialized = `${canonicalStringify(plainJson(document, "run manifest document"))}\n`; }
+  catch (cause) { throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "run manifest cannot be serialized", cause); }
+  if (Buffer.byteLength(serialized, "utf8") > MAX_RUN_MANIFEST_BYTES)
+    throw new RunDirectoryError("MANIFEST_WRITE_FAILED", "run manifest exceeds its resume authority byte limit");
   const mutation = async (): Promise<void> => {
   const lockPath = join(dir, RUN_LOCK_FILE);
   let lock: RunDirectoryFileHandle;
@@ -543,7 +548,7 @@ export const claimRunDirectory = async (
     const temp = await fileSystem.open(tempPath, "wx", 0o600);
     tempCreated = true;
     await closeAfter(temp, async () => {
-      await temp.writeFile(`${canonicalStringify(plainJson(document, "run manifest document"))}\n`, "utf8");
+      await temp.writeFile(serialized, "utf8");
       await temp.sync();
     });
     await fileSystem.rename(tempPath, manifestPath);

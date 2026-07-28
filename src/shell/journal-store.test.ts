@@ -89,10 +89,12 @@ const instrumentedFileSystem = (root: string, failAt?: FaultOperation): {
       await handle.close();
       maybeFail(name);
     },
+    read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
     readFile: async () => {
       operations.push(operation(path, "read"));
       return handle.readFile();
     },
+    stat: () => handle.stat(),
     sync: async () => {
       const name = operation(path, "sync");
       operations.push(name);
@@ -165,11 +167,11 @@ describe("JournalStore", () => {
     expect(raw.trimEnd().split("\n")).toHaveLength(3);
     expect(operations.slice(0, 6)).toEqual([
       "events open",
-      "events read",
       "events truncate",
       "events sync",
       "events append",
       "events sync",
+      "events close",
     ]);
 
     const events = await store.readEvents();
@@ -214,7 +216,7 @@ describe("JournalStore", () => {
     const denied = Object.assign(new Error("denied"), { code: "EACCES" });
     const fileSystem: JournalFileSystem = {
       ...nodeFileSystem,
-      readFile: async () => { throw denied; },
+      open: async () => { throw denied; },
     };
     await expect(new JournalStore(dir, fileSystem).readEvents()).rejects.toBe(denied);
   });
@@ -290,7 +292,9 @@ describe("JournalStore", () => {
               throw new Error(`injected rejection after ${prefixBytes} bytes`);
             },
             close: () => handle.close(),
+            read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
             readFile: () => handle.readFile(),
+            stat: () => handle.stat(),
             sync: () => handle.sync(),
             truncate: (length) => handle.truncate(length),
             writeFile: (data, encoding) => handle.writeFile(data, encoding),
@@ -487,7 +491,6 @@ describe("JournalStore", () => {
     await new JournalStore(dir, fileSystem).append(started);
     expect(operations).toEqual([
       "events open",
-      "events read",
       "events append",
       "events sync",
       "events close",
@@ -542,4 +545,74 @@ describe("JournalStore", () => {
       if (rebuilt.ok) expect(rebuilt.value.runId).toBe("r1");
     });
   }
+});
+
+describe("owned journal repair fault matrix", () => {
+  for (const seam of ["truncate", "sync", "close"] as const) {
+    test(`${seam} failure is surfaced and a retry never truncates beyond the parser-proven prefix`, async () => {
+      const target = await mkdtemp(join(tmpdir(), `pi-rlm-journal-repair-${seam}-`));
+      const path = join(target, "events.jsonl");
+      const prefix = `${canonicalStringify(started as unknown as JsonValue)}\n`;
+      await writeFile(path, `${prefix}{"type":`, { mode: 0o600 });
+      let fired = false;
+      const fileSystem: JournalFileSystem = {
+        ...nodeFileSystem,
+        async open(openedPath, flags) {
+          const handle = await nodeFileSystem.open(openedPath, flags);
+          if (openedPath !== path) return handle;
+          return {
+            appendFile: (data, encoding) => handle.appendFile(data, encoding),
+            read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+            readFile: () => handle.readFile(),
+            stat: () => handle.stat(),
+            truncate: async (length) => {
+              if (seam === "truncate" && !fired) {
+                fired = true;
+                throw new Error("injected repair truncate failure");
+              }
+              await handle.truncate(length);
+            },
+            sync: async () => {
+              await handle.sync();
+              if (seam === "sync" && !fired) {
+                fired = true;
+                throw new Error("injected repair sync failure");
+              }
+            },
+            close: async () => {
+              await handle.close();
+              if (seam === "close" && !fired) {
+                fired = true;
+                throw new Error("injected repair close failure");
+              }
+            },
+            writeFile: (data, encoding) => handle.writeFile(data, encoding),
+          };
+        },
+      };
+      await expect(new JournalStore(target, fileSystem).repairIncompleteTail()).rejects.toThrow(`injected repair ${seam} failure`);
+      expect(fired).toBe(true);
+      const repaired = await new JournalStore(target).repairIncompleteTail();
+      expect(repaired.verifiedPrefix).toEqual(Buffer.from(prefix));
+      expect(await readFile(path, "utf8")).toBe(prefix);
+      await import("node:fs/promises").then((fs) => fs.rm(target, { recursive: true, force: true }));
+    });
+  }
+
+  test("repair rejects symlink and hard-link leaves without modifying their targets", async () => {
+    for (const kind of ["symlink", "hardlink"] as const) {
+      const target = await mkdtemp(join(tmpdir(), `pi-rlm-journal-repair-${kind}-`));
+      const external = join(target, "external.jsonl");
+      const journalDir = join(target, "run");
+      await import("node:fs/promises").then((fs) => fs.mkdir(journalDir, { mode: 0o700 }));
+      const raw = `${canonicalStringify(started as unknown as JsonValue)}\n{"type":`;
+      await writeFile(external, raw, { mode: 0o600 });
+      const leaf = join(journalDir, "events.jsonl");
+      if (kind === "symlink") await import("node:fs/promises").then((fs) => fs.symlink(external, leaf));
+      else await import("node:fs/promises").then((fs) => fs.link(external, leaf));
+      await expect(new JournalStore(journalDir).repairIncompleteTail()).rejects.toBeDefined();
+      expect(await readFile(external, "utf8")).toBe(raw);
+      await import("node:fs/promises").then((fs) => fs.rm(target, { recursive: true, force: true }));
+    }
+  });
 });

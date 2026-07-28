@@ -27,6 +27,7 @@ describe("controller resume capability contract", () => {
     });
     const state = resumed.capability.capture(boundary);
     expect(state).toEqual({ nextIteration: 3 });
+    expect(() => resumed.capability.validate(state, boundary)).not.toThrow();
     expect(() => resumed.capability.restore(state, boundary)).not.toThrow();
     expect(() => resumed.capability.restore({ nextIteration: 2 }, boundary)).toThrow();
   });
@@ -52,5 +53,27 @@ describe("controller resume capability contract", () => {
     };
     expect(inspectControllerResumeCapability(unsupported)).toBeUndefined();
     expect(() => requireControllerResumeCapability(unsupported)).toThrow();
+  });
+
+  test("rejects capability accessors without invoking them", () => {
+    let getterCalls = 0;
+    const capability = {
+      strategy: "state-token",
+      capture: () => null,
+      validate: () => {},
+      restore: () => {},
+    } as Record<string, unknown>;
+    Object.defineProperty(capability, "version", {
+      enumerable: true,
+      get: () => { getterCalls++; return CONTROLLER_RESUME_CAPABILITY_VERSION; },
+    });
+    const hostile: ControllerDriver = {
+      identity: { id: "test/hostile-capability", version: "1", configuration: {} },
+      resumeCapability: capability as never,
+      async next() { return { reasoning: "unused", code: "" }; },
+      fork() { return this; },
+    };
+    expect(() => inspectControllerResumeCapability(hostile)).toThrow("capability.version must be an own data property");
+    expect(getterCalls).toBe(0);
   });
 });

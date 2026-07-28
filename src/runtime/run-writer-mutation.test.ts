@@ -33,7 +33,9 @@ const journalFaultFileSystem = (fault: JournalFault): JournalFileSystem => {
           }
           await handle.appendFile(data, encoding);
         },
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
         readFile: () => handle.readFile(),
+        stat: () => handle.stat(),
         truncate: (length) => handle.truncate(length),
         writeFile: (data, encoding) => handle.writeFile(data, encoding),
         async close() {
@@ -111,7 +113,9 @@ describe("lease-owned managed persistence", () => {
                 await continueAppend.promise;
               }
             },
+            read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
             readFile: () => handle.readFile(),
+            stat: () => handle.stat(),
             sync: () => handle.sync(),
             truncate: (length) => handle.truncate(length),
             writeFile: (data, encoding) => handle.writeFile(data, encoding),

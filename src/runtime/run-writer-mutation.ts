@@ -168,10 +168,10 @@ export class LeaseOwnedRunPersistence {
   private journalHandle(path: string, handle: JournalFileHandle): JournalFileHandle {
     return {
       appendFile: (data, encoding) => this.runPathEffect(path, () => handle.appendFile(data, encoding)),
-      ...(handle.read ? { read: (buffer: Uint8Array, offset: number, length: number, position: number) =>
-        this.runPathEffect(path, () => handle.read!(buffer, offset, length, position)) } : {}),
+      read: (buffer, offset, length, position) =>
+        this.runPathEffect(path, () => handle.read(buffer, offset, length, position)),
       readFile: () => this.runPathEffect(path, () => handle.readFile()),
-      ...(handle.stat ? { stat: () => this.runPathEffect(path, () => handle.stat!()) } : {}),
+      stat: () => this.runPathEffect(path, () => handle.stat()),
       sync: () => this.runPathEffect(path, () => handle.sync()),
       truncate: (length) => this.runPathEffect(path, () => handle.truncate(length)),
       writeFile: (data, encoding) => this.runPathEffect(path, () => handle.writeFile(data, encoding)),

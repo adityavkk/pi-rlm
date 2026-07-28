@@ -25,7 +25,7 @@ Terminal inspection does not invoke a model, controller, interpreter, delegated 
 
 ## Managed continuation
 
-`ManagedRunStore.openForResume(runName)` acquires the exact append-only writer successor and returns a lease-bound lifecycle. `resumeProgram()` accepts only that managed lifecycle. It validates manifest schema v4, permanent claim, exact current backend/model/controller/extractor/delegation identities, the journal-tail checkpoint, every retained payload, and exact hydrated ledger/cache/key/artifact/ordinal state before invoking runtime components. It repairs only a parser-proven incomplete final JSONL record after validation and writer acquisition. Terminal, unresolved-intent, no-checkpoint, authoritative-tail, corrupt, incompatible, and unsupported active states fail typed.
+`ManagedRunStore.openForResume(runName)` acquires the exact append-only writer successor and returns a lease-bound lifecycle. `resumeProgram()` accepts only that managed lifecycle. It validates manifest schema v5, permanent claim, exact current backend/model/controller/extractor/delegation identities, the journal-tail checkpoint, every retained payload, and exact hydrated ledger/cache/key/artifact/ordinal state before invoking runtime components. It repairs only a parser-proven incomplete final JSONL record after validation and writer acquisition. Terminal, unresolved-intent, no-checkpoint, authoritative-tail, corrupt, incompatible, and unsupported active states fail typed.
 
 Continuation reopens no run or root frame events. It starts the root at the checkpoint's next iteration and next global controller turn under the original absolute deadline. Host authorization and slash-command integration remain tracked by issue #86.
 

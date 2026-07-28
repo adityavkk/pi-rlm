@@ -246,7 +246,8 @@ describe("managed lifecycle adversarial recovery", () => {
           const handle = await open(target, flags, mode);
           return {
             appendFile: async () => { invoked = true; throw new Error("first journal append fault"); },
-            readFile: () => handle.readFile(), sync: () => handle.sync(),
+            read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+            readFile: () => handle.readFile(), stat: () => handle.stat(), sync: () => handle.sync(),
             truncate: (length) => handle.truncate(length),
             writeFile: (data, encoding) => handle.writeFile(data, encoding),
             close: () => handle.close(),

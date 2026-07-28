@@ -104,7 +104,9 @@ const terminalStatusFaultFileSystem = (root: string, fault: TerminalStatusFault)
   };
   const wrap = (path: string, handle: JournalFileHandle): JournalFileHandle => ({
     appendFile: (data, encoding) => handle.appendFile(data, encoding),
+    read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
     readFile: () => handle.readFile(),
+    stat: () => handle.stat(),
     truncate: (length) => handle.truncate(length),
     writeFile: async (data, encoding) => {
       if (path === statusTmpPath) maybeFail("status write");

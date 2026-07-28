@@ -1,12 +1,14 @@
 /** Strict selection and exact validation of one resumable root-frame checkpoint. */
 
+import { createHash } from "node:crypto";
 import type { BudgetUsage } from "../core/budget.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, isJsonObject, parseJsonValue, type JsonValue } from "../core/json.ts";
 import type { CallUsage } from "../core/usage.ts";
-import type { ContextDescriptor, ContextStore } from "../shell/context-store.ts";
+import type { ContextDescriptor, ContextOperationControl, ContextStore } from "../shell/context-store.ts";
 import { sha256, sha256Bytes } from "../shell/hash.ts";
 import type { JournalStore, JournalTailInspection } from "../shell/journal-store.ts";
+import { checkpointControlFailure } from "./checkpoint-failure.ts";
 import { parseRunCheckpointPayload, RunCheckpointValidationError } from "./checkpoint-schema.ts";
 import {
   RUN_CHECKPOINT_SCHEMA_VERSION,
@@ -29,6 +31,10 @@ const invalid = (message: string, cause?: unknown): never => {
 };
 const unsupported = (message: string): never => {
   throw new RunRecoveryError("RECOVERY_UNSUPPORTED_STATE", message);
+};
+const preserveControlFailure = (cause: unknown): void => {
+  const control = checkpointControlFailure(cause);
+  if (control !== undefined) throw control;
 };
 
 const parseCanonicalPayload = (bytes: Uint8Array, document: RunManifestDocument): RunCheckpointPayloadV1 => {
@@ -230,14 +236,16 @@ const contentJson = async (
   store: ContextStore,
   reference: { readonly id: string; readonly sha256: string; readonly bytes: number },
   label: string,
+  control: ContextOperationControl,
 ): Promise<JsonValue> => {
   try {
-    const bytes = await store.loadFromDisk(reference);
+    const bytes = await store.loadFromDisk(reference, control);
     const text = decoder.decode(bytes);
     const parsed = parseJsonValue(JSON.parse(text) as unknown);
     if (!parsed.ok || canonicalStringify(parsed.value) !== text) throw new TypeError(`${label} is not canonical strict JSON`);
     return parsed.value;
   } catch (cause) {
+    preserveControlFailure(cause);
     return invalid(`${label} content is missing or invalid`, cause);
   }
 };
@@ -273,6 +281,7 @@ const validateCallCache = async (
   state: DerivedJournalState,
   store: ContextStore,
   descriptors: ReadonlyMap<string, ContextDescriptor>,
+  control: ContextOperationControl,
 ): Promise<void> => {
   const expected = [...state.callEvents.values()].filter((event) => event.ok)
     .sort((left, right) => compare(left.callId, right.callId));
@@ -284,7 +293,7 @@ const validateCallCache = async (
       || entry.descriptor.id !== event.outputRef || entry.descriptor.sha256 !== event.outputSha256
       || entry.descriptor.bytes !== event.outputBytes || !same(entry.descriptor, descriptors.get(entry.descriptor.id)))
       invalid("checkpoint call cache identity does not match its journal event");
-    const stored = await contentJson(store, entry.descriptor, `call ${entry.callId}`);
+    const stored = await contentJson(store, entry.descriptor, `call ${entry.callId}`, control);
     if (!isJsonObject(stored)) return invalid("checkpoint call cache content is not an object");
     const expectedResult = { ...stored, outputRef: entry.descriptor.id } as JsonValue;
     if (!same(entry.result, expectedResult)) invalid("checkpoint call cache result does not match retained content");
@@ -296,6 +305,7 @@ const validateRuntimeContent = async (
   document: RunManifestDocument,
   events: readonly RlmEvent[],
   store: ContextStore,
+  control: ContextOperationControl,
 ): Promise<number> => {
   const descriptors = new Map(payload.contexts.map((descriptor) => [descriptor.id, descriptor] as const));
   let storedBytes = 0;
@@ -303,8 +313,11 @@ const validateRuntimeContent = async (
   for (const artifact of payload.artifacts) storedBytes += artifact.descriptor.bytes;
   if (!Number.isSafeInteger(storedBytes) || storedBytes > document.manifest.limits.storedByteLimit)
     invalid("checkpoint retained-byte catalog exceeds the run limit");
-  try { await store.hydrateFromDisk(payload.contexts); }
-  catch (cause) { invalid("checkpoint context catalog could not be hydrated", cause); }
+  try { await store.hydrateFromDisk(payload.contexts, control); }
+  catch (cause) {
+    preserveControlFailure(cause);
+    invalid("checkpoint context catalog could not be hydrated", cause);
+  }
 
   const model = validateRecoveryJournal(document, events);
   for (const reference of model.content) {
@@ -334,6 +347,7 @@ const validateExactState = async (
   document: RunManifestDocument,
   events: readonly RlmEvent[],
   store: ContextStore,
+  control: ContextOperationControl,
 ): Promise<void> => {
   if (payload.scopeUsage.length !== 0) unsupported("checkpoint retains active recurse usage scopes");
   if (payload.ledger.usage.activeLeafCalls !== 0 || payload.ledger.usage.tokensReserved !== 0)
@@ -342,7 +356,7 @@ const validateExactState = async (
   if (openFrames.length !== 1 || openFrames[0]?.frameId !== payload.run.rootFrameId)
     unsupported("checkpoint retains nested or ambiguous active frames");
 
-  const storedBytes = await validateRuntimeContent(payload, document, events, store);
+  const storedBytes = await validateRuntimeContent(payload, document, events, store, control);
   const state = deriveJournalState(document, events, storedBytes);
   if (!same(payload.frames, state.frames)) invalid("checkpoint frame catalog does not match the journal");
   if (!same(payload.keyBindings, state.keyBindings)) invalid("checkpoint key bindings do not match the journal");
@@ -357,13 +371,13 @@ const validateExactState = async (
   validateTrajectory(payload, state);
 
   const descriptors = new Map(payload.contexts.map((descriptor) => [descriptor.id, descriptor] as const));
-  await validateCallCache(payload, state, store, descriptors);
+  await validateCallCache(payload, state, store, descriptors, control);
   const expectedWorkspace = state.latestRootWorkspace
     ? await contentJson(store, {
         id: state.latestRootWorkspace.workspaceRef,
         sha256: state.latestRootWorkspace.workspaceSha256,
         bytes: state.latestRootWorkspace.workspaceBytes,
-      }, "root workspace")
+      }, "root workspace", control)
     : {};
   if (!same(payload.root.workspace, expectedWorkspace)) invalid("checkpoint workspace does not match the latest committed root workspace");
 }
@@ -379,6 +393,10 @@ export interface RecoveredRunCheckpoint {
 export interface RunCheckpointRecoveryOptions {
   readonly repair?: boolean;
   readonly checkpoint?: () => void;
+  readonly validateControllerState?: (
+    state: JsonValue,
+    boundary: { readonly frameId: string; readonly nextIteration: number; readonly trajectoryLength: number },
+  ) => void;
 }
 
 const checkpointEventIdentity = (event: Extract<RlmEvent, { type: "checkpoint_committed" }>) => ({
@@ -401,15 +419,34 @@ const checkpointEventIdentity = (event: Extract<RlmEvent, { type: "checkpoint_co
 const validateEveryCheckpointEvent = (
   document: RunManifestDocument,
   snapshot: JournalTailInspection,
+  checkpoint: () => void,
 ): void => {
   const byteLimit = runCheckpointPayloadByteLimit(document.manifest.limits.storedByteLimit);
+  const prefixes = snapshot.events.flatMap((event, index) =>
+    event.type === "checkpoint_committed" ? [snapshot.eventPositions[index]?.prefixBytes] : [])
+    .filter((value): value is number => value !== undefined)
+    .sort((left, right) => left - right);
+  const digests = new Map<number, string>();
+  const hash = createHash("sha256");
+  let offset = 0;
+  for (const end of prefixes) {
+    while (offset < end) {
+      checkpoint();
+      const next = Math.min(end, offset + 64 * 1024);
+      hash.update(snapshot.verifiedPrefix.subarray(offset, next));
+      offset = next;
+    }
+    checkpoint();
+    digests.set(end, hash.copy().digest("hex"));
+  }
   for (let index = 0; index < snapshot.events.length; index++) {
+    checkpoint();
     const event = snapshot.events[index]!;
     if (event.type !== "checkpoint_committed") continue;
     const position = snapshot.eventPositions[index];
     if (!position || position.eventIndex !== index
       || event.journalPrefixBytes !== position.prefixBytes || event.journalPrefixEventCount !== index
-      || event.journalPrefixSha256 !== sha256Bytes(snapshot.verifiedPrefix.subarray(0, position.prefixBytes)))
+      || event.journalPrefixSha256 !== digests.get(position.prefixBytes))
       invalid("checkpoint event does not bind its exact journal prefix");
     if (event.checkpointBytes < 1 || event.checkpointBytes > byteLimit)
       invalid("checkpoint payload exceeds its profile-scaled byte limit");
@@ -434,7 +471,10 @@ export const recoverLatestRunCheckpoint = async (
   checkpoint();
   let snapshot;
   try { snapshot = await journal.inspectTail({ checkpoint }); }
-  catch (cause) { throw new RunRecoveryError("RECOVERY_JOURNAL_CORRUPT", "run journal is corrupt", cause); }
+  catch (cause) {
+    preserveControlFailure(cause);
+    throw new RunRecoveryError("RECOVERY_JOURNAL_CORRUPT", "run journal is corrupt", cause);
+  }
   checkpoint();
   const model = validateRecoveryJournal(document, snapshot.events);
   if (model.terminal) throw new RunRecoveryError("RECOVERY_TERMINAL", "terminal runs are immutable and cannot be resumed");
@@ -442,7 +482,7 @@ export const recoverLatestRunCheckpoint = async (
   if (selectedIndex < 0) throw new RunRecoveryError("RECOVERY_CHECKPOINT_MISSING", "run has no authoritative checkpoint");
   if (selectedIndex !== snapshot.events.length - 1)
     throw new RunRecoveryError("RECOVERY_UNSAFE_TAIL", "journal has authoritative events after its latest checkpoint");
-  validateEveryCheckpointEvent(document, snapshot);
+  validateEveryCheckpointEvent(document, snapshot, checkpoint);
   const event = snapshot.events[selectedIndex] as Extract<RlmEvent, { type: "checkpoint_committed" }>;
   const position = snapshot.eventPositions[selectedIndex];
   if (!position || position.endBytes !== snapshot.verifiedBytes)
@@ -456,7 +496,10 @@ export const recoverLatestRunCheckpoint = async (
       sha256: event.checkpointSha256,
       bytes: event.checkpointBytes,
     }, checkpoint);
-  } catch (cause) { return invalid("checkpoint payload is missing or failed integrity validation", cause); }
+  } catch (cause) {
+    preserveControlFailure(cause);
+    return invalid("checkpoint payload is missing or failed integrity validation", cause);
+  }
   const payload = parseCanonicalPayload(checkpointBytes, document);
   if (payload.identity.checkpointSequence !== event.checkpointSequence
     || payload.run.rootFrameId !== event.frameId || payload.root.frame.frameId !== event.frameId
@@ -466,7 +509,20 @@ export const recoverLatestRunCheckpoint = async (
       bytes: event.journalPrefixBytes,
       eventCount: event.journalPrefixEventCount,
     })) invalid("checkpoint payload identity does not match its commit event");
-  await validateExactState(payload, document, snapshot.events, runtimeStore);
+  await validateExactState(payload, document, snapshot.events, runtimeStore, { checkpoint });
+  checkpoint();
+  if (options.validateControllerState) {
+    try {
+      options.validateControllerState(payload.controller.state, {
+        frameId: payload.root.frame.frameId,
+        nextIteration: payload.root.nextIteration,
+        trajectoryLength: payload.root.trajectory.length,
+      });
+    } catch (cause) {
+      preserveControlFailure(cause);
+      throw new RunRecoveryError("RECOVERY_CONTROLLER_STATE_INVALID", "controller checkpoint state is invalid", cause);
+    }
+  }
   checkpoint();
   if (options.repair === false) return {
     payload,
@@ -478,7 +534,10 @@ export const recoverLatestRunCheckpoint = async (
 
   let repaired;
   try { repaired = await journal.repairIncompleteTail({ checkpoint }); }
-  catch (cause) { throw new RunRecoveryError("RECOVERY_UNSTABLE", "validated journal tail could not be repaired", cause); }
+  catch (cause) {
+    preserveControlFailure(cause);
+    throw new RunRecoveryError("RECOVERY_UNSTABLE", "validated journal tail could not be repaired", cause);
+  }
   if (repaired.verifiedBytes !== snapshot.verifiedBytes || repaired.prefixSha256 !== snapshot.prefixSha256
     || repaired.events.length !== snapshot.events.length || repaired.removedBytes !== snapshot.incompleteTailBytes)
     throw new RunRecoveryError("RECOVERY_UNSTABLE", "run journal changed during checkpoint recovery");

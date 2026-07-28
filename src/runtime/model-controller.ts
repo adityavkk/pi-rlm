@@ -54,6 +54,11 @@ export class ModelController implements ControllerDriver {
     version: CONTROLLER_RESUME_CAPABILITY_VERSION,
     strategy: "trajectory-derived",
     capture: (boundary) => ({ nextIteration: boundary.nextIteration }),
+    validate: (state, boundary) => {
+      if (!isJsonObject(state) || Object.keys(state).length !== 1
+        || state["nextIteration"] !== boundary.nextIteration)
+        throw new TypeError("ModelController checkpoint does not match the trajectory boundary");
+    },
     restore: (state, boundary) => {
       if (!isJsonObject(state) || Object.keys(state).length !== 1
         || state["nextIteration"] !== boundary.nextIteration)

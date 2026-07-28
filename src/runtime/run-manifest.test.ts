@@ -18,6 +18,7 @@ import {
   claimRunDirectory,
   nodeRunDirectoryFileSystem,
   readRunManifest,
+  MAX_RUN_MANIFEST_BYTES,
   RUN_LOCK_FILE,
   RUN_MANIFEST_FILE,
   type RunDirectoryFileSystem,
@@ -335,6 +336,21 @@ describe("source-bound run identity and manifest", () => {
     rehash(incompatible);
     await writeFile(join(dir, RUN_MANIFEST_FILE), `${JSON.stringify(incompatible)}\n`);
     await expect(readRunManifest(dir)).rejects.toMatchObject({ code: "MANIFEST_INCOMPATIBLE" });
+  });
+
+  test("rejects writer output above the exact resume reader cap before claiming the directory", async () => {
+    const dir = await tmp();
+    const oversizedModel: ModelClient = {
+      ...model,
+      identity: {
+        id: "test/oversized-model",
+        version: "1",
+        configuration: { padding: "x".repeat(MAX_RUN_MANIFEST_BYTES) },
+      },
+    };
+    const document = manifest("alpha", "oversized-manifest", { model: oversizedModel });
+    await expect(claimRunDirectory(dir, document)).rejects.toMatchObject({ code: "MANIFEST_WRITE_FAILED" });
+    expect(await readdir(dir)).toEqual([]);
   });
 
   test("shared directory permits one writer and permanently rejects reuse", async () => {
