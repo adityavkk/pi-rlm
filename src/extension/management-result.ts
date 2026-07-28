@@ -139,6 +139,26 @@ export const projectCleanupManagement = (
   });
 };
 
+/** Bounded failure projection which preserves already-applied cleanup outcomes. */
+export const projectCleanupFailureManagement = (
+  result: RunCleanupResult,
+): RlmManagementMetadata => {
+  const deleted = safeNameList(result?.deleted);
+  const retained = safeNameList(result?.retained);
+  return projection({
+    operation: "cleanup", status: "failed", code: "RLM_CLEANUP_PARTIAL",
+    message: "Managed cleanup stopped with a bounded partial result.",
+    counts: {
+      deleted: deleted.length,
+      retained: retained.length,
+      skipped: unsigned(result?.skipped?.length),
+      issues: unsigned(result?.issues?.length),
+    },
+    rows: deleted,
+    warningCodes: ["RLM_CLEANUP_PARTIAL"],
+  });
+};
+
 export const projectResumeManagement = (
   result: RunResult,
   managedName: string,

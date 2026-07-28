@@ -377,6 +377,80 @@ describe("managed checkpoint continuation", () => {
     }
   }, 90_000);
 
+  test("enforces consumed manifest and checkpoint identity inside recovery before hydration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-consumed-identity-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    let contextOperations = 0;
+    try {
+      const name = await crashAtCheckpoint(root);
+      const inspected = await inspectManagedResumeCandidate(name, { root });
+      const store = new ManagedRunStore(managedRunStoreTestOptions({
+        root,
+        contextStoreInstrumentation: {
+          async runFileSystemOperation(_path, effect) { contextOperations++; return effect(); },
+        },
+      }));
+      lease = await store.openForResume(name);
+      const writer = lease.resumeWriterIdentity();
+      const expectedIdentity = {
+        managedName: inspected.managedName,
+        runId: inspected.runId,
+        manifestHash: inspected.manifestHash,
+        checkpointSequence: inspected.checkpointSequence,
+        checkpointSha256: inspected.checkpointSha256,
+        checkpointPrefixSha256: inspected.checkpointPrefixSha256,
+        writerOrdinal: writer.writerOrdinal,
+        writerTokenSha256: writer.writerTokenSha256,
+      };
+      await expectRecoveryCode(resumeProgram({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend,
+        dir: lease.dir,
+        signal: new AbortController().signal,
+        runLifecycle: lease.lifecycle,
+        expectedIdentity: { ...expectedIdentity, writerOrdinal: expectedIdentity.writerOrdinal + 1 },
+      }), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+
+      const manifestPath = join(lease.dir, RUN_MANIFEST_FILE);
+      const originalManifest = await readFile(manifestPath);
+      const document = JSON.parse(originalManifest.toString("utf8")) as {
+        manifest: Record<string, unknown>;
+        manifestHash: string;
+      };
+      const launchAuthorization = document.manifest["launchAuthorization"] as Record<string, unknown>;
+      launchAuthorization["mode"] = launchAuthorization["mode"] === "direct" ? "confirmed" : "direct";
+      document.manifestHash = sha256(canonicalStringify(document.manifest as unknown as JsonValue));
+      await writeFile(manifestPath, `${canonicalStringify(document as unknown as JsonValue)}\n`, { mode: 0o600 });
+
+      const attempt = () => resumeProgram({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend,
+        dir: lease!.dir,
+        signal: new AbortController().signal,
+        runLifecycle: lease!.lifecycle,
+        expectedIdentity,
+      });
+      await expectRecoveryCode(attempt(), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+
+      await writeFile(manifestPath, originalManifest, { mode: 0o600 });
+      await rewriteCheckpointPayload(lease.dir, (payload) => {
+        const run = payload["run"] as Record<string, unknown>;
+        run["nextControllerTurn"] = (run["nextControllerTurn"] as number) + 1;
+      });
+      await expectRecoveryCode(attempt(), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await backend.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("rejects component drift before controller, model, or backend execution", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-components-"));
     const backend = await QuickJsBackend.create();

@@ -393,6 +393,14 @@ export interface RecoveredRunCheckpoint {
 export interface RunCheckpointRecoveryOptions {
   readonly repair?: boolean;
   readonly checkpoint?: () => void;
+  /** Consumed host authority, compared before payload reads, hydration, callbacks, or repair. */
+  readonly expectedAuthority?: {
+    readonly runId: string;
+    readonly manifestHash: string;
+    readonly checkpointSequence: number;
+    readonly checkpointSha256: string;
+    readonly checkpointPrefixSha256: string;
+  };
   readonly validateControllerState?: (
     state: JsonValue,
     boundary: { readonly frameId: string; readonly nextIteration: number; readonly trajectoryLength: number },
@@ -534,6 +542,13 @@ export const recoverLatestRunCheckpoint = async (
 ): Promise<RecoveredRunCheckpoint> => {
   const checkpoint = options.checkpoint ?? (() => {});
   const { snapshot, event } = await selectCheckpointAuthority(document, journal, checkpoint);
+  const expected = options.expectedAuthority;
+  if (expected && (event.runId !== expected.runId || event.manifestHash !== expected.manifestHash
+    || event.checkpointSequence !== expected.checkpointSequence
+    || event.checkpointSha256 !== expected.checkpointSha256
+    || event.journalPrefixSha256 !== expected.checkpointPrefixSha256))
+    throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "consumed checkpoint identity was substituted");
+  checkpoint();
 
   let checkpointBytes: Uint8Array;
   try {

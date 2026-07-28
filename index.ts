@@ -101,6 +101,7 @@ import {
 import {
   managementContent,
   managementFailure,
+  projectCleanupFailureManagement,
   projectCleanupManagement,
   projectInspectManagement,
   projectResumeManagement,
@@ -208,9 +209,11 @@ const resumeErrorProjection = (error: unknown, managedName: string): RlmManageme
         : code === "RECOVERY_INCOMPATIBLE" || code === "RECOVERY_COMPONENT_MISMATCH"
           || code === "RECOVERY_CONTROLLER_UNSUPPORTED" || code === "RECOVERY_UNSUPPORTED_STATE"
           ? ["RLM_RESUME_INCOMPATIBLE", "Managed continuation is incompatible and inspect-only.", true] as const
-          : code === "RECOVERY_UNSAFE_TAIL" || code === "RECOVERY_CHECKPOINT_INVALID"
-            || code === "RECOVERY_SEMANTIC_CORRUPTION" || code === "RECOVERY_JOURNAL_CORRUPT"
-            ? ["RLM_RESUME_INVALID", "Managed continuation authority is invalid and inspect-only.", true] as const
+          : code === "RECOVERY_IDENTITY_MISMATCH" || code === "RECOVERY_UNSTABLE"
+            ? ["RLM_RESUME_STALE", "Managed continuation identity was substituted or became unstable.", true] as const
+            : code === "RECOVERY_UNSAFE_TAIL" || code === "RECOVERY_CHECKPOINT_INVALID"
+              || code === "RECOVERY_SEMANTIC_CORRUPTION" || code === "RECOVERY_JOURNAL_CORRUPT"
+              ? ["RLM_RESUME_INVALID", "Managed continuation authority is invalid and inspect-only.", true] as const
             : code === "RECOVERY_DIRECTORY_INVALID"
               ? ["RLM_RESUME_NOT_FOUND", "Exact managed resume target was not found.", false] as const
               : code === "RUN_RETENTION_RESUME_FAILED"
@@ -771,8 +774,23 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     let ownership: OwnedRunHandle | undefined;
     let authoritativeResult = false;
     try {
-      lease = await waitForAbort(acquireManagedResumeLease(managedName), commandSignal);
+      // waitForAbort must not discard a late writer winner. A detached fulfillment
+      // immediately releases that exact candidate generation after cancellation.
+      let acquisitionAborted = commandSignal.aborted;
+      const markAcquisitionAborted = (): void => { acquisitionAborted = true; };
+      commandSignal.addEventListener("abort", markAcquisitionAborted, { once: true });
+      const acquisition = acquireManagedResumeLease(managedName);
+      void acquisition.then(
+        (late) => {
+          if (!acquisitionAborted) return;
+          void late.abandon().catch(() => { /* Store retains failed exact release authority. */ });
+        },
+        () => {},
+      );
+      try { lease = await waitForAbort(acquisition, commandSignal); }
+      finally { commandSignal.removeEventListener("abort", markAcquisitionAborted); }
       if (!current()) return;
+
       const afterLease = await waitForAbort(inspectManagedResumeCandidate(managedName), commandSignal);
       if (!sameResumeCandidate(candidate, afterLease)) {
         deliver(managementFailure("resume", "RLM_RESUME_STALE", "Managed continuation identity changed before authorization.", {
@@ -790,7 +808,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       }
       const commandNonce = createId();
       const turnOriginSha256 = sha256(`/rlm resume ${managedName}`);
-      const binding: ResumeAuthorizationBinding = {
+      const binding: ResumeAuthorizationBinding = Object.freeze({
         sessionId,
         authorizationGeneration: generation,
         commandNonce,
@@ -804,19 +822,22 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         writerOrdinal: writer.writerOrdinal,
         writerTokenSha256: writer.writerTokenSha256,
         mode: ctx.mode,
-      };
-      const authorizationRequest: RlmResumeAuthorizationRequest = {
+      });
+      const expiresAtMs = now() + grantTtlMs;
+      const authorizationEnvelope: RlmResumeAuthorizationRequest = Object.freeze({
         ...binding,
-        expiresAtMs: now() + grantTtlMs,
-      };
+        expiresAtMs,
+      });
       let approved: boolean;
       try {
         approved = hasTuiAuthorization
           ? await waitForAbort(ctx.ui.confirm(
               "Approve exact managed pi-rlm continuation?",
-              resumeConfirmationMessage(authorizationRequest),
+              resumeConfirmationMessage(authorizationEnvelope),
             ), commandSignal)
-          : await waitForAbort(Promise.resolve(dependencies.authorizeResume!(authorizationRequest, commandSignal)), commandSignal);
+          : await waitForAbort(Promise.resolve(dependencies.authorizeResume!(
+              Object.freeze({ ...authorizationEnvelope }), commandSignal,
+            )), commandSignal);
       } catch (error) {
         if (current()) deliver(managementFailure(
           "resume",
@@ -828,60 +849,124 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         return;
       }
       if (!current()) return;
+      if (now() >= expiresAtMs) {
+        deliver(managementFailure(
+          "resume", "RLM_RESUME_GRANT_EXPIRED",
+          "Managed continuation authorization expired before consumption.", { managedName },
+        ));
+        return;
+      }
       if (!approved) {
         deliver(managementFailure("resume", "RLM_RESUME_DENIED", "Managed continuation was not approved.", { managedName }));
         return;
       }
-      const approvedCandidate = await waitForAbort(inspectManagedResumeCandidate(managedName), commandSignal);
-      const approvedWriter = lease.writerIdentity();
-      if (!sameResumeCandidate(candidate, approvedCandidate)
-        || approvedWriter.writerOrdinal !== writer.writerOrdinal
-        || approvedWriter.writerTokenSha256 !== writer.writerTokenSha256) {
+
+      // Final effect-free, cancellation-bound identity reread. No factories,
+      // hydration, controller callback, repair, or active adoption precedes it.
+      const finalCandidate = await waitForAbort(inspectManagedResumeCandidate(managedName), commandSignal);
+      if (!current()) return;
+      const finalWriter = lease.writerIdentity();
+      if (!sameResumeCandidate(candidate, finalCandidate)
+        || finalWriter.managedName !== writer.managedName
+        || finalWriter.runId !== writer.runId
+        || finalWriter.writerOrdinal !== writer.writerOrdinal
+        || finalWriter.writerTokenSha256 !== writer.writerTokenSha256) {
         deliver(managementFailure("resume", "RLM_RESUME_STALE", "Managed continuation identity changed during approval.", {
           managedName, inspectOnly: true,
         }));
         return;
       }
+      const consumeAtMs = now();
+      if (consumeAtMs >= expiresAtMs) {
+        deliver(managementFailure(
+          "resume", "RLM_RESUME_GRANT_EXPIRED",
+          "Managed continuation authorization expired before consumption.", { managedName },
+        ));
+        return;
+      }
 
       grantId = createId();
-      const issuedAtMs = now();
       const grant: ManagedResumeGrant = Object.freeze({
         grantId,
         ...binding,
-        issuedAtMs,
-        expiresAtMs: authorizationRequest.expiresAtMs,
+        issuedAtMs: consumeAtMs,
+        expiresAtMs,
         oneShot: true,
       });
       resumeGrantStore = mintResumeGrant(resumeGrantStore, grant);
+      const actualBinding: ResumeAuthorizationBinding = {
+        sessionId,
+        authorizationGeneration: generation,
+        commandNonce,
+        turnOriginSha256,
+        managedName: finalCandidate.managedName,
+        runId: finalCandidate.runId,
+        manifestHash: finalCandidate.manifestHash,
+        checkpointSequence: finalCandidate.checkpointSequence,
+        checkpointSha256: finalCandidate.checkpointSha256,
+        checkpointPrefixSha256: finalCandidate.checkpointPrefixSha256,
+        writerOrdinal: finalWriter.writerOrdinal,
+        writerTokenSha256: finalWriter.writerTokenSha256,
+        mode: ctx.mode,
+      };
+      const consumed = consumeResumeGrant(resumeGrantStore, {
+        grantId,
+        ...actualBinding,
+        nowMs: consumeAtMs,
+      });
+      resumeGrantStore = consumed.store;
+      if (!consumed.ok) {
+        deliver(managementFailure(
+          "resume", `RLM_RESUME_GRANT_${consumed.denial}`,
+          "Managed continuation authorization became stale before consumption.", { managedName },
+        ));
+        return;
+      }
+      const expectedIdentity = Object.freeze({
+        managedName: consumed.grant.managedName,
+        runId: consumed.grant.runId,
+        manifestHash: consumed.grant.manifestHash,
+        checkpointSequence: consumed.grant.checkpointSequence,
+        checkpointSha256: consumed.grant.checkpointSha256,
+        checkpointPrefixSha256: consumed.grant.checkpointPrefixSha256,
+        writerOrdinal: consumed.grant.writerOrdinal,
+        writerTokenSha256: consumed.grant.writerTokenSha256,
+      });
+
+      // Audit is downstream of consumption and upstream of every lifecycle or runtime effect.
       if (!current()) return;
       try {
         pi.appendEntry("pi-rlm-resume-grant", {
-          grantId: grant.grantId,
-          sessionId: grant.sessionId,
-          authorizationGeneration: grant.authorizationGeneration,
-          commandNonce: grant.commandNonce,
-          turnOriginSha256: grant.turnOriginSha256,
-          managedName: grant.managedName,
-          runId: grant.runId,
-          manifestHash: grant.manifestHash,
-          checkpointSequence: grant.checkpointSequence,
-          checkpointSha256: grant.checkpointSha256,
-          checkpointPrefixSha256: grant.checkpointPrefixSha256,
-          writerOrdinal: grant.writerOrdinal,
-          writerTokenSha256: grant.writerTokenSha256,
-          mode: grant.mode,
-          issuedAtMs: grant.issuedAtMs,
-          expiresAtMs: grant.expiresAtMs,
+          grantId: consumed.grant.grantId,
+          sessionId: consumed.grant.sessionId,
+          authorizationGeneration: consumed.grant.authorizationGeneration,
+          commandNonce: consumed.grant.commandNonce,
+          turnOriginSha256: consumed.grant.turnOriginSha256,
+          managedName: consumed.grant.managedName,
+          runId: consumed.grant.runId,
+          manifestHash: consumed.grant.manifestHash,
+          checkpointSequence: consumed.grant.checkpointSequence,
+          checkpointSha256: consumed.grant.checkpointSha256,
+          checkpointPrefixSha256: consumed.grant.checkpointPrefixSha256,
+          writerOrdinal: consumed.grant.writerOrdinal,
+          writerTokenSha256: consumed.grant.writerTokenSha256,
+          mode: consumed.grant.mode,
+          issuedAtMs: consumed.grant.issuedAtMs,
+          expiresAtMs: consumed.grant.expiresAtMs,
           oneShot: true,
         });
       } catch {
-        resumeGrantStore = revokeResumeGrant(resumeGrantStore, grantId);
         deliver(managementFailure(
           "resume", "RLM_RESUME_AUDIT_FAILED", "Managed continuation audit failed; no runtime was constructed.",
           { managedName },
         ));
         return;
       }
+      if (!current()) return;
+
+      // First lifecycle mutation: atomically adopt local active ownership under
+      // the consumed writer generation. This await is signal-bound internally.
+      await lease.adopt(commandSignal);
       if (!current()) return;
 
       runCoordinator.setSession(sessionId, generation);
@@ -935,56 +1020,12 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         onProgressSource: ownership.attachProgress,
         ...(agentDelegation ? { agentDelegation } : {}),
       };
-      const compatible = await lease.inspect(resumeInput);
-      if (compatible.runId !== candidate.runId || compatible.manifestHash !== candidate.manifestHash
-        || compatible.checkpointSequence !== candidate.checkpointSequence
-        || compatible.checkpointSha256 !== candidate.checkpointSha256
-        || compatible.checkpointPrefixSha256 !== candidate.checkpointPrefixSha256) {
-        deliver(managementFailure("resume", "RLM_RESUME_STALE", "Managed checkpoint identity changed after compatibility preflight.", {
-          managedName, inspectOnly: true,
-        }));
-        ownership.fail("failed", "RLM_RESUME_STALE");
-        return;
-      }
-      if (!current()) return;
-      const finalCandidate = await inspectManagedResumeCandidate(managedName);
-      const finalWriter = lease.writerIdentity();
-      const actualBinding: ResumeAuthorizationBinding = {
-        sessionId: ctx.sessionManager.getSessionId(),
-        authorizationGeneration,
-        commandNonce,
-        turnOriginSha256,
-        managedName: finalCandidate.managedName,
-        runId: finalCandidate.runId,
-        manifestHash: finalCandidate.manifestHash,
-        checkpointSequence: finalCandidate.checkpointSequence,
-        checkpointSha256: finalCandidate.checkpointSha256,
-        checkpointPrefixSha256: finalCandidate.checkpointPrefixSha256,
-        writerOrdinal: finalWriter.writerOrdinal,
-        writerTokenSha256: finalWriter.writerTokenSha256,
-        mode: ctx.mode,
-      };
-      const consumed = consumeResumeGrant(resumeGrantStore, {
-        grantId,
-        ...actualBinding,
-        nowMs: now(),
-      });
-      resumeGrantStore = consumed.store;
-      if (!consumed.ok) {
-        ownership.fail("failed", `RLM_RESUME_GRANT_${consumed.denial}`);
-        deliver(managementFailure(
-          "resume", `RLM_RESUME_GRANT_${consumed.denial}`,
-          "Managed continuation authorization became stale before consumption.", { managedName },
-        ));
-        return;
-      }
 
-      // No await or host effect may appear between one-shot consumption and continuation entry.
-      let result = await lease.resume(resumeInput);
+      let result = await lease.resume(resumeInput, expectedIdentity);
       authoritativeResult = true;
       try { await lease.finish(result); }
       catch (error) { result = retentionWarning(result, "RETENTION_METADATA_FAILED", error); }
-      try { await cleanupManagedRuns({}); }
+      try { await cleanupManagedRuns({ signal: commandSignal }); }
       catch (error) { result = retentionWarning(result, "RETENTION_CLEANUP_FAILED", error); }
       const finished = ownership.finish(result);
       if (!finished.ok) {
@@ -1221,6 +1262,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
             const cleaned = await cleanupManagedRuns({
               ...(route.mode === "dry-run" ? { dryRun: true } : {}),
               ...(route.mode === "force" ? { force: true } : {}),
+              signal: managementController.signal,
             });
             if (isCurrent()) deliver(projectCleanupManagement(cleaned, route.mode));
             return;
@@ -1259,6 +1301,10 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           return;
         } catch (error) {
           if (!isCurrent()) return;
+          if (route.kind === "cleanup" && error instanceof RunRetentionError && error.result) {
+            deliver(projectCleanupFailureManagement(error.result));
+            return;
+          }
           const operation = route.kind === "inspect" ? "inspect"
             : route.kind === "cleanup" ? "cleanup" : route.kind === "runs" ? "runs" : "invalid";
           deliver(managementFailure(

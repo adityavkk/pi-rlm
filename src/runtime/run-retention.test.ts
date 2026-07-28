@@ -157,6 +157,26 @@ describe("managed run lifecycle", () => {
     await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test("resume candidate election does not adopt or rewrite active lifecycle before approval", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    const original = await producer.create();
+    await publishManifest(original, "candidate-no-adoption");
+    await original.abandon();
+    await expect(readFile(join(original.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+    const lifecycleBefore = await readFile(join(original.dir, RUN_LIFECYCLE_FILE));
+
+    const candidate = await new ManagedRunStore({ root: path, createToken: tokens() })
+      .openResumeCandidate(original.name);
+    expect(candidate.writerIdentity()).toMatchObject({ managedName: original.name, writerOrdinal: 2 });
+    expect(await readFile(join(original.dir, RUN_LIFECYCLE_FILE))).toEqual(lifecycleBefore);
+    await expect(readFile(join(original.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ManagedRunStore({ root: path }).list()).runs[0]?.activity).toBe("stale");
+
+    await candidate.release();
+    await expect(readFile(join(original.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test.each(["completed", "failed", "cancelled"] as const)("records %s as a retained terminal lifecycle", async (status) => {
     const store = new ManagedRunStore({ root: await root(), createToken: tokens() });
     const lease = await store.create();
@@ -499,6 +519,32 @@ describe("bounded deterministic retention", () => {
       }
     },
   );
+
+  test("session cancellation stops before the next deletion and returns the bounded partial result", async () => {
+    const path = await root();
+    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+    await terminalFixture(producer, "completed", "cancel-partial-a", 1);
+    await terminalFixture(producer, "completed", "cancel-partial-b", 1);
+    const controller = new AbortController();
+    let decisions = 0;
+    const sweeper = new ManagedRunStore({
+      root: path,
+      beforeCleanupDecision: async () => {
+        if (++decisions === 2) controller.abort(new Error("session switched"));
+      },
+    });
+    try {
+      await sweeper.cleanup({ force: true, signal: controller.signal });
+      throw new Error("expected cancelled cleanup");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RunRetentionError);
+      const result = (error as RunRetentionError).result!;
+      expect(result.deleted).toHaveLength(1);
+      expect(result.retained).toHaveLength(1);
+      expect(result.deleted[0]).not.toBe(result.retained[0]);
+    }
+    expect((await producer.list()).runs).toHaveLength(1);
+  });
 
   test("cleanup failure is typed, observable, and reports the retained run", async () => {
     const path = await root();

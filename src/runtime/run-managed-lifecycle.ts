@@ -8,6 +8,9 @@ export const MANAGED_RUN_RESUME = Symbol("pi-rlm.managed-run-resume");
 export interface ManagedRunResumeBinding {
   readonly runId: string;
   readonly runName: string;
+  readonly writerOrdinal: number;
+  /** One-way identity only. Raw arbitration tokens never cross this boundary. */
+  readonly writerTokenSha256: string;
 }
 
 export interface ManagedRunPersistenceCarrier {

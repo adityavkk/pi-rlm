@@ -154,6 +154,8 @@ export interface RunCleanupOptions {
   readonly dryRun?: boolean;
   /** Delete every safely inactive terminal run, while preserving active and not-yet-abandoned runs. */
   readonly force?: boolean;
+  /** Host/session cancellation. Checked before each selected run deletion where possible. */
+  readonly signal?: AbortSignal;
 }
 
 export type RunCleanupSkipReason = "already_removed" | "already_claimed";
@@ -385,12 +387,65 @@ class RetentionPreflightChanged extends Error {
   override readonly name = "RetentionPreflightChanged";
 }
 
+class CleanupAborted extends Error {
+  override readonly name = "CleanupAborted";
+  constructor(readonly reason?: unknown) { super("managed cleanup aborted"); }
+}
+
 export interface ManagedResumeWriterIdentity {
   readonly managedName: string;
   readonly runId: string;
   readonly writerOrdinal: number;
   /** One-way identity only. Raw arbitration tokens never cross this boundary. */
   readonly writerTokenSha256: string;
+}
+
+/** Exact writer election without local active-lifecycle adoption. */
+export class ManagedResumeCandidateLease {
+  private adopted: ManagedRunLease | undefined;
+  private released = false;
+
+  constructor(
+    private readonly store: ManagedRunStore,
+    readonly name: string,
+    readonly dir: string,
+    private readonly metadata: RunLifecycleMetadata,
+    private readonly writer: RunWriterLease,
+    private readonly persistence: LeaseOwnedRunPersistence,
+  ) {}
+
+  writerIdentity(): ManagedResumeWriterIdentity {
+    if (this.released || this.adopted)
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed resume candidate is no longer pending");
+    return Object.freeze({
+      managedName: this.name,
+      runId: this.metadata.runId!,
+      writerOrdinal: this.writer.generation.ordinal,
+      writerTokenSha256: sha256(this.writer.generation.token),
+    });
+  }
+
+  /** Atomically publish local active ownership under this exact writer generation. */
+  async adopt(signal?: AbortSignal): Promise<ManagedRunLease> {
+    if (this.released || this.adopted)
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed resume candidate was already resolved");
+    this.adopted = await this.store.adoptResumeCandidate(
+      this.name, this.dir, this.metadata, this.writer, this.persistence, signal,
+    );
+    return this.adopted;
+  }
+
+  /** Release the exact candidate generation, or abandon it if adoption completed. */
+  async release(): Promise<void> {
+    if (this.released) return;
+    if (this.adopted) {
+      await this.adopted.abandon();
+      this.released = true;
+      return;
+    }
+    await this.store.releaseResumeCandidate(this.name, this.writer);
+    this.released = true;
+  }
 }
 
 export class ManagedRunLease {
@@ -419,7 +474,12 @@ export class ManagedRunLease {
     this.lifecycle = {
       claimEntries: MANAGED_RUN_CLAIM_ENTRIES,
       [MANAGED_RUN_PERSISTENCE]: persistence,
-      ...(resumed ? { [MANAGED_RUN_RESUME]: { runId: metadata.runId!, runName: name } } : {}),
+      ...(resumed ? { [MANAGED_RUN_RESUME]: {
+        runId: metadata.runId!,
+        runName: name,
+        writerOrdinal: writer.generation.ordinal,
+        writerTokenSha256: sha256(writer.generation.token),
+      } } : {}),
       onManifest: async (runId: string): Promise<void> => {
         if (this.closed || !RUN_ID.test(runId))
           throw new RunRetentionError("RUN_RETENTION_METADATA_FAILED", "invalid managed run identity");
@@ -442,7 +502,12 @@ export class ManagedRunLease {
   readonly lifecycle: {
     readonly claimEntries: readonly string[];
     readonly [MANAGED_RUN_PERSISTENCE]: LeaseOwnedRunPersistence;
-    readonly [MANAGED_RUN_RESUME]?: { readonly runId: string; readonly runName: string };
+    readonly [MANAGED_RUN_RESUME]?: {
+      readonly runId: string;
+      readonly runName: string;
+      readonly writerOrdinal: number;
+      readonly writerTokenSha256: string;
+    };
     readonly onManifest: (runId: string) => Promise<void>;
     readonly onRunStarted: (runId: string) => Promise<void>;
   };
@@ -862,8 +927,8 @@ export class ManagedRunStore {
     }
   }
 
-  /** Acquire writer authority for one exact managed nonterminal run name. */
-  async openForResume(name: string): Promise<ManagedRunLease> {
+  /** Elect an exact resume writer without publishing local active ownership. */
+  async openResumeCandidate(name: string): Promise<ManagedResumeCandidateLease> {
     await this.ensureRoot();
     const dir = join(this.root, name);
     if (!RUN_NAME.test(name) || dir !== join(this.root, name) || dirname(dir) !== this.root || !this.contained(dir))
@@ -887,6 +952,39 @@ export class ManagedRunStore {
       throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "failed to acquire managed resume writer authority", cause);
     }
     const persistence = new LeaseOwnedRunPersistence(writer, this.persistenceOptions);
+    try {
+      await persistence.runTransaction(async () => {
+        await this.ensureRunPath(dir);
+        const current = parseLifecycle(await readBoundedJson(join(dir, RUN_LIFECYCLE_FILE)));
+        if (!this.sameLifecycle(current, metadata) || current.status !== "active" || current.runId !== metadata.runId)
+          throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed lifecycle changed during resume acquisition");
+      });
+      return new ManagedResumeCandidateLease(this, name, dir, metadata, writer, persistence);
+    } catch (cause) {
+      let releaseFailure: unknown;
+      try { await this.releaseResumeCandidate(name, writer); }
+      catch (error) { releaseFailure = error; }
+      throw new RunRetentionError(
+        "RUN_RETENTION_RESUME_FAILED",
+        "failed to validate managed resume candidate",
+        releaseFailure === undefined ? cause : new AggregateError([cause, releaseFailure]),
+      );
+    }
+  }
+
+  /** Internal candidate transition. The active marker and process owner publish in one writer transaction. */
+  async adoptResumeCandidate(
+    name: string,
+    dir: string,
+    metadata: RunLifecycleMetadata,
+    writer: RunWriterLease,
+    persistence: LeaseOwnedRunPersistence,
+    signal?: AbortSignal,
+  ): Promise<ManagedRunLease> {
+    const checkpoint = (): void => {
+      if (signal?.aborted)
+        throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed resume adoption was cancelled", signal.reason);
+    };
     const marker: ActiveMarker = {
       schemaVersion: 1,
       pid: process.pid,
@@ -894,37 +992,51 @@ export class ManagedRunStore {
       startedAtMs: metadata.createdAtMs,
     };
     let lease: ManagedRunLease | undefined;
-    try {
-      await persistence.runTransaction(async () => {
-        await this.ensureRunPath(dir);
-        const current = parseLifecycle(await readBoundedJson(join(dir, RUN_LIFECYCLE_FILE)));
-        if (!this.sameLifecycle(current, metadata) || current.status !== "active" || current.runId !== metadata.runId)
-          throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed lifecycle changed during resume acquisition");
-        lease = new ManagedRunLease(this, name, dir, metadata, writer, persistence, true);
-        try {
-          await privateJson(dir, RUN_ACTIVE_FILE, marker, this.token(), this.ownedMetadataFileSystem(persistence));
-        } catch (cause) {
-          let applied = false;
-          try { applied = JSON.stringify(parseMarker(await readBoundedJson(join(dir, RUN_ACTIVE_FILE)), metadata)) === JSON.stringify(marker); }
-          catch { /* The replacement did not become exact authority. */ }
-          if (!applied) throw cause;
-        }
-        activeOwners.set(dir, metadata.owner);
-      });
-      return lease!;
-    } catch (cause) {
-      activeOwners.delete(dir);
-      let releaseFailure: unknown;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try { await writer.release(); releaseFailure = undefined; break; }
-        catch (error) { releaseFailure = releaseFailure === undefined ? error : new AggregateError([releaseFailure, error]); }
+    await persistence.runTransaction(async () => {
+      checkpoint();
+      await this.ensureRunPath(dir);
+      checkpoint();
+      const current = parseLifecycle(await readBoundedJson(join(dir, RUN_LIFECYCLE_FILE)));
+      if (!this.sameLifecycle(current, metadata) || current.status !== "active" || current.runId !== metadata.runId)
+        throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed lifecycle changed before active adoption");
+      checkpoint();
+      lease = new ManagedRunLease(this, name, dir, metadata, writer, persistence, true);
+      try {
+        await privateJson(dir, RUN_ACTIVE_FILE, marker, this.token(), this.ownedMetadataFileSystem(persistence));
+      } catch (cause) {
+        let applied = false;
+        try { applied = JSON.stringify(parseMarker(await readBoundedJson(join(dir, RUN_ACTIVE_FILE)), metadata)) === JSON.stringify(marker); }
+        catch { /* The replacement did not become exact authority. */ }
+        if (!applied) throw cause;
       }
-      if (releaseFailure !== undefined) this.retainWriterReleaseAuthority(name, writer);
-      throw new RunRetentionError(
-        "RUN_RETENTION_RESUME_FAILED",
-        "failed to bind managed resume lifecycle",
-        releaseFailure === undefined ? cause : new AggregateError([cause, releaseFailure]),
-      );
+      activeOwners.set(dir, metadata.owner);
+    });
+    return lease!;
+  }
+
+  /** Release a pending candidate without touching lifecycle or active-marker state. */
+  async releaseResumeCandidate(name: string, writer: RunWriterLease): Promise<void> {
+    const failures: unknown[] = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await writer.release(); return; }
+      catch (error) { failures.push(error); }
+    }
+    this.retainWriterReleaseAuthority(name, writer);
+    throw new RunRetentionError(
+      "RUN_RETENTION_METADATA_FAILED",
+      "managed resume candidate release retries failed",
+      new AggregateError(failures),
+    );
+  }
+
+  /** Backward-compatible runtime API: acquisition and active adoption complete before return. */
+  async openForResume(name: string): Promise<ManagedRunLease> {
+    const candidate = await this.openResumeCandidate(name);
+    try { return await candidate.adopt(); }
+    catch (cause) {
+      try { await candidate.release(); }
+      catch (release) { cause = new AggregateError([cause, release], "resume adoption and candidate release both failed"); }
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "failed to bind managed resume lifecycle", cause);
     }
   }
 
@@ -1215,7 +1327,12 @@ export class ManagedRunStore {
     now: number,
     options: RunCleanupOptions,
   ): Promise<"deleted" | "retained" | RunCleanupSkipReason> {
+    const checkpoint = (): void => {
+      if (options.signal?.aborted) throw new CleanupAborted(options.signal.reason);
+    };
+    checkpoint();
     await this.beforeDecision(run.path);
+    checkpoint();
     let lease: RunWriterLease;
     let retirementMode: "publishing" | "recovering" | undefined;
     try {
@@ -1238,6 +1355,7 @@ export class ManagedRunStore {
     let terminal = false;
     try {
       await this.afterAcquisition(run.path);
+      if (lease.role !== "retirement") checkpoint();
       const recoveringTerminal = retirementMode === "recovering";
       const retiredRecovery = lease.role === "retirement" && recoveringTerminal;
       const eligible = recoveringTerminal
@@ -1249,6 +1367,7 @@ export class ManagedRunStore {
         await lease.release();
         return "retained";
       }
+      if (lease.role !== "retirement") checkpoint();
       const quarantined = await lease.quarantine(
         (identity) => quarantineOwnedRun(identity, this.quarantineFileSystem),
         recoveringTerminal ? async () => {
@@ -1268,6 +1387,7 @@ export class ManagedRunStore {
         try { await lease.release(); }
         catch (release) { throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "retention failure and release both failed", new AggregateError([cause, release])); }
       }
+      if (cause instanceof CleanupAborted) throw cause;
       const quarantine = join(this.root, quarantineName(lease.generation));
       throw new RunRetentionError(
         "RUN_RETENTION_CLEANUP_FAILED",
@@ -1455,10 +1575,23 @@ export class ManagedRunStore {
   }
 
   async cleanup(options: RunCleanupOptions = {}): Promise<RunCleanupResult> {
-    if (!options.dryRun) {
-      await this.retryReleaseAuthorities();
-      await this.scavengeQuarantines();
-      await this.scavengeDeadGeneses();
+    const checkpoint = (): void => {
+      if (options.signal?.aborted) throw new CleanupAborted(options.signal.reason);
+    };
+    try {
+      checkpoint();
+      if (!options.dryRun) {
+        await this.retryReleaseAuthorities();
+        checkpoint();
+        await this.scavengeQuarantines();
+        checkpoint();
+        await this.scavengeDeadGeneses();
+        checkpoint();
+      }
+    } catch (cause) {
+      if (cause instanceof CleanupAborted)
+        throw new RunRetentionError("RUN_RETENTION_CLEANUP_FAILED", "managed cleanup was cancelled before run deletion", cause.reason);
+      throw cause;
     }
     const internal = await this.listInternal();
     const listing: ManagedRunListing = {
@@ -1482,11 +1615,30 @@ export class ManagedRunStore {
     if (!options.dryRun) {
       for (const run of ordered) {
         try {
+          checkpoint();
           const outcome = await this.removeCandidate(run, now, options);
           if (outcome === "deleted") deleted.push(run.name);
           else if (outcome === "already_removed" || outcome === "already_claimed")
             skipped.push({ runName: run.name, reason: outcome });
         } catch (cause) {
+          if (cause instanceof CleanupAborted) {
+            const removed = new Set(deleted);
+            const result: RunCleanupResult = {
+              ...listing,
+              issues,
+              deleted: [...deleted],
+              skipped: [...skipped],
+              wouldDelete: [],
+              retained: internal.runs.map((candidate) => candidate.name)
+                .filter((name) => !removed.has(name)).sort(),
+            };
+            throw new RunRetentionError(
+              "RUN_RETENTION_CLEANUP_FAILED",
+              "managed cleanup was cancelled after a partial result",
+              cause.reason,
+              result,
+            );
+          }
           failedRemovals.add(run.name);
           issues.push({ code: "CLEANUP_FAILED", message: "failed to remove managed run", runName: run.name, cause });
         }

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -117,12 +117,15 @@ const crashAtCheckpoint = async (root: string): Promise<string> => {
   }
 };
 
-const createUi = (observed: { confirms: number; customs: number }): ExtensionUIContext => ({
+const createUi = (
+  observed: { confirms: number; customs: number; widgets: number },
+  approve = false,
+): ExtensionUIContext => ({
   notify() {},
   setStatus() {},
-  setWidget() {},
+  setWidget() { observed.widgets++; },
   setToolsExpanded() {},
-  async confirm() { observed.confirms++; return false; },
+  async confirm() { observed.confirms++; return approve; },
   custom(factory: any) {
     observed.customs++;
     return new Promise((resolve, reject) => {
@@ -133,6 +136,43 @@ const createUi = (observed: { confirms: number; customs: number }): ExtensionUIC
     });
   },
 }) as unknown as ExtensionUIContext;
+
+const runContentionChild = async (
+  root: string,
+  managedName: string,
+  gate: string,
+  kind: "resume" | "cleanup",
+): Promise<string> => {
+  const script = `
+    import { existsSync } from "node:fs";
+    import { ManagedRunStore } from "pi-rlm/runtime";
+    while (!existsSync(${JSON.stringify(gate)})) await Bun.sleep(5);
+    try {
+      const store = new ManagedRunStore({ root: ${JSON.stringify(root)}, policy: { abandonedGraceMs: 0 } });
+      if (${JSON.stringify(kind)} === "resume") {
+        const candidate = await store.openResumeCandidate(${JSON.stringify(managedName)});
+        console.log("resume-won");
+        await Bun.sleep(750);
+        await candidate.release();
+      } else {
+        const result = await store.cleanup({ force: true });
+        console.log(result.deleted.includes(${JSON.stringify(managedName)}) ? "cleanup-won" : "cleanup-lost");
+      }
+    } catch {
+      console.log(${JSON.stringify(kind)} + "-lost");
+    }
+  `;
+  const child = Bun.spawn([process.execPath, "--eval", script], {
+    cwd: process.cwd(), stdout: "pipe", stderr: "pipe",
+  });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+    new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+  ]);
+  if (status !== 0) throw new Error(`contention child failed: ${stderr}`);
+  return stdout.trim();
+};
 
 const managementContents = (events: readonly AgentSessionEvent[]): string[] => events.flatMap((event) => {
   if (event.type !== "message_end") return [];
@@ -147,7 +187,7 @@ describe("public managed host commands", () => {
     const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-managed-${mode}-`));
     const runsRoot = join(root, "state", "runs");
     const events: AgentSessionEvent[] = [];
-    const observed = { confirms: 0, customs: 0 };
+    const observed = { confirms: 0, customs: 0, widgets: 0 };
     let runtime: Awaited<ReturnType<typeof createAgentSessionRuntime>> | undefined;
     let unsubscribe: (() => void) | undefined;
     let factories = 0;
@@ -208,6 +248,7 @@ describe("public managed host commands", () => {
       expect(factories).toBe(0);
       expect(observed.confirms).toBe(0);
       expect(observed.customs).toBe(mode === "tui" ? 2 : 0);
+      expect(observed.widgets > 0).toBe(mode === "tui");
       expect((await new ManagedRunStore({ root: runsRoot }).list()).runs).toHaveLength(0);
     } finally {
       unsubscribe?.();
@@ -216,31 +257,54 @@ describe("public managed host commands", () => {
     }
   }, 60_000);
 
-  test("concurrent public resume lease contenders elect one exact writer", async () => {
+  test("two genuine child-process resume contenders elect one exact writer", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-public-resume-contention-"));
+    const gate = join(tmpdir(), `pi-rlm-resume-contenders-${crypto.randomUUID()}.go`);
     try {
       const managedName = await crashAtCheckpoint(root);
-      const attempts = await Promise.allSettled([
-        new ManagedRunStore({ root }).openForResume(managedName),
-        new ManagedRunStore({ root }).openForResume(managedName),
-      ]);
-      const winners = attempts.filter((attempt): attempt is PromiseFulfilledResult<Awaited<ReturnType<ManagedRunStore["openForResume"]>>> =>
-        attempt.status === "fulfilled");
-      expect(winners).toHaveLength(1);
-      expect(attempts.filter((attempt) => attempt.status === "rejected")).toHaveLength(1);
-      await winners[0]!.value.abandon();
+      const contenders = [
+        runContentionChild(root, managedName, gate, "resume"),
+        runContentionChild(root, managedName, gate, "resume"),
+      ];
+      await writeFile(gate, "go", { mode: 0o600 });
+      const outcomes = await Promise.all(contenders);
+      expect(outcomes.filter((outcome) => outcome === "resume-won")).toHaveLength(1);
+      expect(outcomes.filter((outcome) => outcome === "resume-lost")).toHaveLength(1);
     } finally {
+      await rm(gate, { force: true });
       await rm(root, { recursive: true, force: true });
     }
   }, 60_000);
 
-  test("offline public host authorization continues a crashed checkpoint without replay or network", async () => {
-    const root = await mkdtemp(join(tmpdir(), "pi-rlm-public-resume-success-"));
+  test("genuine child-process resume and cleanup contenders share one writer election", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-public-resume-cleanup-contention-"));
+    const gate = join(tmpdir(), `pi-rlm-resume-cleanup-${crypto.randomUUID()}.go`);
+    try {
+      const managedName = await crashAtCheckpoint(root);
+      const contenders = [
+        runContentionChild(root, managedName, gate, "resume"),
+        runContentionChild(root, managedName, gate, "cleanup"),
+      ];
+      await writeFile(gate, "go", { mode: 0o600 });
+      const outcomes = await Promise.all(contenders);
+      if (outcomes.filter((outcome) => outcome.endsWith("-won")).length !== 1)
+        throw new Error(`unexpected resume-cleanup outcomes: ${JSON.stringify(outcomes)}`);
+      expect(outcomes.filter((outcome) => outcome.endsWith("-lost"))).toHaveLength(1);
+    } finally {
+      await rm(gate, { force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.each(modes)("%s offline host authorization continues a crashed checkpoint without replay or network", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), `pi-rlm-public-resume-success-${mode}-`));
     const runsRoot = join(root, "state", "runs");
     const events: AgentSessionEvent[] = [];
     let runtime: Awaited<ReturnType<typeof createAgentSessionRuntime>> | undefined;
     let unsubscribe: (() => void) | undefined;
     let modelCalls = 0;
+    let policyCalls = 0;
+    const observed = { confirms: 0, customs: 0, widgets: 0 };
     try {
       const managedName = await crashAtCheckpoint(runsRoot);
       const settingsManager = SettingsManager.inMemory();
@@ -269,7 +333,11 @@ describe("public managed host commands", () => {
           createModel: () => model,
           createController: () => new MockController(resumeCells),
         },
-        authorizeResume: async () => true,
+        authorizeResume: async (request) => {
+          policyCalls++;
+          expect(Object.isFrozen(request)).toBe(true);
+          return true;
+        },
       });
       runtime = await createAgentSessionRuntime(async (options) => {
         const services = await createAgentSessionServices({
@@ -282,7 +350,7 @@ describe("public managed host commands", () => {
         return { ...created, services, diagnostics: services.diagnostics };
       }, { cwd: root, agentDir: join(root, "agent"), sessionManager });
       unsubscribe = runtime.session.subscribe((event) => events.push(event));
-      await runtime.session.bindExtensions({ mode: "print", uiContext: createUi({ confirms: 0, customs: 0 }) });
+      await runtime.session.bindExtensions({ mode, uiContext: createUi(observed, true) });
       await runtime.session.prompt(`/rlm resume ${managedName}`, { source: "interactive" });
 
       const contents = managementContents(events);
@@ -290,6 +358,10 @@ describe("public managed host commands", () => {
       expect(contents[0]).toContain("RLM_RESUME_COMPLETED");
       expect(contents[0]).not.toContain("PUBLIC_CONTINUED_RAW_ANSWER");
       expect(modelCalls).toBe(0);
+      expect(policyCalls).toBe(mode === "tui" ? 0 : 1);
+      expect(observed.confirms).toBe(mode === "tui" ? 1 : 0);
+      expect(observed.customs).toBe(0);
+      expect(observed.widgets > 0).toBe(mode === "tui");
       const retained = (await new ManagedRunStore({ root: runsRoot }).list()).runs;
       expect(retained).toHaveLength(1);
       expect(retained[0]?.metadata).toMatchObject({ status: "completed" });
