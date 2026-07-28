@@ -33,12 +33,14 @@ export interface JournalFileHandle {
 }
 
 export interface JournalFileSystem {
+  /** Optional lease-owned boundary for one complete journal operation. */
+  runTransaction?<T>(effect: () => Promise<T>): Promise<T>;
   open(path: string, flags: string, mode?: number): Promise<JournalFileHandle>;
   readFile(path: string): Promise<Buffer>;
   rename(oldPath: string, newPath: string): Promise<void>;
 }
 
-const nodeFileSystem: JournalFileSystem = {
+export const nodeJournalFileSystem: JournalFileSystem = {
   open: async (path, flags, mode) => open(path, flags, mode),
   readFile: async (path) => readFile(path),
   rename,
@@ -235,7 +237,7 @@ export class JournalStore {
 
   constructor(
     private readonly dir: string,
-    private readonly fileSystem: JournalFileSystem = nodeFileSystem,
+    private readonly fileSystem: JournalFileSystem = nodeJournalFileSystem,
   ) {
     this.eventsPath = join(dir, "events.jsonl");
     this.statusPath = join(dir, "status.json");
@@ -382,7 +384,9 @@ export class JournalStore {
         return { events: dispositions, statusCache: { state: "failed", error } };
       }
     };
-    const queued = this.queue.then(run, run);
+    const ownedRun = (): Promise<JournalBatchAppendOutcome> =>
+      this.fileSystem.runTransaction?.(run) ?? run();
+    const queued = this.queue.then(ownedRun, ownedRun);
     this.queue = queued;
     return queued;
   }
@@ -414,15 +418,18 @@ export class JournalStore {
   }
 
   private async readEventsInternal(): Promise<Result<RlmEvent[], InterpreterError>> {
-    let raw: Buffer;
-    try {
-      raw = await this.fileSystem.readFile(this.eventsPath);
-    } catch (error) {
-      if (isMissing(error)) return ok([]);
-      throw error;
-    }
-    const scanned = scanJournal(raw);
-    return scanned.ok ? ok(scanned.value.events) : scanned;
+    const read = async (): Promise<Result<RlmEvent[], InterpreterError>> => {
+      let raw: Buffer;
+      try {
+        raw = await this.fileSystem.readFile(this.eventsPath);
+      } catch (error) {
+        if (isMissing(error)) return ok([]);
+        throw error;
+      }
+      const scanned = scanJournal(raw);
+      return scanned.ok ? ok(scanned.value.events) : scanned;
+    };
+    return this.fileSystem.runTransaction?.(read) ?? read();
   }
 
   async readEvents(): Promise<Result<RlmEvent[], InterpreterError>> {

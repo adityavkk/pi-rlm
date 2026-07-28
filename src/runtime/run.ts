@@ -9,11 +9,12 @@ import {
   type ContextDescriptor,
   type ContextOperationControl,
   ContextStore,
+  type ContextStoreInstrumentation,
 } from "../shell/context-store.ts";
 import { type Clock, systemClock } from "../shell/clock.ts";
 import { sha256 } from "../shell/hash.ts";
 import type { InterpreterBackend } from "../shell/interpreter/backend.ts";
-import { JournalAppendError, JournalStore } from "../shell/journal-store.ts";
+import { JournalAppendError, JournalStore, type JournalFileSystem } from "../shell/journal-store.ts";
 import type { ModelClient } from "../shell/model/client.ts";
 import { createAbortScope, throwIfAborted, waitForAbort, wasAborted, type AbortScope } from "./abort.ts";
 import { persistAnswer } from "./answer-persistence.ts";
@@ -55,14 +56,17 @@ import {
 } from "./run-manifest.ts";
 import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
+import { MANAGED_RUN_PERSISTENCE, type ManagedRunPersistenceCarrier } from "./run-managed-lifecycle.ts";
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
-export interface RunLifecycleHooks {
+export interface RunLifecycleHooks extends ManagedRunPersistenceCarrier {
   /** Pre-existing manager files allowed during the otherwise-exclusive manifest claim. */
   readonly claimEntries: readonly string[];
   /** Called after durable manifest publication and before journals or source snapshots. */
   readonly onManifest: (runId: string) => Promise<void>;
+  /** Called only after the authoritative run_started record is known durable. */
+  readonly onRunStarted?: (runId: string) => Promise<void>;
 }
 
 export interface RunInput {
@@ -84,6 +88,10 @@ export interface RunInput {
   readonly createRunNonce?: () => string;
   /** Optional manifest persistence injection for fault testing. */
   readonly runDirectoryFileSystem?: RunDirectoryFileSystem;
+  /** Optional journal filesystem injection. Managed runs compose it beneath their lease guard. */
+  readonly journalFileSystem?: JournalFileSystem;
+  /** Optional context filesystem instrumentation, composed beneath managed-run ownership. */
+  readonly contextStoreInstrumentation?: ContextStoreInstrumentation;
   /** Host-managed lifecycle binding; custom run directories omit this. */
   readonly runLifecycle?: RunLifecycleHooks;
   /** Optional store injection for fault testing and embedded runtimes. */
@@ -412,7 +420,7 @@ const finalize = async (
   return finish(planned);
 };
 
-export const runProgram = async (input: RunInput): Promise<RunResult> => {
+const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
   const preparedAgentDelegation = prepareAgentDelegation(input.agentDelegation);
   preflightRunComponents({
     backend: input.backend,
@@ -458,9 +466,19 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
   progress.bindRunId(runId);
   progress.setPhase("manifest");
   try { input.onProgressSource?.(progress.source); } catch { /* Progress observers have no run authority. */ }
+  const managedPersistence = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE];
   try {
     try {
-      await claimRunDirectory(input.dir, document, input.runDirectoryFileSystem, input.runLifecycle?.claimEntries);
+      if (managedPersistence && (input.journal || input.runDirectoryFileSystem
+        || input.journalFileSystem || input.contextStoreInstrumentation))
+        throw new TypeError("managed runs reject caller-supplied persistence implementations");
+      const runDirectoryFileSystem = managedPersistence?.runDirectoryFileSystem();
+      await claimRunDirectory(
+        input.dir,
+        document,
+        runDirectoryFileSystem ?? input.runDirectoryFileSystem,
+        input.runLifecycle?.claimEntries,
+      );
   } catch (error) {
     const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
     const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
@@ -472,8 +490,10 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
       throw error;
     }
     await input.runLifecycle?.onManifest(runId);
-  const journal = input.journal ?? new JournalStore(input.dir);
-  const store = new ContextStore(input.dir, contextStoreLimits(profile));
+  const journalFileSystem = managedPersistence?.journalFileSystem() ?? input.journalFileSystem;
+  const contextInstrumentation = managedPersistence?.contextInstrumentation() ?? input.contextStoreInstrumentation;
+  const journal = input.journal ?? new JournalStore(input.dir, journalFileSystem);
+  const store = new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation);
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());
   let phase: Phase = "journal";
   const setPhase = (value: Phase): void => {
@@ -512,6 +532,8 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     try {
       throwIfAborted(scope.signal);
       setPhase("journal");
+      let appendFailed = false;
+      let appendFailure: unknown;
       try {
         const outcome = await journal.append({
           type: "run_started",
@@ -526,12 +548,14 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
           })),
         });
         sourceDurable = outcome.event === "committed";
-        runStartedDurable = sourceDurable;
       } catch (error) {
+        appendFailed = true;
+        appendFailure = error;
         sourceDurable = error instanceof JournalAppendError && error.eventDurable;
-        runStartedDurable = sourceDurable;
-        throw error;
       }
+      runStartedDurable = sourceDurable;
+      if (runStartedDurable) await input.runLifecycle?.onRunStarted?.(runId);
+      if (appendFailed) throw appendFailure;
       if (!sourceDurable) throw new Error("run start ignored after terminal");
       sourceTransaction.commit();
     } catch (error) {
@@ -724,4 +748,10 @@ export const runProgram = async (input: RunInput): Promise<RunResult> => {
     progress.finish(input.signal.aborted || wasAborted(error, input.signal) ? "cancelled" : "failed");
     throw error;
   }
+};
+
+/** Managed runs hold writer admission for the full runtime lifecycle. */
+export const runProgram = (input: RunInput): Promise<RunResult> => {
+  const persistence = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE];
+  return persistence ? persistence.runTransaction(() => runProgramOwned(input)) : runProgramOwned(input);
 };

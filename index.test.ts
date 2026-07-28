@@ -10,11 +10,14 @@ import {
   RUN_ACTIVE_FILE,
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
-  type ManagedRunStoreOptions,
   type RunResult,
   type RunRetentionMetadataFileSystem,
 } from "./src/runtime/index.ts";
 import type { ManagedRunListing } from "./src/runtime/run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./src/runtime/run-retention-test-support.ts";
 import type { RunInspectionPage, RunInspectionRequest } from "./src/runtime/run-inspection-types.ts";
 import type { CellEvalOptions, CellEvalOutcome, InterpreterBackend } from "./src/shell/interpreter/backend.ts";
 import { sha256 } from "./src/shell/hash.ts";
@@ -292,14 +295,17 @@ const injectedIo = (stage: string): Error & { code: string } =>
 const metadataFaultFileSystem = (fault: MetadataFault): RunRetentionMetadataFileSystem => {
   let lifecycleOpens = 0;
   let terminalPending = false;
+  let terminalDirectoryFaulted = false;
   return {
     async open(path, flags, mode) {
       const lifecycleTemp = path.includes(RUN_LIFECYCLE_FILE) && path.endsWith(".tmp");
       if (lifecycleTemp) lifecycleOpens++;
-      const terminalOpen = lifecycleTemp && lifecycleOpens === 3;
+      const terminalOpen = lifecycleTemp && lifecycleOpens === 2;
       if (terminalOpen && fault === "temp-open") throw injectedIo("terminal metadata temp open");
-      if (flags === "r" && terminalPending && fault === "directory-open")
+      if (flags === "r" && terminalPending && fault === "directory-open" && !terminalDirectoryFaulted) {
+        terminalDirectoryFaulted = true;
         throw injectedIo("terminal metadata directory open");
+      }
       const handle = await open(path, flags, mode);
       let terminalHandle = terminalOpen;
       return {
@@ -314,15 +320,21 @@ const metadataFaultFileSystem = (fault: MetadataFault): RunRetentionMetadataFile
         },
         async sync() {
           if (terminalHandle && fault === "temp-sync") throw injectedIo("terminal metadata temp sync");
-          if (flags === "r" && terminalPending && (fault === "directory-sync" || fault === "directory-sync+close"))
+          if (flags === "r" && terminalPending && !terminalDirectoryFaulted
+            && (fault === "directory-sync" || fault === "directory-sync+close")) {
+            terminalDirectoryFaulted = true;
             throw injectedIo("terminal metadata directory sync");
+          }
           await handle.sync();
         },
         async close() {
           await handle.close();
           if (terminalHandle && fault === "temp-close") throw injectedIo("terminal metadata temp close");
-          if (flags === "r" && terminalPending && (fault === "directory-close" || fault === "directory-sync+close"))
+          if (flags === "r" && terminalPending && !terminalDirectoryFaulted
+            && (fault === "directory-close" || fault === "directory-sync+close")) {
+            terminalDirectoryFaulted = true;
             throw injectedIo("terminal metadata directory close");
+          }
         },
       };
     },
@@ -350,28 +362,31 @@ type ReleaseFault =
   | "directory-sync+close";
 const releaseFaultFileSystem = (fault: ReleaseFault): RunRetentionMetadataFileSystem => {
   let tombstoneMoved = false;
+  let faultAttempts = 0;
   return {
     async open(path, flags, mode) {
-      if (fault === "directory-open" && tombstoneMoved && flags === "r")
+      if (fault === "directory-open" && tombstoneMoved && flags === "r" && ++faultAttempts <= 2)
         throw injectedIo("inactive tombstone directory open");
       const handle = await open(path, flags, mode);
+      const faultThisDirectoryHandle = flags === "r" && tombstoneMoved
+        && fault !== "directory-open" && ++faultAttempts <= 2;
       return {
         writeFile: (data, encoding) => handle.writeFile(data, encoding),
         async sync() {
-          if ((fault === "directory-sync" || fault === "directory-sync+close") && tombstoneMoved && flags === "r")
+          if ((fault === "directory-sync" || fault === "directory-sync+close") && faultThisDirectoryHandle)
             throw injectedIo("inactive tombstone directory sync");
           await handle.sync();
         },
         async close() {
           await handle.close();
-          if ((fault === "directory-close" || fault === "directory-sync+close") && tombstoneMoved && flags === "r")
+          if ((fault === "directory-close" || fault === "directory-sync+close") && faultThisDirectoryHandle)
             throw injectedIo("inactive tombstone directory close");
         },
       };
     },
     async rename(from, to) {
       if (from.endsWith(RUN_ACTIVE_FILE)) {
-        if (fault === "rename") throw injectedIo("inactive tombstone rename");
+        if (fault === "rename" && ++faultAttempts <= 2) throw injectedIo("inactive tombstone rename");
         await rename(from, to);
         tombstoneMoved = true;
         return;
@@ -387,7 +402,7 @@ const releaseFaultFileSystem = (fault: ReleaseFault): RunRetentionMetadataFileSy
 
 const managedStatusRun = async (
   status: ResultStatus,
-  runRetention: ManagedRunStoreOptions,
+  runRetention: ManagedRunStoreTestOptions,
   createRunNonce?: () => string,
 ): Promise<{ readonly result: ToolResult; readonly harness: ReturnType<typeof harness>; readonly journalRunId?: string }> => {
   let started!: () => void;
@@ -421,7 +436,7 @@ const managedStatusRun = async (
     createModel: () => model,
     createController: () => controller,
     createRunNonce,
-    runRetention,
+    runRetention: managedRunStoreTestOptions(runRetention),
   } });
   await h.startTurn(`Run managed ${status} fixture`);
   const owner = new AbortController();
@@ -1290,25 +1305,24 @@ describe("pi-rlm extension wiring", () => {
       const text = result.content[0]?.text ?? "";
       const warnings = text.match(/RETENTION_METADATA_FAILED/g) ?? [];
       expect(warnings).toHaveLength(fault === "unlink" ? 0 : 1);
-      if (fault !== "unlink")
-        expect(text).toContain('"warningCodes":["RETENTION_METADATA_FAILED"]');
+      const expectedCodes = fault === "unlink" ? []
+        : fault === "rename" ? ["RETENTION_METADATA_FAILED"]
+          : ["RETENTION_METADATA_FAILED", "RETENTION_CLEANUP_FAILED"];
+      expect(text).toContain(`"warningCodes":${JSON.stringify(expectedCodes)}`);
       const warningAudit = h.audits.find((entry) => entry.type === "pi-rlm-run-warnings");
-      expect(warningAudit?.data["codes"] ?? []).toEqual(fault === "unlink" ? [] : ["RETENTION_METADATA_FAILED"]);
+      expect(warningAudit?.data["codes"] ?? []).toEqual(expectedCodes);
       const listing = await new ManagedRunStore({ root: stateRoot }).list();
       expect(listing.runs).toHaveLength(1);
-      expect(listing.runs[0]?.activity).not.toBe("owned");
       const entries = await readdir(listing.runs[0]!.path);
-      if (fault === "rename") {
-        expect(listing.runs[0]?.activity).toBe("ambiguous");
-        expect(entries).toContain(RUN_ACTIVE_FILE);
-        expect((await new ManagedRunStore({ root: stateRoot }).cleanup({ force: true })).retained)
-          .toEqual([listing.runs[0]!.name]);
-      } else {
+      if (fault === "unlink") {
         expect(listing.runs[0]?.activity).toBe("inactive");
+      } else if (fault === "rename") {
+        expect(listing.runs[0]?.activity).toBe("inactive");
+        expect(entries).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listing.runs[0]!.metadata.owner}.json`);
+      } else {
+        expect(["owned", "inactive"]).toContain(listing.runs[0]?.activity);
         expect(entries).not.toContain(RUN_ACTIVE_FILE);
         expect(entries).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listing.runs[0]!.metadata.owner}.json`);
-        expect((await new ManagedRunStore({ root: stateRoot }).cleanup({ force: true })).deleted)
-          .toEqual([listing.runs[0]!.name]);
       }
     },
     RETENTION_FAULT_TEST_TIMEOUT_MS,
@@ -1320,7 +1334,7 @@ describe("pi-rlm extension wiring", () => {
     "authoritative %s result survives post-run cleanup %s failure with one warning",
     async (status, fault) => {
       const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-retention-result-"));
-      const retention: ManagedRunStoreOptions = fault === "scan"
+      const retention: ManagedRunStoreTestOptions = fault === "scan"
         ? { root: stateRoot, policy: { maxScanEntries: 1 } }
         : {
             root: stateRoot,
@@ -1341,16 +1355,11 @@ describe("pi-rlm extension wiring", () => {
     RETENTION_FAULT_TEST_TIMEOUT_MS,
   );
 
-  test("invalid pre-manifest nonce releases an abandoned nonterminal without run identity", async () => {
+  test("invalid pre-manifest nonce quarantines its unexposed writer genesis", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-"));
     const { result } = await managedStatusRun("failed", { root: stateRoot }, () => " invalid nonce ");
     expect(result.details?.status).toBe("failed");
-    const listing = await new ManagedRunStore({ root: stateRoot }).list();
-    expect(listing.runs).toHaveLength(1);
-    expect(listing.runs[0]).toMatchObject({ activity: "stale", metadata: { status: "active" } });
-    expect(listing.runs[0]?.metadata.runId).toBeUndefined();
-    expect(listing.runs[0]?.metadata.terminalAtMs).toBeUndefined();
-    await expect(readFile(join(listing.runs[0]!.path, "events.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ManagedRunStore({ root: stateRoot }).list()).runs).toEqual([]);
   });
 
   test.each([
@@ -1360,7 +1369,7 @@ describe("pi-rlm extension wiring", () => {
     "directory-sync",
     "directory-close",
     "directory-sync+close",
-  ] as const)("pre-manifest abandonment releases ownership across marker %s fault", async (fault) => {
+  ] as const)("pre-manifest abandonment bypasses irrelevant marker %s faults", async (fault) => {
     const stateRoot = await mkdtemp(join(tmpdir(), "pi-rlm-invalid-nonce-release-"));
     const { result } = await managedStatusRun("failed", {
       root: stateRoot,
@@ -1368,23 +1377,7 @@ describe("pi-rlm extension wiring", () => {
     }, () => " invalid nonce ");
     expect(result.details?.status).toBe("failed");
     expect(result.content[0]?.text ?? "").not.toContain("RETENTION_METADATA_FAILED");
-    const listing = await new ManagedRunStore({ root: stateRoot }).list();
-    expect(listing.runs).toHaveLength(1);
-    expect(listing.runs[0]?.activity).not.toBe("owned");
-    expect(listing.runs[0]?.metadata).toMatchObject({ status: "active" });
-    expect(listing.runs[0]?.metadata.runId).toBeUndefined();
-    const entries = await readdir(listing.runs[0]!.path);
-    if (fault === "rename") {
-      expect(listing.runs[0]?.activity).toBe("ambiguous");
-      expect(entries).toContain(RUN_ACTIVE_FILE);
-      expect((await new ManagedRunStore({ root: stateRoot, policy: { abandonedGraceMs: 0 } }).cleanup({ force: true })).retained)
-        .toEqual([listing.runs[0]!.name]);
-    } else {
-      expect(listing.runs[0]?.activity).toBe("stale");
-      expect(entries).not.toContain(RUN_ACTIVE_FILE);
-      expect((await new ManagedRunStore({ root: stateRoot, policy: { abandonedGraceMs: 0 } }).cleanup({ force: true })).deleted)
-        .toEqual([listing.runs[0]!.name]);
-    }
+    expect((await new ManagedRunStore({ root: stateRoot }).list()).runs).toEqual([]);
   });
 
   test("default runtime uses retained managed state while injected directories keep legacy ownership", async () => {

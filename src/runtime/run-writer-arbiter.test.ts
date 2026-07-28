@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireRunWriterLease,
+  createRunWriterGenesis,
   type RunWriterAcquisitionRole,
 } from "./run-writer-arbiter.ts";
 import { PinnedRunWriterIdentity } from "./run-writer-identity.ts";
@@ -39,14 +40,14 @@ const liveChildScript = (fixture: ArbiterFixture): string => `
     await lease.release();
   } catch (error) { console.log("ERR " + (error && error.code || error && error.name || "unknown")); }
 `;
-const electionChildScript = (fixture: ArbiterFixture): string => `
+const electionChildScript = (fixture: ArbiterFixture, role: RunWriterAcquisitionRole = "writer"): string => `
   const { createInterface } = await import("node:readline");
   const { acquireRunWriterLease } = await import(${JSON.stringify(new URL("./run-writer-arbiter.ts", import.meta.url).href)});
   const lines = createInterface({ input: process.stdin });
   const commands = lines[Symbol.asyncIterator]();
   let waiting = true;
   try {
-    const lease = await acquireRunWriterLease(${JSON.stringify(input(fixture))}, {
+    const lease = await acquireRunWriterLease(${JSON.stringify({ ...input(fixture), role })}, {
       publicationGuard: {
         async pre() {
           if (!waiting) return;
@@ -63,11 +64,37 @@ const electionChildScript = (fixture: ArbiterFixture): string => `
   } catch (error) { console.log("ERR " + (error && error.code || error && error.name || "unknown")); }
   lines.close();
 `;
+const fencedDeathScript = (fixture: ArbiterFixture): string => `
+  const { acquireRunWriterLease } = await import(${JSON.stringify(new URL("./run-writer-arbiter.ts", import.meta.url).href)});
+  const lease = await acquireRunWriterLease(${JSON.stringify(input(fixture))});
+  await lease.run(async () => {
+    console.log("FENCED " + lease.generation.token);
+    await new Promise(() => {});
+  });
+`;
 const spawnChild = (script: string) => Bun.spawn({
   cmd: [process.execPath, "-e", script], stdin: "pipe", stdout: "pipe", stderr: "pipe",
 });
 
 describe("internal run writer arbiter identity", () => {
+  test("creates ordinal-one writer genesis only in an empty managed run", async () => {
+    const fixture = await arbiterFixture({ arbitration: "missing" });
+    try {
+      const lease = await createRunWriterGenesis(
+        { managedRoot: fixture.root, runName: fixture.runName },
+        { createToken: tokens(), now: () => 1 },
+      );
+      expect(lease.role).toBe("writer");
+      expect(lease.generation).toMatchObject({ ordinal: 1, predecessor: null, role: "writer" });
+      expect(await readdir(fixture.runPath)).toEqual([".pi-rlm-arbitration"]);
+      expect((await scanArbitrationDirectory(fixture.arbitrationPath)).tip?.token).toBe(lease.generation.token);
+      await lease.release();
+      const successor = await acquireRunWriterLease(input(fixture), { createToken: tokens(20) });
+      expect(successor.generation.ordinal).toBe(2);
+      await successor.release();
+    } finally { await fixture.cleanup(); }
+  });
+
   test("opens only exact existing private bigint identities", async () => {
     const fixture = await arbiterFixture();
     try {
@@ -240,6 +267,34 @@ describe("internal run writer arbiter election and liveness", () => {
       await Promise.all(children.map((child) => child.exited));
       expect((await scanArbitrationDirectory(fixture.arbitrationPath)).generations).toHaveLength(2);
     } finally { for (const child of children) child.kill(); await fixture.cleanup(); }
+  }, 15_000);
+
+  test("a child death inside a fenced effect elects one of writer and retention takeover contenders", async () => {
+    const fixture = await arbiterFixture();
+    const owner = spawnChild(fencedDeathScript(fixture));
+    let contenders: ReturnType<typeof spawnChild>[] = [];
+    try {
+      expect(await readLine(owner.stdout)).toMatch(/^FENCED /);
+      owner.kill("SIGKILL");
+      await owner.exited;
+      contenders = [
+        spawnChild(electionChildScript(fixture, "writer")),
+        spawnChild(electionChildScript(fixture, "retention")),
+      ];
+      expect(await Promise.all(contenders.map((child) => readLine(child.stdout)))).toEqual(["READY", "READY"]);
+      for (const child of contenders) child.stdin.write("GO\n");
+      const outcomes = await Promise.all(contenders.map((child) => readLine(child.stdout)));
+      expect(outcomes.filter((line) => line.startsWith("OWN "))).toHaveLength(1);
+      expect(outcomes.filter((line) => line === "ERR WRITER_ARBITER_ELECTION_LOST")).toHaveLength(1);
+      const winner = contenders[outcomes.findIndex((line) => line.startsWith("OWN "))]!;
+      winner.stdin.write("STOP\n");
+      for (const child of contenders) child.stdin.end();
+      await Promise.all(contenders.map((child) => child.exited));
+    } finally {
+      owner.kill();
+      for (const child of contenders) child.kill();
+      await fixture.cleanup();
+    }
   }, 15_000);
 
   test("rejects a live child, then permits takeover only after definite death", async () => {

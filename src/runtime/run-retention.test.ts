@@ -12,7 +12,7 @@ import { buildRunManifest, claimRunDirectory, RLM_DSL_VERSION } from "./run-mani
 import {
   cleanupManagedRuns,
   defaultRunStateRoot,
-  ManagedRunStore,
+  ManagedRunStore as ProductionManagedRunStore,
   RUN_ACTIVE_FILE,
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
@@ -20,6 +20,16 @@ import {
   type ManagedRunLease,
   type RunLifecycleStatus,
 } from "./run-retention.ts";
+import {
+  managedRunStoreTestOptions,
+  type ManagedRunStoreTestOptions,
+} from "./run-retention-test-support.ts";
+import { managedRunPersistence } from "./run-managed-lifecycle.ts";
+import { ARBITRATION_DIRECTORY } from "./run-writer-protocol.ts";
+
+class ManagedRunStore extends ProductionManagedRunStore {
+  constructor(options: ManagedRunStoreTestOptions = {}) { super(managedRunStoreTestOptions(options)); }
+}
 
 const root = () => mkdtemp(join(tmpdir(), "pi-rlm-retention-"));
 const tokens = () => {
@@ -47,11 +57,7 @@ const fixtureController: ControllerDriver = {
   fork() { return this; },
 };
 
-const publishTerminal = async (
-  lease: ManagedRunLease,
-  status: Exclude<RunLifecycleStatus, "active">,
-  nonce: string,
-): Promise<string> => {
+const publishManifest = async (lease: ManagedRunLease, nonce: string): Promise<string> => {
   const document = buildRunManifest({
     program: fixtureProgram,
     sources: { context: "" },
@@ -63,13 +69,46 @@ const publishTerminal = async (
     dslVersion: RLM_DSL_VERSION,
     createRunNonce: () => nonce,
   });
-  await claimRunDirectory(lease.dir, document, undefined, lease.lifecycle.claimEntries);
+  await claimRunDirectory(
+    lease.dir,
+    document,
+    managedRunPersistence(lease.lifecycle).runDirectoryFileSystem(),
+    lease.lifecycle.claimEntries,
+  );
   const id = document.manifest.run.id;
   await lease.lifecycle.onManifest(id);
-  const journal = new JournalStore(lease.dir);
+  const journal = new JournalStore(lease.dir, managedRunPersistence(lease.lifecycle).journalFileSystem());
+  await journal.append({
+    type: "run_started",
+    runId: id,
+    manifestHash: document.manifestHash,
+    limits: document.manifest.limits,
+    inputRefs: [],
+  });
+  await lease.lifecycle.onRunStarted(id);
+  return id;
+};
+
+const appendTerminal = async (
+  lease: ManagedRunLease,
+  status: Exclude<RunLifecycleStatus, "active">,
+  id: string,
+): Promise<void> => {
+  const journal = new JournalStore(lease.dir, managedRunPersistence(lease.lifecycle).journalFileSystem());
   if (status === "completed") await journal.append({ type: "run_completed", runId: id, completionMode: "answer" });
   else if (status === "failed") await journal.append({ type: "run_failed", runId: id, code: "TEST_FAILURE", message: "fixture failed" });
   else await journal.append({ type: "run_cancelled", runId: id, code: "CANCELLED", message: "run cancelled by owner" });
+};
+
+const publishTerminal = async (
+  lease: ManagedRunLease,
+  status: Exclude<RunLifecycleStatus, "active">,
+  nonce: string,
+  beforeFinish?: () => Promise<void>,
+): Promise<string> => {
+  const id = await publishManifest(lease, nonce);
+  await beforeFinish?.();
+  await appendTerminal(lease, status, id);
   await lease.finish(status, id);
   return id;
 };
@@ -86,25 +125,34 @@ describe("managed run lifecycle", () => {
     expect(() => new ManagedRunStore({ root: "   " })).toThrow(expect.objectContaining({ code: "RUN_RETENTION_ROOT_INVALID" }));
   });
 
-  test("binds created, manifest, and terminal metadata with private modes", async () => {
+  test("publishes lifecycle metadata only after writer-owned manifest genesis and keeps private modes", async () => {
     let now = 10;
     const store = new ManagedRunStore({ root: await root(), now: () => now, createToken: tokens() });
     const lease = await store.create();
     expect(lease.name).toMatch(/^run-[a-f0-9]{32}$/);
     expect(await privateMode(store.root)).toBe(0o700);
     expect(await privateMode(lease.dir)).toBe(0o700);
-    expect(await privateMode(join(lease.dir, RUN_LIFECYCLE_FILE))).toBe(0o600);
-    expect(await privateMode(join(lease.dir, RUN_ACTIVE_FILE))).toBe(0o600);
-    expect((await store.list()).runs[0]).toMatchObject({ activity: "owned", metadata: { status: "active", createdAtMs: 10 } });
+    expect(await readdir(lease.dir)).toEqual([ARBITRATION_DIRECTORY]);
+    await expect(lstat(join(lease.dir, RUN_LIFECYCLE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
 
     now = 20;
-    const id = await publishTerminal(lease, "completed", "bound-fixture");
+    const id = await publishManifest(lease, "bound-fixture");
+    expect(await privateMode(join(lease.dir, RUN_LIFECYCLE_FILE))).toBe(0o600);
+    expect(await privateMode(join(lease.dir, RUN_ACTIVE_FILE))).toBe(0o600);
+    expect((await store.list()).runs[0]).toMatchObject({
+      activity: "owned",
+      metadata: { status: "active", runId: id, createdAtMs: 10, updatedAtMs: 20 },
+    });
+
+    await appendTerminal(lease, "completed", id);
     now = 30;
+    await lease.finish("completed", id);
     const listed = await store.list();
     expect(listed.issues).toEqual([]);
     expect(listed.runs[0]).toMatchObject({
       activity: "inactive",
-      metadata: { status: "completed", runId: id, createdAtMs: 10, updatedAtMs: 20, terminalAtMs: 20 },
+      metadata: { status: "completed", runId: id, createdAtMs: 10, updatedAtMs: 30, terminalAtMs: 30 },
     });
     await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -124,12 +172,12 @@ describe("managed run lifecycle", () => {
     await expect(lstat(dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("finish without strict manifest and terminal journal evidence releases an abandoned lifecycle", async () => {
+  test("finish before manifest genesis fails typed and quarantines the unexposed allocation", async () => {
     const store = new ManagedRunStore({ root: await root(), createToken: tokens() });
     const lease = await store.create();
     await expect(lease.finish("failed", `run_${"a".repeat(64)}`)).rejects.toMatchObject({ code: "RUN_RETENTION_METADATA_FAILED" });
-    expect((await store.list()).runs[0]).toMatchObject({ metadata: { status: "active" }, activity: "stale" });
-    await expect(readFile(join(lease.dir, RUN_ACTIVE_FILE))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(lease.dir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await store.list()).toMatchObject({ runs: [], issues: [] });
   });
 
   test("marker unlink failure falls back to an owner-bound inactive tombstone", async () => {
@@ -152,7 +200,7 @@ describe("managed run lifecycle", () => {
     expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).deleted).toEqual([lease.name]);
   });
 
-  test.each(["rename", "sync"] as const)("compounded tombstone %s failure releases in-process ownership with a typed error", async (fault) => {
+  test.each(["rename", "sync"] as const)("compounded tombstone %s failure retains in-process release authority with a typed error", async (fault) => {
     const path = await root();
     let tombstoneMoved = false;
     const metadataFileSystem = {
@@ -189,8 +237,8 @@ describe("managed run lifecycle", () => {
       cause: expect.any(AggregateError),
     });
     const listed = (await store.list()).runs[0]!;
-    expect(listed.activity).not.toBe("owned");
-    expect(listed.activity).toBe(fault === "rename" ? "ambiguous" : "inactive");
+    expect(listed.activity).toBe("owned");
+    if (fault === "rename") expect(await readdir(lease.dir)).toContain(RUN_ACTIVE_FILE);
     if (fault === "sync")
       expect(await readdir(lease.dir)).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listed.metadata.owner}.json`);
   });
@@ -203,8 +251,12 @@ const terminalFixture = async (
   bytes: number,
 ): Promise<string> => {
   const lease = await store.create();
-  await publishTerminal(lease, status, `terminal-${id}`);
-  await writeFile(join(lease.dir, "payload.bin"), Buffer.alloc(bytes), { mode: 0o600 });
+  const payload = join(lease.dir, "payload.bin");
+  await publishTerminal(lease, status, `terminal-${id}`, () =>
+    managedRunPersistence(lease.lifecycle).runPathEffect(
+      payload,
+      () => writeFile(payload, Buffer.alloc(bytes), { mode: 0o600 }),
+    ));
   return lease.name;
 };
 
@@ -240,24 +292,29 @@ describe("bounded deterministic retention", () => {
     expect((await sweeper.list()).runs.map((run) => run.name)).toEqual([newest]);
   });
 
-  test("force removes all inactive terminals but not a live nonterminal lease", async () => {
+  test("force removes all inactive terminals but not a live nonterminal writer", async () => {
     const path = await root();
     const createToken = tokens();
     const terminalStore = new ManagedRunStore({ root: path, createToken });
     const terminal = await terminalFixture(terminalStore, "completed", "4", 1);
-    const liveStore = new ManagedRunStore({ root: path, createToken, processProbe: () => true });
+    const liveStore = new ManagedRunStore({
+      root: path, createToken, processProbe: () => true, policy: { abandonedGraceMs: 0 },
+    });
     const live = await liveStore.create();
+    await publishManifest(live, "live-nonterminal");
     const result = await liveStore.cleanup({ force: true });
     expect(result.deleted).toEqual([terminal]);
     expect(result.retained).toContain(live.name);
-    await live.discard();
+    await live.abandon();
+    expect((await liveStore.cleanup({ force: true })).deleted).toEqual([live.name]);
   });
 
-  test("removes only old abandoned runs with a definitely stale or absent marker", async () => {
+  test("removes only old abandoned runs after writer release removes the active marker", async () => {
     let now = 1;
     const path = await root();
     const producer = new ManagedRunStore({ root: path, now: () => now, createToken: tokens() });
-    const stale = await producer.create();
+    const lease = await producer.create();
+    await publishManifest(lease, "abandoned-released-writer");
     now = 200;
     const restarted = new ManagedRunStore({
       root: path,
@@ -265,21 +322,10 @@ describe("bounded deterministic retention", () => {
       policy: { abandonedGraceMs: 100 },
       processProbe: () => false,
     });
-    // Same-process registry is authoritative until process exit, so this lease remains protected.
-    expect((await restarted.cleanup()).retained).toContain(stale.name);
-    await stale.discard();
-
-    const abandonedName = "run-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    const abandonedDir = join(path, abandonedName);
-    await mkdir(abandonedDir, { mode: 0o700 });
-    const abandonedOwner = "f".repeat(32);
-    await writeFile(join(abandonedDir, RUN_LIFECYCLE_FILE), JSON.stringify({
-      schemaVersion: 1, status: "active", owner: abandonedOwner, createdAtMs: 1, updatedAtMs: 1,
-    }), { mode: 0o600 });
-    await writeFile(join(abandonedDir, RUN_ACTIVE_FILE), JSON.stringify({
-      schemaVersion: 1, pid: 999_999, owner: abandonedOwner, startedAtMs: 1,
-    }), { mode: 0o600 });
-    expect((await restarted.cleanup()).deleted).toEqual([abandonedName]);
+    // The same-process writer registry remains authoritative even when a UI liveness probe says absent.
+    expect((await restarted.cleanup()).retained).toContain(lease.name);
+    await lease.abandon();
+    expect((await restarted.cleanup()).deleted).toEqual([lease.name]);
   });
 
   test("keeps a live child-process lease, then reclaims it after process crash and restart grace", async () => {
@@ -288,6 +334,7 @@ describe("bounded deterministic retention", () => {
     const script = `
       const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
       const lease = await new ManagedRunStore({ root: ${JSON.stringify(path)} }).create();
+      await lease.lifecycle.onManifest("run_" + "a".repeat(64));
       process.stdout.write(lease.name + "\\n");
       await Bun.stdin.text();
     `;
@@ -311,12 +358,14 @@ describe("bounded deterministic retention", () => {
     expect((await host.cleanup()).deleted).toEqual([name]);
   });
 
-  test("a cleanup process cannot delete a run while another process publishes its lease under the lifecycle claim", async () => {
+  test("cleanup cannot delete while another process binds lifecycle under writer genesis", async () => {
     const path = await root();
     const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const supportUrl = new URL("./run-retention-test-support.ts", import.meta.url).href;
     const script = `
       const fs = await import("node:fs/promises");
       const { ManagedRunStore, RUN_ACTIVE_FILE } = await import(${JSON.stringify(moduleUrl)});
+      const { managedRunStoreTestOptions } = await import(${JSON.stringify(supportUrl)});
       let paused = false;
       const metadataFileSystem = {
         async open(path, flags, mode) {
@@ -337,7 +386,10 @@ describe("bounded deterministic retention", () => {
         rename: fs.rename,
         unlink: fs.unlink,
       };
-      const lease = await new ManagedRunStore({ root: ${JSON.stringify(path)}, metadataFileSystem }).create();
+      const lease = await new ManagedRunStore(managedRunStoreTestOptions({
+        root: ${JSON.stringify(path)}, metadataFileSystem,
+      })).create();
+      await lease.lifecycle.onManifest("run_" + "b".repeat(64));
       process.stdout.write("READY " + lease.name + "\\n");
       await new Promise(() => {});
     `;
@@ -364,15 +416,17 @@ describe("bounded deterministic retention", () => {
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
     const name = await terminalFixture(producer, "completed", "process-cleaners", 1);
     const moduleUrl = new URL("./run-retention.ts", import.meta.url).href;
+    const supportUrl = new URL("./run-retention-test-support.ts", import.meta.url).href;
     const script = `
       const { ManagedRunStore } = await import(${JSON.stringify(moduleUrl)});
-      const store = new ManagedRunStore({
+      const { managedRunStoreTestOptions } = await import(${JSON.stringify(supportUrl)});
+      const store = new ManagedRunStore(managedRunStoreTestOptions({
         root: ${JSON.stringify(path)},
         beforeCleanupDecision: async () => {
           process.stdout.write("LISTED\\n");
           await Bun.stdin.text();
         },
-      });
+      }));
       const result = await store.cleanup({ force: true });
       process.stdout.write(JSON.stringify({ deleted: result.deleted, skipped: result.skipped }) + "\\n");
     `;
@@ -414,28 +468,37 @@ describe("bounded deterministic retention", () => {
     },
   );
 
-  test.each(["stale", "ambiguous"] as const)("a %s cross-process lifecycle claim is skipped as already claimed", async (kind) => {
-    const path = await root();
-    const producer = new ManagedRunStore({ root: path, createToken: tokens() });
-    const name = await terminalFixture(producer, "completed", `process-claim-${kind}`, 1);
-    const claimPath = join(path, name, ".pi-rlm-lifecycle.claim");
-    const script = `
-      const { open } = await import("node:fs/promises");
-      const handle = await open(${JSON.stringify(claimPath)}, "wx", 0o600);
-      await handle.writeFile(JSON.stringify({ schemaVersion: 1, pid: process.pid }) + "\\n");
-      await handle.sync();
-      await handle.close();
-      process.stdout.write("READY\\n");
-      await new Promise(() => {});
-    `;
-    const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
-    expect(new TextDecoder().decode((await child.stdout.getReader().read()).value).trim()).toBe("READY");
-    if (kind === "stale") { child.kill(); await child.exited; }
-    expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).skipped)
-      .toEqual([{ runName: name, reason: "already_claimed" }]);
-    expect((await lstat(join(path, name))).isDirectory()).toBe(true);
-    if (kind === "ambiguous") { child.kill(); await child.exited; }
-  });
+  test.each(["stale", "live"] as const)(
+    "%s cross-process writer authority is reclaimed only after definite owner death",
+    async (kind) => {
+      const path = await root();
+      const producer = new ManagedRunStore({ root: path, createToken: tokens() });
+      const name = await terminalFixture(producer, "completed", `process-writer-${kind}`, 1);
+      const arbiterUrl = new URL("./run-writer-arbiter.ts", import.meta.url).href;
+      const script = `
+        const { acquireRunWriterLease } = await import(${JSON.stringify(arbiterUrl)});
+        await acquireRunWriterLease({
+          managedRoot: ${JSON.stringify(path)}, runName: ${JSON.stringify(name)}, role: "writer",
+        });
+        process.stdout.write("READY\\n");
+        await new Promise(() => {});
+      `;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      expect(new TextDecoder().decode((await child.stdout.getReader().read()).value).trim()).toBe("READY");
+      if (kind === "stale") { child.kill(); await child.exited; }
+      const result = await new ManagedRunStore({ root: path }).cleanup({ force: true });
+      if (kind === "stale") {
+        expect(result.deleted).toEqual([name]);
+        await expect(lstat(join(path, name))).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(result.skipped).toEqual([{ runName: name, reason: "already_claimed" }]);
+        expect((await lstat(join(path, name))).isDirectory()).toBe(true);
+        child.kill();
+        await child.exited;
+        expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).deleted).toEqual([name]);
+      }
+    },
+  );
 
   test("cleanup failure is typed, observable, and reports the retained run", async () => {
     const path = await root();
@@ -477,7 +540,7 @@ describe("bounded deterministic retention", () => {
     expect((failure as RunRetentionError).cause).toBeInstanceOf(AggregateError);
   });
 
-  test("remover failure skips a loser only when the whole quarantine is absent", async () => {
+  test("reconciles remover-applied-then-thrown as deletion when the whole quarantine is absent", async () => {
     const path = await root();
     const producer = new ManagedRunStore({ root: path, createToken: tokens(), now: () => 1 });
     const name = await terminalFixture(producer, "completed", "remover-absent", 1);
@@ -490,8 +553,8 @@ describe("bounded deterministic retention", () => {
       },
     });
     const result = await sweeper.cleanup({ force: true });
-    expect(result.deleted).toEqual([]);
-    expect(result.skipped).toEqual([{ runName: name, reason: "already_removed" }]);
+    expect(result.deleted).toEqual([name]);
+    expect(result.skipped).toEqual([]);
     expect(result.retained).toEqual([]);
     expect((await readdir(path)).filter((entry) => entry.startsWith(".pi-rlm-quarantine-"))).toEqual([]);
   });
@@ -536,7 +599,7 @@ describe("bounded deterministic retention", () => {
     expect(await readFile(join(oldPath, "replacement"), "utf8")).toBe("keep");
   });
 
-  test("serializes two concurrent cleanup decisions with one exclusive lifecycle claim", async () => {
+  test("concurrent cleanup scavenges a terminal deterministic quarantine without duplicate owned removal", async () => {
     const path = await root();
     const producer = new ManagedRunStore({ root: path, createToken: tokens() });
     const name = await terminalFixture(producer, "completed", "concurrent", 1);
@@ -557,13 +620,13 @@ describe("bounded deterministic retention", () => {
     const second = new ManagedRunStore({ root: path });
     const firstWork = first.cleanup({ force: true });
     await removalEntered;
-    let secondFailure: unknown;
-    try { await second.cleanup({ force: true }); } catch (error) { secondFailure = error; }
+    const secondResult = await second.cleanup({ force: true });
     releaseRemoval();
     const firstResult = await firstWork;
     expect(firstResult.deleted).toEqual([name]);
-    expect(secondFailure).toMatchObject({ code: "RUN_RETENTION_CLEANUP_FAILED" });
+    expect(secondResult).toMatchObject({ deleted: [], skipped: [], retained: [] });
     expect(removals).toBe(1);
+    expect(await readdir(path)).toEqual([]);
   });
 });
 

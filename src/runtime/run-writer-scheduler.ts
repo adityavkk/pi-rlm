@@ -49,6 +49,10 @@ type Attempt<T> =
   | { readonly status: "fulfilled"; readonly value: T }
   | { readonly status: "rejected"; readonly error: unknown };
 
+class TerminalGuardRejection {
+  constructor(readonly error: unknown) {}
+}
+
 const writerScope = new AsyncLocalStorage<WriterScope>();
 const invoke = async <T>(effect: () => T | PromiseLike<T>): Promise<T> => effect();
 const attempt = async <T>(effect: () => T | PromiseLike<T>): Promise<Attempt<T>> => {
@@ -64,8 +68,43 @@ export class RunWriterScheduler {
   private accepting = true;
   private released = false;
   private releaseInFlight: Promise<void> | undefined;
+  private terminalInFlight: Promise<unknown> | undefined;
+  private terminalPrepared = false;
 
   constructor(private readonly hooks: RunWriterSchedulerHooks) {}
+
+  /** Logical transactions nest inline while their outer transaction retains admission. */
+  runOwnedTransaction<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    const inherited = writerScope.getStore();
+    if (inherited?.open) {
+      if (inherited.scheduler !== this) {
+        return Promise.reject(new RunWriterSchedulerError(
+          "WRITER_SCHEDULER_LOCK_ORDER",
+          "cannot enter a different writer scheduler from an open writer scope",
+        ));
+      }
+      return invoke(effect);
+    }
+    return this.run(effect);
+  }
+
+  /**
+   * Filesystem pathname effects nest inline so an enclosing logical transaction retains
+   * admission, but each effect still receives its own pre/post identity fence.
+   */
+  runOwnedOperation<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+    const inherited = writerScope.getStore();
+    if (inherited?.open) {
+      if (inherited.scheduler !== this) {
+        return Promise.reject(new RunWriterSchedulerError(
+          "WRITER_SCHEDULER_LOCK_ORDER",
+          "cannot enter a different writer scheduler from an open writer scope",
+        ));
+      }
+      return this.runQueued(effect);
+    }
+    return this.run(effect);
+  }
 
   run<T>(effect: () => T | PromiseLike<T>): Promise<T> {
     const inherited = writerScope.getStore();
@@ -89,6 +128,55 @@ export class RunWriterScheduler {
     return this.enqueue(() => this.runQueued(effect));
   }
 
+  /**
+   * Drain admitted work, fence once, then run an intentional terminal path transition without a post-fence.
+   * A guard rejection proves the transition never began, so ordinary admission can safely reopen.
+   */
+  terminal<T>(
+    effect: () => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
+    const inherited = writerScope.getStore();
+    if (inherited?.open && inherited.scheduler !== this) {
+      return Promise.reject(new RunWriterSchedulerError(
+        "WRITER_SCHEDULER_LOCK_ORDER",
+        "cannot terminate a writer scheduler from a different open writer scope",
+      ));
+    }
+    this.accepting = false;
+    if (inherited?.open) {
+      return Promise.reject(new RunWriterSchedulerError(
+        "WRITER_SCHEDULER_SELF_RELEASE",
+        "cannot terminate a writer scheduler from its own open scope",
+      ));
+    }
+    if (this.released)
+      return Promise.reject(new RunWriterSchedulerError("WRITER_SCHEDULER_CLOSED", "writer scheduler is already closed"));
+    if (this.releaseInFlight)
+      return Promise.reject(new RunWriterSchedulerError("WRITER_SCHEDULER_CLOSED", "writer release is already in flight"));
+    if (this.terminalInFlight) return this.terminalInFlight as Promise<T>;
+
+    const transition = this.enqueue(() => this.runTerminalQueued(effect, guard));
+    const tracked = transition.then(
+      (value) => {
+        this.released = true;
+        this.terminalInFlight = undefined;
+        return value;
+      },
+      (error: unknown) => {
+        this.terminalInFlight = undefined;
+        if (error instanceof TerminalGuardRejection) {
+          this.terminalPrepared = false;
+          this.accepting = true;
+          throw error.error;
+        }
+        throw error;
+      },
+    );
+    this.terminalInFlight = tracked;
+    return tracked;
+  }
+
   release(): Promise<void> {
     const inherited = writerScope.getStore();
     if (inherited?.open && inherited.scheduler !== this) {
@@ -105,6 +193,8 @@ export class RunWriterScheduler {
       ));
     }
     if (this.released) return Promise.resolve();
+    if (this.terminalInFlight)
+      return Promise.reject(new RunWriterSchedulerError("WRITER_SCHEDULER_CLOSED", "writer terminal transition is already in flight"));
     if (this.releaseInFlight) return this.releaseInFlight;
 
     const transition = this.enqueue(async () => {
@@ -133,6 +223,45 @@ export class RunWriterScheduler {
     const result = this.tail.then(effect);
     this.tail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  private async runTerminalQueued<T>(
+    effect: () => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
+    if (!this.terminalPrepared) {
+      const before = await attempt(this.hooks.preFence);
+      if (before.status === "rejected")
+        throw new RunWriterSchedulerManagementError("pre-fence", before.error, false, undefined);
+      this.terminalPrepared = true;
+    }
+    if (guard) {
+      const guarded = await attempt(guard);
+      if (guarded.status === "rejected") throw new TerminalGuardRejection(guarded.error);
+    }
+
+    const scope: WriterScope = { scheduler: this, children: [], open: true };
+    let effectResult: Attempt<T>;
+    const childErrors: unknown[] = [];
+    try {
+      effectResult = await writerScope.run(scope, () => attempt(effect));
+      for (let index = 0; index < scope.children.length; index++) {
+        const child = await scope.children[index] as Attempt<unknown>;
+        if (child.status === "rejected") childErrors.push(child.error);
+      }
+    } finally { scope.open = false; }
+    if (effectResult.status === "rejected" && childErrors.length === 0) throw effectResult.error;
+    if (effectResult.status === "rejected") {
+      throw new RunWriterSchedulerManagementError(
+        "nested-effect",
+        childErrors.length === 1 ? childErrors[0] : new AggregateError(childErrors, "nested writer effects failed"),
+        true,
+        effectResult.error,
+      );
+    }
+    if (childErrors.length === 1) throw childErrors[0];
+    if (childErrors.length > 1) throw new AggregateError(childErrors, "nested writer effects failed");
+    return effectResult.value;
   }
 
   private async runQueued<T>(effect: () => T | PromiseLike<T>): Promise<T> {
