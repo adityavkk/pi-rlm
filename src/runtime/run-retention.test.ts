@@ -192,7 +192,7 @@ describe("managed run lifecycle", () => {
     expect((await new ManagedRunStore({ root: path }).cleanup({ force: true })).deleted).toEqual([lease.name]);
   });
 
-  test.each(["rename", "sync"] as const)("compounded tombstone %s failure releases in-process ownership with a typed error", async (fault) => {
+  test.each(["rename", "sync"] as const)("compounded tombstone %s failure retains in-process release authority with a typed error", async (fault) => {
     const path = await root();
     let tombstoneMoved = false;
     const metadataFileSystem = {
@@ -229,8 +229,8 @@ describe("managed run lifecycle", () => {
       cause: expect.any(AggregateError),
     });
     const listed = (await store.list()).runs[0]!;
-    expect(listed.activity).not.toBe("owned");
-    expect(listed.activity).toBe(fault === "rename" ? "ambiguous" : "inactive");
+    expect(listed.activity).toBe("owned");
+    if (fault === "rename") expect(await readdir(lease.dir)).toContain(RUN_ACTIVE_FILE);
     if (fault === "sync")
       expect(await readdir(lease.dir)).toContain(`${RUN_INACTIVE_FILE_PREFIX}${listed.metadata.owner}.json`);
   });

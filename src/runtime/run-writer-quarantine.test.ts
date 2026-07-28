@@ -126,6 +126,29 @@ describe("terminal writer quarantine", () => {
     } finally { await fixture.cleanup(); }
   });
 
+  test("rejects a resolving remover that leaves the quarantine present", async () => {
+    const fixture = await arbiterFixture();
+    try {
+      const lease = await acquireRunRetentionLease({
+        managedRoot: fixture.root,
+        runName: fixture.runName,
+        preflightRetirement: async () => {},
+      }, { createToken: tokens() });
+      const quarantined = await lease.quarantine((identity) => quarantineOwnedRun(identity));
+      await expect(scavengeRunQuarantine({
+        root: fixture.root,
+        name: quarantined.name,
+        async remove() {},
+      })).rejects.toThrow("resolved without removing");
+      expect((await lstat(quarantined.path)).isDirectory()).toBe(true);
+      await scavengeRunQuarantine({
+        root: fixture.root,
+        name: quarantined.name,
+        remove: (path) => rm(path, { recursive: true }),
+      });
+    } finally { await fixture.cleanup(); }
+  });
+
   test("preserves removal and residual-inspection failures by reference", async () => {
     const fixture = await arbiterFixture();
     try {

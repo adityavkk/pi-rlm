@@ -167,5 +167,7 @@ export const scavengeRunQuarantine = async (
     }
     if (residual) throw removal;
   }
+  const residual = await statAttempt(path, fileSystem);
+  if (residual) throw new Error("quarantine remover resolved without removing the inode-bound directory");
   if (input.syncAfterRemove !== false) await syncRoot(input.root, tip, fileSystem);
 };

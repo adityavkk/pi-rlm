@@ -466,12 +466,13 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
   progress.bindRunId(runId);
   progress.setPhase("manifest");
   try { input.onProgressSource?.(progress.source); } catch { /* Progress observers have no run authority. */ }
+  const managedPersistence = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE];
   try {
     try {
-      if (input.runLifecycle?.[MANAGED_RUN_PERSISTENCE] && input.journal)
-        throw new TypeError("managed runs cannot bypass lease ownership with a preconstructed journal");
-      const runDirectoryFileSystem = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE]
-        ?.runDirectoryFileSystem(input.runDirectoryFileSystem);
+      if (managedPersistence && (input.journal || input.runDirectoryFileSystem
+        || input.journalFileSystem || input.contextStoreInstrumentation))
+        throw new TypeError("managed runs reject caller-supplied persistence implementations");
+      const runDirectoryFileSystem = managedPersistence?.runDirectoryFileSystem();
       await claimRunDirectory(
         input.dir,
         document,
@@ -489,11 +490,8 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
       throw error;
     }
     await input.runLifecycle?.onManifest(runId);
-  const journalFileSystem = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE]?.journalFileSystem(input.journalFileSystem)
-    ?? input.journalFileSystem;
-  const contextInstrumentation = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE]
-    ?.contextInstrumentation(input.contextStoreInstrumentation)
-    ?? input.contextStoreInstrumentation;
+  const journalFileSystem = managedPersistence?.journalFileSystem() ?? input.journalFileSystem;
+  const contextInstrumentation = managedPersistence?.contextInstrumentation() ?? input.contextStoreInstrumentation;
   const journal = input.journal ?? new JournalStore(input.dir, journalFileSystem);
   const store = new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation);
   const scope = createAbortScope(input.signal, limits.deadlineMs, () => clock.now());

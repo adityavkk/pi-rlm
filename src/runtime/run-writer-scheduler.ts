@@ -49,6 +49,10 @@ type Attempt<T> =
   | { readonly status: "fulfilled"; readonly value: T }
   | { readonly status: "rejected"; readonly error: unknown };
 
+class TerminalGuardRejection {
+  constructor(readonly error: unknown) {}
+}
+
 const writerScope = new AsyncLocalStorage<WriterScope>();
 const invoke = async <T>(effect: () => T | PromiseLike<T>): Promise<T> => effect();
 const attempt = async <T>(effect: () => T | PromiseLike<T>): Promise<Attempt<T>> => {
@@ -124,8 +128,14 @@ export class RunWriterScheduler {
     return this.enqueue(() => this.runQueued(effect));
   }
 
-  /** Drain admitted work, fence once, then run an intentional terminal path transition without a post-fence. */
-  terminal<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+  /**
+   * Drain admitted work, fence once, then run an intentional terminal path transition without a post-fence.
+   * A guard rejection proves the transition never began, so ordinary admission can safely reopen.
+   */
+  terminal<T>(
+    effect: () => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
     const inherited = writerScope.getStore();
     if (inherited?.open && inherited.scheduler !== this) {
       return Promise.reject(new RunWriterSchedulerError(
@@ -146,7 +156,7 @@ export class RunWriterScheduler {
       return Promise.reject(new RunWriterSchedulerError("WRITER_SCHEDULER_CLOSED", "writer release is already in flight"));
     if (this.terminalInFlight) return this.terminalInFlight as Promise<T>;
 
-    const transition = this.enqueue(() => this.runTerminalQueued(effect));
+    const transition = this.enqueue(() => this.runTerminalQueued(effect, guard));
     const tracked = transition.then(
       (value) => {
         this.released = true;
@@ -155,6 +165,11 @@ export class RunWriterScheduler {
       },
       (error: unknown) => {
         this.terminalInFlight = undefined;
+        if (error instanceof TerminalGuardRejection) {
+          this.terminalPrepared = false;
+          this.accepting = true;
+          throw error.error;
+        }
         throw error;
       },
     );
@@ -210,12 +225,19 @@ export class RunWriterScheduler {
     return result;
   }
 
-  private async runTerminalQueued<T>(effect: () => T | PromiseLike<T>): Promise<T> {
+  private async runTerminalQueued<T>(
+    effect: () => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
     if (!this.terminalPrepared) {
       const before = await attempt(this.hooks.preFence);
       if (before.status === "rejected")
         throw new RunWriterSchedulerManagementError("pre-fence", before.error, false, undefined);
       this.terminalPrepared = true;
+    }
+    if (guard) {
+      const guarded = await attempt(guard);
+      if (guarded.status === "rejected") throw new TerminalGuardRejection(guarded.error);
     }
 
     const scope: WriterScope = { scheduler: this, children: [], open: true };

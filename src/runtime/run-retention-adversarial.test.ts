@@ -146,7 +146,11 @@ describe("managed lifecycle adversarial recovery", () => {
     await expect(lease.discard()).rejects.toThrow("cannot discard an exposed managed run");
     expect((await lstat(lease.dir)).isDirectory()).toBe(true);
     await lease.abandon();
-    await expect(lstat(lease.dir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(lease.dir)).isDirectory()).toBe(true);
+    expect((await new ManagedRunStore({
+      root: path,
+      policy: { abandonedGraceMs: 0 },
+    }).cleanup({ force: true })).deleted).toEqual([lease.name]);
   });
 
   test("syncs the managed root after run mkdir and rolls back a failed sync", async () => {

@@ -88,6 +88,9 @@ export interface CreateRunWriterGenesisInput {
   readonly managedRoot: string;
   readonly runName: string;
 }
+export interface RecoverFailedRunWriterGenesisInput extends CreateRunWriterGenesisInput {
+  readonly preflight: () => void | PromiseLike<void>;
+}
 
 export interface RunWriterArbiterOptions {
   readonly now?: () => number;
@@ -413,7 +416,10 @@ export class RunWriterLease {
     return this.scheduler.release();
   }
 
-  private terminalTransition<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
+  private terminalTransition<T>(
+    effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
     return this.scheduler.terminal(async () => {
       const value = await effect({
         managedRoot: this.pinned.managedRoot,
@@ -424,21 +430,27 @@ export class RunWriterLease {
       if (registry.active.get(this.pinned.key)?.lease === this) registry.active.delete(this.pinned.key);
       await this.pinned.close();
       return value;
-    });
+    }, guard);
   }
 
   /** Terminal retention transition. The caller must reconcile rename and root sync before returning. */
-  quarantine<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
+  quarantine<T>(
+    effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
     if (this.role !== "retention" && this.role !== "retirement")
       return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_INPUT", "only retention authority may quarantine a run"));
-    return this.terminalTransition(effect);
+    return this.terminalTransition(effect, guard);
   }
 
   /** Fail-closed terminal transition for an ordinal-one genesis never exposed to a runtime. */
-  quarantineGenesis<T>(effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>): Promise<T> {
+  quarantineGenesis<T>(
+    effect: (identity: RunWriterTerminalIdentity) => T | PromiseLike<T>,
+    guard?: () => void | PromiseLike<void>,
+  ): Promise<T> {
     if (this.role !== "writer" || this.generation.ordinal !== 1)
       return Promise.reject(new RunWriterArbiterError("WRITER_ARBITER_INPUT", "only ordinal-one writer genesis may use genesis quarantine"));
-    return this.terminalTransition(effect);
+    return this.terminalTransition(effect, guard);
   }
 
   private async assertOwnedTip(): Promise<void> {
@@ -507,47 +519,85 @@ export class RunWriterLease {
   }
 }
 
+const activateWriterGenesis = async (
+  pinned: PinnedRunWriterIdentity,
+  options: ResolvedOptions,
+  recoverOrphans: boolean,
+  preflight?: () => void | PromiseLike<void>,
+): Promise<RunWriterLease> => withRunLock(pinned.key, async () => {
+  if (registry.active.has(pinned.key))
+    throw new RunWriterArbiterError("WRITER_ARBITER_ALREADY_OWNED", "current process already owns this pinned run");
+  const before = await scanPinned(pinned, options);
+  const recoverableOrphans = recoverOrphans && before.orphans.every((orphan) =>
+    orphan.recordType === "generation" && orphan.validity !== "unverifiable");
+  if (before.tip || before.generations.length > 0 || before.releases.size > 0
+    || (before.orphans.length > 0 && !recoverableOrphans))
+    throw new RunWriterArbiterError("WRITER_ARBITER_NO_AUTHORITY", "genesis arbitration namespace is not claimable");
+  await preflight?.();
+  await pinned.assertValid();
+  const generation: GenerationRecord = {
+    schemaVersion: 1, type: "generation", token: token(options.createToken), predecessor: null, ordinal: 1,
+    role: "writer", ...pinned.identity, runName: pinned.runName, pid: process.pid,
+    processNonce: registry.processNonce, osProcessIdentity: options.osProcessIdentity, createdAtMs: timestamp(options.now),
+  };
+  const publication = await attempt(() => publishPinned(pinned, generation, options));
+  const after = await attempt(() => scanPinned(pinned, options));
+  if (after.status === "failed") {
+    if (publication.status === "failed")
+      throw new AggregateError([publication.error, after.error], "genesis publication and reconciliation failed");
+    throw after.error;
+  }
+  const authoritative = after.value.tip;
+  if (!authoritative || !sameGeneration(authoritative, generation) || after.value.releases.has(generation.token)) {
+    if (publication.status === "failed") throw publication.error;
+    throw new RunWriterArbiterError("WRITER_ARBITER_ELECTION_LOST", "genesis did not become the exact authoritative tip");
+  }
+  const lease = new RunWriterLease(generation, pinned, options);
+  registry.active.set(pinned.key, { record: generation, lease });
+  return lease;
+});
+
+const openGenesis = async (
+  pinnedWork: Promise<PinnedRunWriterIdentity>,
+  options: ResolvedOptions,
+  recoverOrphans: boolean,
+  preflight?: () => void | PromiseLike<void>,
+): Promise<RunWriterLease> => {
+  const pinned = await pinnedWork;
+  try { return await activateWriterGenesis(pinned, options, recoverOrphans, preflight); }
+  catch (error) {
+    const closed = await attempt(() => pinned.close());
+    if (closed.status === "failed") throw new AggregateError([error, closed.error], "genesis and pinned-handle close failed");
+    throw error;
+  }
+};
+
 export const createRunWriterGenesis = async (
   input: CreateRunWriterGenesisInput,
   suppliedOptions: RunWriterArbiterOptions = {},
 ): Promise<RunWriterLease> => {
   if (!isMainThread)
     throw new RunWriterArbiterError("WRITER_ARBITER_UNSUPPORTED_REALM", "writer ownership is restricted to the main thread");
-  const options = resolvedOptions(suppliedOptions);
-  const pinned = await PinnedRunWriterIdentity.createGenesis(input.managedRoot, input.runName);
-  try {
-    return await withRunLock(pinned.key, async () => {
-      if (registry.active.has(pinned.key))
-        throw new RunWriterArbiterError("WRITER_ARBITER_ALREADY_OWNED", "current process already owns this pinned run");
-      const before = await scanPinned(pinned, options);
-      if (before.tip || before.generations.length > 0 || before.releases.size > 0 || before.orphans.length > 0)
-        throw new RunWriterArbiterError("WRITER_ARBITER_NO_AUTHORITY", "genesis arbitration namespace is not empty");
-      const generation: GenerationRecord = {
-        schemaVersion: 1, type: "generation", token: token(options.createToken), predecessor: null, ordinal: 1,
-        role: "writer", ...pinned.identity, runName: pinned.runName, pid: process.pid,
-        processNonce: registry.processNonce, osProcessIdentity: options.osProcessIdentity, createdAtMs: timestamp(options.now),
-      };
-      const publication = await attempt(() => publishPinned(pinned, generation, options));
-      const after = await attempt(() => scanPinned(pinned, options));
-      if (after.status === "failed") {
-        if (publication.status === "failed")
-          throw new AggregateError([publication.error, after.error], "genesis publication and reconciliation failed");
-        throw after.error;
-      }
-      const authoritative = after.value.tip;
-      if (!authoritative || !sameGeneration(authoritative, generation) || after.value.releases.has(generation.token)) {
-        if (publication.status === "failed") throw publication.error;
-        throw new RunWriterArbiterError("WRITER_ARBITER_ELECTION_LOST", "genesis did not become the exact authoritative tip");
-      }
-      const lease = new RunWriterLease(generation, pinned, options);
-      registry.active.set(pinned.key, { record: generation, lease });
-      return lease;
-    });
-  } catch (error) {
-    const closed = await attempt(() => pinned.close());
-    if (closed.status === "failed") throw new AggregateError([error, closed.error], "genesis and pinned-handle close failed");
-    throw error;
-  }
+  return openGenesis(
+    PinnedRunWriterIdentity.createGenesis(input.managedRoot, input.runName),
+    resolvedOptions(suppliedOptions),
+    false,
+  );
+};
+
+/** Elect cleanup-owned genesis in an existing empty/partial unpublished namespace. */
+export const recoverFailedRunWriterGenesis = async (
+  input: RecoverFailedRunWriterGenesisInput,
+  suppliedOptions: RunWriterArbiterOptions = {},
+): Promise<RunWriterLease> => {
+  if (!isMainThread)
+    throw new RunWriterArbiterError("WRITER_ARBITER_UNSUPPORTED_REALM", "writer ownership is restricted to the main thread");
+  return openGenesis(
+    PinnedRunWriterIdentity.openExisting(input.managedRoot, input.runName),
+    resolvedOptions(suppliedOptions),
+    true,
+    input.preflight,
+  );
 };
 
 const acquireLease = async (
@@ -565,7 +615,11 @@ const acquireLease = async (
     return await withRunLock(pinned.key, async () => {
       const active = registry.active.get(pinned.key);
       if (active) {
-        if (input.role === "retention" && active.record.role === "retirement" && preflightRetirement) {
+        if (input.role === "retention"
+          && (active.record.role === "retention" || active.record.role === "retirement")
+          && preflightRetirement) {
+          // A prior terminal attempt may have closed scheduler admission while
+          // retaining exact filesystem authority. Fresh preflight permits retry.
           await preflightRetirement("recovering");
           await pinned.close();
           return active.lease;

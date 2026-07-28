@@ -218,14 +218,18 @@ export class PinnedRunWriterIdentity {
 
   mutationIdentity(): {
     readonly managedRoot: string;
+    readonly realManagedRoot: string;
     readonly runName: string;
     readonly runPath: string;
+    readonly realRunPath: string;
     readonly identity: ArbitrationIdentity;
   } {
     return {
       managedRoot: this.managedRoot,
+      realManagedRoot: this.root.real,
       runName: this.runName,
       runPath: this.runPath,
+      realRunPath: this.run.real,
       identity: this.identity,
     };
   }
