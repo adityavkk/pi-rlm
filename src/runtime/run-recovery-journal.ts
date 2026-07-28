@@ -139,6 +139,7 @@ export const validateRecoveryJournal = (
   const attemptRecords = new Map<string, OperationAttemptRecord>();
   const operations = new Map<string, OperationRecord>();
   const controllerOperations = new Set<string>();
+  let committedControllerTurns = 0;
   let logicalCalls = 0;
   let attempts = 0;
   let tokensReserved = 0;
@@ -210,6 +211,9 @@ export const validateRecoveryJournal = (
           semanticError("committed cells exceed the manifest turn limit");
         const key = `${event.frameId}\0${event.iteration}`;
         if (rememberExact(cells, key, event, "cell")) {
+          committedControllerTurns += 1;
+          if (committedControllerTurns > document.manifest.limits.maxControllerTurns)
+            semanticError("committed cells exceed the global manifest turn limit");
           if (event.iteration !== frame.cells.size + 1) semanticError("cell iterations are not contiguous");
           frame.cells.set(event.iteration, event);
           const controller = operations.get(`${event.frameId}\0${event.frameId}:controller:${event.iteration}`);
@@ -274,8 +278,14 @@ export const validateRecoveryJournal = (
         } else {
           const expectedPrefix = event.kind === "llm" ? "call_llm_" : "call_agent_";
           const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
-          if (!event.operationId.startsWith(expectedPrefix) || !/^[a-f0-9]{64}$/.test(event.operationId.slice(expectedPrefix.length))
-            || !binding) semanticError("call operation lacks its authoritative key binding");
+          const expectedCallId = binding ? `${expectedPrefix}${sha256(canonicalStringify({
+            runId,
+            kind: event.kind,
+            key: event.key,
+            identityHash: binding.identityHash,
+          }))}` : undefined;
+          if (event.operationId !== expectedCallId)
+            semanticError("call operation lacks its authoritative key binding");
           if (event.kind === "llm" && event.requestIdentityVersion !== PROVIDER_REQUEST_IDENTITY_VERSION)
             semanticError("llm operation has an invalid request protocol");
           if (event.kind === "agent") {
