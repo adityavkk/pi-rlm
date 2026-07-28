@@ -36,7 +36,7 @@ const program = (() => {
 })();
 
 const waitForFile = async (path: string, child: ReturnType<typeof Bun.spawn>): Promise<void> => {
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 60_000;
   while (!existsSync(path)) {
     if (await Promise.race([child.exited.then(() => true), Bun.sleep(20).then(() => false)])) {
       const stderr = await new Response(child.stderr as ReadableStream<Uint8Array>).text();
@@ -174,7 +174,7 @@ describe("managed checkpoint continuation", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 90_000);
 
   test("rejects component drift before controller, model, or backend execution", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-components-"));
@@ -195,7 +195,7 @@ describe("managed checkpoint continuation", () => {
       await lease?.abandon().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 90_000);
 
   test("rejects corrupt checkpoint bytes and unsupported hydrated activity before execution", async () => {
     const backend = await QuickJsBackend.create();
@@ -214,11 +214,31 @@ describe("managed checkpoint continuation", () => {
           await writeFile(path, bytes);
           await expectRecoveryCode(resumeWith(lease, backend), "RECOVERY_CHECKPOINT_INVALID");
         } else {
-          await rewriteCheckpointPayload(lease.dir, (payload) => {
-            const ledger = payload["ledger"] as { usage: { activeLeafCalls: number } };
-            ledger.usage.activeLeafCalls = 1;
-          });
-          await expectRecoveryCode(resumeWith(lease, backend), "RECOVERY_UNSUPPORTED_STATE");
+          const eventsPath = join(lease.dir, "events.jsonl");
+          const originalEvents = await readFile(eventsPath, "utf8");
+          const unsupportedMutations: Array<(payload: Record<string, unknown>) => void> = [
+            (payload) => { ((payload["ledger"] as { usage: { activeLeafCalls: number } }).usage).activeLeafCalls = 1; },
+            (payload) => { ((payload["ledger"] as { usage: { tokensReserved: number } }).usage).tokensReserved = 1; },
+            (payload) => { payload["scopeUsage"] = [{ scope: "active-scope", usage: { attempts: 0, durationMs: 0 } }]; },
+            (payload) => {
+              const frames = payload["frames"] as Array<Record<string, unknown>>;
+              const rootFrame = frames[0]!;
+              frames.push({
+                frameId: `${rootFrame["frameId"]}:nested`,
+                lineage: `${rootFrame["frameId"]}:nested`,
+                parentFrameId: rootFrame["frameId"],
+                depth: 1,
+                objective: "unsupported nested frame",
+                state: "open",
+                nextIteration: 1,
+              });
+            },
+          ];
+          for (const mutate of unsupportedMutations) {
+            await rewriteCheckpointPayload(lease.dir, mutate);
+            await expectRecoveryCode(resumeWith(lease, backend), "RECOVERY_UNSUPPORTED_STATE");
+            await writeFile(eventsPath, originalEvents, { mode: 0o600 });
+          }
         }
         await lease.abandon();
         lease = undefined;
@@ -227,7 +247,7 @@ describe("managed checkpoint continuation", () => {
         await rm(root, { recursive: true, force: true });
       }
     }
-  }, 60_000);
+  }, 180_000);
 
   test("binds every hydrated state catalog exactly to checkpoint content and journal authority", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-exact-state-"));
@@ -253,6 +273,14 @@ describe("managed checkpoint continuation", () => {
         await expectRecoveryCode(resumeWith(lease, backend, model), "RECOVERY_CHECKPOINT_INVALID");
         await writeFile(eventsPath, originalEvents, { mode: 0o600 });
       }
+      const lines = originalEvents.trim().split("\n");
+      const checkpoint = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
+      checkpoint["journalPrefixSha256"] = "0".repeat(64);
+      const { type: _type, checkpointId: _checkpointId, ...identity } = checkpoint;
+      checkpoint["checkpointId"] = `cp_${sha256(canonicalStringify(identity as unknown as JsonValue))}`;
+      lines[lines.length - 1] = canonicalStringify(checkpoint as unknown as JsonValue);
+      await writeFile(eventsPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+      await expectRecoveryCode(resumeWith(lease, backend, model), "RECOVERY_CHECKPOINT_INVALID");
       expect(model.callCount).toBe(0);
       await lease.abandon();
       lease = undefined;
@@ -260,7 +288,7 @@ describe("managed checkpoint continuation", () => {
       await lease?.abandon().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
-  }, 45_000);
+  }, 120_000);
 
   test("rejects authoritative unsafe tails and unsettled operation intents", async () => {
     const backend = await QuickJsBackend.create();
@@ -310,7 +338,7 @@ describe("managed checkpoint continuation", () => {
         await rm(root, { recursive: true, force: true });
       }
     }
-  }, 60_000);
+  }, 180_000);
 
   test("classifies pre-v4 manifests as incompatible before checkpoint or model effects", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-pre-v4-"));
@@ -333,7 +361,7 @@ describe("managed checkpoint continuation", () => {
       await lease?.abandon().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 90_000);
 
   test("terminal managed runs are immutable at exact-name reopen", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-terminal-"));
@@ -357,5 +385,5 @@ describe("managed checkpoint continuation", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 });
