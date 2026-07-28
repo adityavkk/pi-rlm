@@ -1,5 +1,12 @@
 import type { RuntimeComponentIdentity } from "../core/identity.ts";
-import type { Cell, ControllerDriver, FrameState } from "./controller.ts";
+import { isJsonObject } from "../core/json.ts";
+import {
+  CONTROLLER_RESUME_CAPABILITY_VERSION,
+  type Cell,
+  type ControllerDriver,
+  type ControllerResumeCapabilityV1,
+  type FrameState,
+} from "./controller.ts";
 
 export const RESUME_FIXTURE_FIRST_CELL = `
 const model = await llm({ key: "once", prompt: "spend exactly once" });
@@ -23,19 +30,33 @@ answer({ answer: workspace.count + ":" + model.value + ":" + (context.id === wor
 `;
 
 export class ResumeFixtureController implements ControllerDriver {
+  private index = 0;
   readonly identity: RuntimeComponentIdentity = {
     id: "pi-rlm/test-resume-controller",
     version: "1",
     configuration: { fixture: "checkpoint-resume-v1" },
   };
 
+  readonly resumeCapability: ControllerResumeCapabilityV1 = {
+    version: CONTROLLER_RESUME_CAPABILITY_VERSION,
+    strategy: "state-token",
+    capture: (boundary) => ({ index: this.index, nextIteration: boundary.nextIteration }),
+    restore: (state, boundary) => {
+      if (!isJsonObject(state) || Object.keys(state).length !== 2 || state["index"] !== 1
+        || state["nextIteration"] !== boundary.nextIteration)
+        throw new TypeError("resume fixture controller cursor is invalid");
+      this.index = 1;
+    },
+  };
+
   constructor(private readonly beforeSecond?: (state: FrameState) => void | Promise<void>) {}
 
   async next(state: FrameState): Promise<Cell> {
-    if (state.trajectory.total === 0)
-      return { reasoning: "build checkpoint state", code: RESUME_FIXTURE_FIRST_CELL };
+    const index = this.index++;
+    if (index === 0) return { reasoning: "build checkpoint state", code: RESUME_FIXTURE_FIRST_CELL };
     await this.beforeSecond?.(state);
-    return { reasoning: "continue without replay", code: RESUME_FIXTURE_SECOND_CELL };
+    if (index === 1) return { reasoning: "continue without replay", code: RESUME_FIXTURE_SECOND_CELL };
+    throw new Error("resume fixture controller script exhausted");
   }
 
   fork(): ControllerDriver {

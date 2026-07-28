@@ -75,6 +75,19 @@ const semanticError = (message: string): never => {
   throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", message);
 };
 
+const recoveryKeyRegistryId = (runId: string, event: Extract<RlmEvent, { type: "key_bound" }>): string => {
+  if (event.kind !== "recurse") return `${event.kind}\0${event.key}`;
+  if (event.frameId === `${runId}:f0`) return `${event.kind}\0${event.frameId}\0${event.key}`;
+  const prefix = `${runId}:frame:`;
+  const match = event.frameId.startsWith(prefix)
+    ? /^(call_recurse_[a-f0-9]{64}):e[1-9][0-9]*$/.exec(event.frameId.slice(prefix.length))
+    : null;
+  if (!match?.[1]) return semanticError("recurse key binding has an invalid frame lineage");
+  return `${event.kind}\0${match[1]}\0${event.key}`;
+};
+
+const operationKeyRegistryId = (kind: "llm" | "agent", key: string): string => `${kind}\0${key}`;
+
 const rememberExact = <K, T>(registry: Map<K, T>, key: K, event: T, label: string): boolean => {
   const existing = registry.get(key);
   if (!existing) {
@@ -231,7 +244,7 @@ export const validateRecoveryJournal = (
         break;
       }
       case "key_bound":
-        rememberExact(keys, `${event.frameId}\0${event.kind}\0${event.key}`, event, "key binding");
+        rememberExact(keys, recoveryKeyRegistryId(runId, event), event, "key binding");
         break;
       case "agent_approval":
         rememberExact(approvals, `${event.frameId}\0${event.callId}`, event, "agent approval");
@@ -279,7 +292,7 @@ export const validateRecoveryJournal = (
             semanticError("extractor operation lacks its authoritative fallback projection");
         } else {
           const expectedPrefix = event.kind === "llm" ? "call_llm_" : "call_agent_";
-          const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
+          const binding = keys.get(operationKeyRegistryId(event.kind, event.key));
           const expectedCallId = binding ? `${expectedPrefix}${sha256(canonicalStringify({
             runId,
             kind: event.kind,
@@ -381,7 +394,9 @@ export const validateRecoveryJournal = (
         break;
       }
       case "call_committed": {
-        const binding = keys.get(`${event.frameId}\0${event.kind}\0${event.key}`);
+        const binding = event.kind === "llm" || event.kind === "agent"
+          ? keys.get(operationKeyRegistryId(event.kind, event.key))
+          : keys.get(recoveryKeyRegistryId(runId, event as unknown as Extract<RlmEvent, { type: "key_bound" }>));
         if (!binding || event.cached) semanticError("committed call lacks one prior key binding");
         const executions = calls.get(event.callId) ?? [];
         const prior = executions.at(-1);

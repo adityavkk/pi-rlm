@@ -4,6 +4,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeComponentIdentity } from "../core/identity.ts";
+import type { ControllerDriver } from "./controller.ts";
 import { deriveOperationIntentId } from "../core/operation.ts";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import { normalizeProgram } from "../core/program.ts";
@@ -12,10 +13,11 @@ import { JournalStore } from "../shell/journal-store.ts";
 import { QuickJsBackend } from "../shell/interpreter/quickjs.ts";
 import { MockModelClient } from "../shell/model/mock.ts";
 import { ResumeFixtureController } from "./checkpoint-resume-fixture.ts";
+import { runCheckpointPayloadPath } from "./checkpoint-store.ts";
 import { managedRunPersistence } from "./run-managed-lifecycle.ts";
 import { ManagedRunStore } from "./run-retention.ts";
 import { RunRecoveryError, type RunRecoveryErrorCode } from "./run-recovery-types.ts";
-import { resumeProgram } from "./run-resume.ts";
+import { inspectResumableManagedRun, resumeProgram } from "./run-resume.ts";
 import { runProgram } from "./run.ts";
 
 const modelIdentity: RuntimeComponentIdentity = {
@@ -128,13 +130,13 @@ const rewriteCheckpointPayload = async (
   const prefix = raw.slice(0, priorNewline + 1);
   const event = JSON.parse(raw.slice(priorNewline + 1).trim()) as Record<string, unknown>;
   if (event["type"] !== "checkpoint_committed") throw new Error("fixture journal does not end in a checkpoint");
-  const digest = event["checkpointSha256"] as string;
-  const payload = JSON.parse(await readFile(join(dir, "contexts", `${digest}.bin`), "utf8")) as Record<string, unknown>;
+  const sequence = event["checkpointSequence"] as number;
+  const path = runCheckpointPayloadPath(dir, sequence);
+  const payload = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
   mutate(payload);
   const payloadText = canonicalStringify(payload as unknown as JsonValue);
   const nextDigest = sha256(payloadText);
-  await mkdir(join(dir, "contexts"), { recursive: true, mode: 0o700 });
-  await writeFile(join(dir, "contexts", `${nextDigest}.bin`), payloadText, { flag: "wx", mode: 0o600 });
+  await writeFile(path, payloadText, { mode: 0o600 });
   event["checkpointRef"] = `ctx_${nextDigest}`;
   event["checkpointSha256"] = nextDigest;
   event["checkpointBytes"] = Buffer.byteLength(payloadText, "utf8");
@@ -207,8 +209,8 @@ describe("managed checkpoint continuation", () => {
         lease = await new ManagedRunStore({ root }).openForResume(name);
         if (kind === "corrupt") {
           const raw = await readFile(join(lease.dir, "events.jsonl"), "utf8");
-          const event = JSON.parse(raw.trim().split("\n").at(-1)!) as { checkpointSha256: string };
-          const path = join(lease.dir, "contexts", `${event.checkpointSha256}.bin`);
+          const event = JSON.parse(raw.trim().split("\n").at(-1)!) as { checkpointSequence: number };
+          const path = runCheckpointPayloadPath(lease.dir, event.checkpointSequence);
           const bytes = await readFile(path);
           bytes[0] = bytes[0] === 0x7b ? 0x5b : 0x7b;
           await writeFile(path, bytes);
@@ -355,6 +357,59 @@ describe("managed checkpoint continuation", () => {
       const model = new MockModelClient(() => "must-not-run", modelIdentity);
       await expectRecoveryCode(resumeWith(lease, backend, model), "RECOVERY_INCOMPATIBLE");
       expect(model.callCount).toBe(0);
+      await lease.abandon();
+      lease = undefined;
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("rejects an unsupported private-cursor controller before controller or provider effects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-unsupported-controller-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    try {
+      const name = await crashAtCheckpoint(root);
+      lease = await new ManagedRunStore({ root }).openForResume(name);
+      let controllerCalls = 0;
+      const unsupported: ControllerDriver = {
+        identity: new ResumeFixtureController().identity,
+        async next() { controllerCalls++; return { reasoning: "must not run", code: "1" }; },
+        fork() { return this; },
+      };
+      const model = new MockModelClient(() => "must-not-run", modelIdentity);
+      await expectRecoveryCode(resumeProgram({
+        controller: unsupported, model, backend, dir: lease.dir,
+        signal: new AbortController().signal, runLifecycle: lease.lifecycle,
+      }), "RECOVERY_CONTROLLER_UNSUPPORTED");
+      expect(controllerCalls).toBe(0);
+      expect(model.callCount).toBe(0);
+      await lease.abandon();
+      lease = undefined;
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("inspects resumability without repairing a proven torn suffix", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-inspect-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    try {
+      const name = await crashAtCheckpoint(root);
+      lease = await new ManagedRunStore({ root }).openForResume(name);
+      const path = join(lease.dir, "events.jsonl");
+      await appendFile(path, '{"type":');
+      const before = await readFile(path);
+      const inspected = await inspectResumableManagedRun({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend, dir: lease.dir, signal: new AbortController().signal, runLifecycle: lease.lifecycle,
+      });
+      expect(inspected.incompleteTailBytes).toBe(Buffer.byteLength('{"type":'));
+      expect(await readFile(path)).toEqual(before);
       await lease.abandon();
       lease = undefined;
     } finally {

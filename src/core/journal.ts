@@ -270,7 +270,9 @@ export const reduceStatus = (events: readonly RlmEvent[]): RunStatus => {
       case "checkpoint_committed":
         break;
       case "key_bound": {
-        const registryKey = `${event.frameId}\u0000${event.kind}\u0000${event.key}`;
+        const registryKey = event.kind === "recurse"
+          ? `${event.frameId}\u0000${event.kind}\u0000${event.key}`
+          : `${event.kind}\u0000${event.key}`;
         if (!keyBindings.has(registryKey)) keyBindings.set(registryKey, {
           frameId: event.frameId,
           kind: event.kind,

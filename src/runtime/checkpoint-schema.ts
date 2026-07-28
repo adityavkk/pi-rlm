@@ -193,7 +193,7 @@ export const parseRunCheckpointPayload = (
   document: RunManifestDocument,
 ): RunCheckpointPayloadV1 => {
   const root = object(input, "checkpoint", [
-    "schemaVersion", "checkpointVersion", "identity", "run", "journalPrefix", "frames", "root", "contexts",
+    "schemaVersion", "checkpointVersion", "identity", "run", "journalPrefix", "controller", "frames", "root", "contexts",
     "callCache", "keyBindings", "artifacts", "ledger", "scopeUsage", "ordinals",
   ]);
   if (root["schemaVersion"] !== RUN_CHECKPOINT_SCHEMA_VERSION || root["checkpointVersion"] !== RUN_CHECKPOINT_VERSION)
@@ -222,6 +222,10 @@ export const parseRunCheckpointPayload = (
     bytes: integer(prefix["bytes"], "checkpoint.journalPrefix.bytes", 1),
     eventCount: integer(prefix["eventCount"], "checkpoint.journalPrefix.eventCount", 1),
   };
+  const controller = object(root["controller"], "checkpoint.controller", ["capability", "state"]);
+  const capability = object(controller["capability"], "checkpoint.controller.capability", ["version", "strategy"]);
+  if (document.manifest.components.controllerResume === null
+    || !same(capability, document.manifest.components.controllerResume)) invalid("checkpoint.controller.capability");
 
   const frames: CheckpointFrameV1[] = list(root["frames"], "checkpoint.frames", document.manifest.limits.maxFrames + 1)
     .map((raw, index) => {
@@ -341,7 +345,12 @@ export const parseRunCheckpointPayload = (
     schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
     checkpointVersion: RUN_CHECKPOINT_VERSION,
     identity: { runId, manifestHash, manifestSchemaVersion: document.manifest.schemaVersion, checkpointSequence },
-    run: { startMs, rootFrameId, nextControllerTurn }, journalPrefix, frames,
+    run: { startMs, rootFrameId, nextControllerTurn }, journalPrefix,
+    controller: {
+      capability: document.manifest.components.controllerResume!,
+      state: controller["state"] as JsonValue,
+    },
+    frames,
     root: {
       frame: { frameId: rootFrameId, lineage: rootFrameId, depth: 0, objective: program.objective, inputs, outputs: program.outputs },
       nextIteration, workspace: rootState["workspace"] as JsonValue, trajectory: trajectory as never,

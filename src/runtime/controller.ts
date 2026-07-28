@@ -12,6 +12,27 @@ import type { CallUsage } from "../core/usage.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { ModelClient, ModelRequest, ModelResponse } from "../shell/model/client.ts";
 
+export const CONTROLLER_RESUME_CAPABILITY_VERSION = "pi-rlm.controller-resume.v1" as const;
+
+export interface ControllerResumeBoundary {
+  readonly frameId: string;
+  readonly nextIteration: number;
+  readonly trajectoryLength: number;
+}
+
+export interface ControllerResumeCapabilityV1 {
+  readonly version: typeof CONTROLLER_RESUME_CAPABILITY_VERSION;
+  /** `trajectory-derived` has no private cursor; `state-token` checkpoints one bounded JSON cursor. */
+  readonly strategy: "trajectory-derived" | "state-token";
+  capture(boundary: ControllerResumeBoundary): JsonValue;
+  restore(state: JsonValue, boundary: ControllerResumeBoundary): void;
+}
+
+export interface ControllerResumeCapabilityIdentityV1 {
+  readonly version: typeof CONTROLLER_RESUME_CAPABILITY_VERSION;
+  readonly strategy: ControllerResumeCapabilityV1["strategy"];
+}
+
 export interface FrameState {
   readonly frameId: string;
   readonly depth: number;
@@ -38,7 +59,42 @@ export interface ControllerModelOperation {
 export interface ControllerDriver {
   /** Required before run effects. Includes implementation and all behavior-affecting instance options. */
   readonly identity: RuntimeComponentIdentity;
+  /** Optional explicit checkpoint contract. Resume rejects drivers without this own-data capability. */
+  readonly resumeCapability?: ControllerResumeCapabilityV1;
   /** Drivers must perform provider work only through `operation.complete`. */
   next(state: FrameState, signal: AbortSignal, operation: ControllerModelOperation): Promise<Cell>;
   fork(childObjective: string, childFrameId: string): ControllerDriver;
 }
+
+export class ControllerResumeCapabilityError extends TypeError {
+  override readonly name = "ControllerResumeCapabilityError";
+  readonly code = "CONTROLLER_RESUME_UNSUPPORTED";
+}
+
+/** Effect-free own-data inspection. Accessors cannot run during component preflight. */
+export const inspectControllerResumeCapability = (
+  controller: ControllerDriver,
+): { readonly identity: ControllerResumeCapabilityIdentityV1; readonly capability: ControllerResumeCapabilityV1 } | undefined => {
+  const descriptor = Object.getOwnPropertyDescriptor(controller, "resumeCapability");
+  if (!descriptor) return undefined;
+  if (!("value" in descriptor) || descriptor.value === undefined || descriptor.get || descriptor.set)
+    throw new ControllerResumeCapabilityError("controller resume capability must be an own data property");
+  const capability = descriptor.value as Partial<ControllerResumeCapabilityV1>;
+  if (capability === null || typeof capability !== "object"
+    || capability.version !== CONTROLLER_RESUME_CAPABILITY_VERSION
+    || (capability.strategy !== "trajectory-derived" && capability.strategy !== "state-token")
+    || typeof capability.capture !== "function" || typeof capability.restore !== "function")
+    throw new ControllerResumeCapabilityError("controller resume capability is malformed or unsupported");
+  return {
+    identity: { version: CONTROLLER_RESUME_CAPABILITY_VERSION, strategy: capability.strategy },
+    capability: capability as ControllerResumeCapabilityV1,
+  };
+};
+
+export const requireControllerResumeCapability = (
+  controller: ControllerDriver,
+): { readonly identity: ControllerResumeCapabilityIdentityV1; readonly capability: ControllerResumeCapabilityV1 } => {
+  const inspected = inspectControllerResumeCapability(controller);
+  if (!inspected) throw new ControllerResumeCapabilityError("controller does not declare resumable state semantics");
+  return inspected;
+};

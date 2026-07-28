@@ -544,7 +544,10 @@ export class ManagedRunLease {
   }
 }
 
-const retainedReleaseAuthorities = new Map<string, ManagedRunLease>();
+interface RetainedReleaseAuthority {
+  retryReleaseAuthority(): Promise<void>;
+}
+const retainedReleaseAuthorities = new Map<string, RetainedReleaseAuthority>();
 
 export class ManagedRunStore {
   readonly root: string;
@@ -599,6 +602,18 @@ export class ManagedRunStore {
     for (const [key, retained] of retainedReleaseAuthorities) {
       if (retained === lease) retainedReleaseAuthorities.delete(key);
     }
+  }
+
+  private retainWriterReleaseAuthority(name: string, writer: RunWriterLease): void {
+    if (!this.rootIdentity) throw new Error("managed root identity is unavailable while retaining writer authority");
+    const key = join(this.rootIdentity.real, name);
+    const authority: RetainedReleaseAuthority = {
+      retryReleaseAuthority: async (): Promise<void> => {
+        await writer.release();
+        if (retainedReleaseAuthorities.get(key) === authority) retainedReleaseAuthorities.delete(key);
+      },
+    };
+    retainedReleaseAuthorities.set(key, authority);
   }
 
   private async retryReleaseAuthorities(): Promise<void> {
@@ -883,6 +898,7 @@ export class ManagedRunStore {
         try { await writer.release(); releaseFailure = undefined; break; }
         catch (error) { releaseFailure = releaseFailure === undefined ? error : new AggregateError([releaseFailure, error]); }
       }
+      if (releaseFailure !== undefined) this.retainWriterReleaseAuthority(name, writer);
       throw new RunRetentionError(
         "RUN_RETENTION_RESUME_FAILED",
         "failed to bind managed resume lifecycle",

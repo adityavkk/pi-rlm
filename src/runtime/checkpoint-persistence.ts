@@ -1,15 +1,16 @@
 /** Guarded payload-first checkpoint publication at a globally quiescent root boundary. */
 
 import type { RlmEvent } from "../core/journal.ts";
-import { canonicalStringify, type JsonValue } from "../core/json.ts";
-import type { ContextStore } from "../shell/context-store.ts";
+import { canonicalStringify, parseJsonValue, type JsonValue } from "../core/json.ts";
+import { JournalAppendError } from "../shell/journal-store.ts";
 import type { RunManifestDocument } from "./run-manifest.ts";
 import { validateRecoveryJournal } from "./run-recovery-journal.ts";
 import type { InternalRunState } from "./state.ts";
 import { throwIfAborted } from "./abort.ts";
-import { parseRunCheckpointPayload } from "./checkpoint-schema.ts";
+import { parseRunCheckpointPayload, RunCheckpointValidationError } from "./checkpoint-schema.ts";
+import { RunCheckpointStore } from "./checkpoint-store.ts";
+import type { ControllerResumeCapabilityIdentityV1, ControllerResumeCapabilityV1 } from "./controller.ts";
 import {
-  MAX_RUN_CHECKPOINT_BYTES,
   RUN_CHECKPOINT_SCHEMA_VERSION,
   RUN_CHECKPOINT_VERSION,
   type CheckpointFrameV1,
@@ -67,7 +68,11 @@ const exactStoredBytes = (state: InternalRunState): number => {
 export interface RunCheckpointWriterOptions {
   readonly state: InternalRunState;
   readonly document: RunManifestDocument;
-  readonly checkpointStore: ContextStore;
+  readonly checkpointStore: RunCheckpointStore;
+  readonly controllerResume?: {
+    readonly identity: ControllerResumeCapabilityIdentityV1;
+    readonly capability: ControllerResumeCapabilityV1;
+  };
   readonly signal: AbortSignal;
 }
 
@@ -75,8 +80,8 @@ export class RunCheckpointWriter {
   constructor(private readonly options: RunCheckpointWriterOptions) {}
 
   async commit(continuation: FrameCheckpointContinuation): Promise<boolean> {
-    const { state, document, checkpointStore, signal } = this.options;
-    if (continuation.frame.depth !== 0 || continuation.frame.frameId !== `${state.runId}:f0`
+    const { state, document, checkpointStore, controllerResume, signal } = this.options;
+    if (!controllerResume || continuation.frame.depth !== 0 || continuation.frame.frameId !== `${state.runId}:f0`
       || state.inflight.size !== 0 || state.scopeUsage.size !== 0
       || state.ledger.current.usage.activeLeafCalls !== 0 || state.ledger.current.usage.tokensReserved !== 0
       || !state.semaphore.isIdle() || !state.contextSemaphore.isIdle()
@@ -121,6 +126,13 @@ export class RunCheckpointWriter {
         .sort((left, right) => compare(left.descriptor.id, right.descriptor.id));
       const scopeUsage = [...state.scopeUsage].map(([scope, usage]) => ({ scope, usage }))
         .sort((left, right) => compare(left.scope, right.scope));
+      const boundary = {
+        frameId: continuation.frame.frameId,
+        nextIteration: continuation.nextIteration,
+        trajectoryLength: continuation.entries.length,
+      };
+      const captured = parseJsonValue(controllerResume.capability.capture(boundary));
+      if (!captured.ok) return false;
       const payload: RunCheckpointPayloadV1 = {
         schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
         checkpointVersion: RUN_CHECKPOINT_VERSION,
@@ -140,6 +152,7 @@ export class RunCheckpointWriter {
           bytes: journal.verifiedBytes,
           eventCount: journal.events.length,
         },
+        controller: { capability: controllerResume.identity, state: captured.value },
         frames,
         root: {
           frame: {
@@ -165,18 +178,18 @@ export class RunCheckpointWriter {
           recurseExecutions: mapEntries(state.recurseExecutions),
         },
       };
-      const canonicalPayload = parseRunCheckpointPayload(payload as unknown as JsonValue, document);
-      const checkpoint = await checkpointStore.derive(
-        {
-          key: `checkpoint:${state.runId}:${checkpointSequence}`,
-          value: canonicalPayload as unknown as JsonValue,
-          label: `checkpoint:${state.runId}:${checkpointSequence}`,
-        },
-        {
-          checkpoint: () => throwIfAborted(signal),
-          maxOutputBytes: MAX_RUN_CHECKPOINT_BYTES,
-        },
+      let canonicalPayload: RunCheckpointPayloadV1;
+      try { canonicalPayload = parseRunCheckpointPayload(payload as unknown as JsonValue, document); }
+      catch (error) {
+        if (error instanceof RunCheckpointValidationError) return false;
+        throw error;
+      }
+      const checkpoint = await checkpointStore.publish(
+        checkpointSequence,
+        canonicalPayload as unknown as JsonValue,
+        () => throwIfAborted(signal),
       );
+      if (!checkpoint) return false;
       // Payload is intentionally committed before the journal gains authority over it.
       throwIfAborted(signal);
       const identity = {
@@ -196,9 +209,15 @@ export class RunCheckpointWriter {
         nextControllerTurn: state.ledger.current.usage.controllerTurns + 1,
       } as const;
       const checkpointId = `cp_${state.hasher(canonicalStringify(identity as unknown as JsonValue))}`;
-      const appended = await state.journal.append({ type: "checkpoint_committed", checkpointId, ...identity });
-      if (appended.event !== "committed") throw new Error("checkpoint commit event was not newly authoritative");
-      return true;
+      try {
+        const appended = await state.journal.append({ type: "checkpoint_committed", checkpointId, ...identity });
+        return appended.event === "committed" || appended.event === "deduplicated";
+      } catch (error) {
+        // Checkpoint publication is optional. A durable append is authoritative;
+        // a rejected append leaves the prior parity slot and prior checkpoint intact.
+        if (error instanceof JournalAppendError) return error.eventDurable;
+        throw error;
+      }
     } finally {
       release();
     }

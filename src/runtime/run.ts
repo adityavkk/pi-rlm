@@ -23,7 +23,7 @@ import {
   prepareAgentDelegation,
   type AgentDelegationConfig,
 } from "./agent-delegation.ts";
-import type { ControllerDriver } from "./controller.ts";
+import { inspectControllerResumeCapability, type ControllerDriver } from "./controller.ts";
 import {
   buildExtractorModelRequest,
   normalizeExtractorResult,
@@ -59,6 +59,7 @@ import { remainingStoredBytes, reserveStoredBytes } from "./stored-bytes.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 import { MANAGED_RUN_PERSISTENCE, type ManagedRunPersistenceCarrier } from "./run-managed-lifecycle.ts";
 import { RunCheckpointWriter } from "./checkpoint-persistence.ts";
+import { RunCheckpointStore } from "./checkpoint-store.ts";
 
 export { RLM_DSL_VERSION } from "./run-manifest.ts";
 
@@ -431,6 +432,7 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
     ...(input.extractor ? { extractor: input.extractor } : {}),
     ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
   });
+  const controllerResume = inspectControllerResumeCapability(input.controller);
   const clock = input.clock ?? systemClock;
   const profile = input.profile ?? DEFAULT_PROFILE;
   const startMs = clock.now();
@@ -623,7 +625,8 @@ const runProgramOwned = async (input: RunInput): Promise<RunResult> => {
       checkpointWriter = new RunCheckpointWriter({
         state,
         document,
-        checkpointStore: new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation),
+        checkpointStore: new RunCheckpointStore(input.dir, profile.storedByteLimit, contextInstrumentation),
+        ...(controllerResume ? { controllerResume } : {}),
         signal: scope.signal,
       });
     }

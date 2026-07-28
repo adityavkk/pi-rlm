@@ -354,9 +354,9 @@ describe("source-bound run identity and manifest", () => {
     const operations: string[] = [];
     const recording: RunDirectoryFileSystem = {
       ...nodeRunDirectoryFileSystem,
-      async open(path, flags) {
+      async open(path, flags, mode) {
         operations.push(`open:${basename(path)}:${flags}`);
-        const handle = await nodeRunDirectoryFileSystem.open(path, flags);
+        const handle = await nodeRunDirectoryFileSystem.open(path, flags, mode);
         return {
           async writeFile(data, encoding) { operations.push(`write:${basename(path)}`); await handle.writeFile(data, encoding); },
           async sync() { operations.push(`sync:${basename(path)}`); await handle.sync(); },
@@ -389,7 +389,7 @@ const faultFileSystem = (dir: string, point: FaultPoint): RunDirectoryFileSystem
   const fault = (at: string): never => { throw Object.assign(new Error(`injected ${point} at ${at}`), { code: "EIO" }); };
   return {
     ...nodeRunDirectoryFileSystem,
-    async open(path, flags) {
+    async open(path, flags, mode) {
       const name = basename(path);
       const lock = name === RUN_LOCK_FILE;
       const temp = name.endsWith(".tmp");
@@ -402,7 +402,7 @@ const faultFileSystem = (dir: string, point: FaultPoint): RunDirectoryFileSystem
         || (point === "temp-open" && temp)
         || (point === "pre-dir-open" && directoryPhase === "pre")
         || (point === "post-dir-open" && directoryPhase === "post")) fault("open");
-      const handle = await nodeRunDirectoryFileSystem.open(path, flags);
+      const handle = await nodeRunDirectoryFileSystem.open(path, flags, mode);
       return {
         async writeFile(data, encoding) {
           if ((point === "lock-write" || point === "lock-write-close") && lock) fault("write");

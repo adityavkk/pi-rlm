@@ -7,6 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { constants, type Stats } from "node:fs";
 import { open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { interpreterError, type InterpreterError } from "../core/errors.ts";
@@ -23,11 +24,16 @@ const lineHash = (line: string): string => sha256(line).slice(0, 12);
 const BATCH_RECORD_TYPE = "journal_batch";
 const BATCH_RECORD_VERSION = 1;
 const SHA256 = /^[0-9a-f]{64}$/;
+export const MAX_JOURNAL_AUTHORITY_BYTES = 32 * 1024 * 1024;
+const noFollow = constants.O_NOFOLLOW ?? 0;
+const directoryFlag = constants.O_DIRECTORY ?? 0;
 
 export interface JournalFileHandle {
   appendFile(data: string, encoding: BufferEncoding): Promise<void>;
   close(): Promise<void>;
+  read?(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ readonly bytesRead: number }>;
   readFile(): Promise<Buffer>;
+  stat?(): Promise<Stats>;
   sync(): Promise<void>;
   truncate(length: number): Promise<void>;
   writeFile(data: string, encoding: BufferEncoding): Promise<void>;
@@ -36,7 +42,7 @@ export interface JournalFileHandle {
 export interface JournalFileSystem {
   /** Optional lease-owned boundary for one complete journal operation. */
   runTransaction?<T>(effect: () => Promise<T>): Promise<T>;
-  open(path: string, flags: string, mode?: number): Promise<JournalFileHandle>;
+  open(path: string, flags: string | number, mode?: number): Promise<JournalFileHandle>;
   readFile(path: string): Promise<Buffer>;
   rename(oldPath: string, newPath: string): Promise<void>;
 }
@@ -184,6 +190,48 @@ const scanJournal = (raw: Uint8Array): Result<JournalScan, InterpreterError> => 
   return ok({ events, eventPositions, verifiedBytes, batchIds });
 };
 
+export interface JournalAuthorityControl {
+  readonly checkpoint?: () => void;
+}
+
+const stableJournalStat = (before: Stats, after: Stats): boolean =>
+  before.dev === after.dev && before.ino === after.ino && before.size === after.size
+  && before.mode === after.mode && before.nlink === after.nlink
+  && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+
+const readBoundedJournalHandle = async (
+  handle: JournalFileHandle,
+  control: JournalAuthorityControl = {},
+  requirePrivate = false,
+): Promise<Buffer> => {
+  control.checkpoint?.();
+  if (!handle.stat || !handle.read) {
+    const fallback = await handle.readFile();
+    if (fallback.length > MAX_JOURNAL_AUTHORITY_BYTES)
+      throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
+    control.checkpoint?.();
+    return fallback;
+  }
+  const before = await handle.stat();
+  if (!before.isFile() || before.nlink !== 1 || (requirePrivate && (before.mode & 0o077) !== 0)
+    || before.size > MAX_JOURNAL_AUTHORITY_BYTES)
+    throw interpreterError("JOURNAL_CORRUPT", "journal is not one bounded private regular file");
+  control.checkpoint?.();
+  const raw = Buffer.alloc(before.size);
+  let offset = 0;
+  while (offset < raw.length) {
+    control.checkpoint?.();
+    const result = await handle.read(raw, offset, Math.min(64 * 1024, raw.length - offset), offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  const after = await handle.stat();
+  if (offset !== before.size || !stableJournalStat(before, after))
+    throw interpreterError("JOURNAL_CORRUPT", "journal changed during its bounded read");
+  control.checkpoint?.();
+  return raw;
+};
+
 export interface ParsedJournalSnapshot {
   readonly events: readonly RlmEvent[];
   readonly eventPositions: readonly JournalEventPosition[];
@@ -303,9 +351,12 @@ export class JournalStore {
   }
 
   /** Read one verified prefix without repairing its incomplete final record. */
-  inspectTail(): Promise<JournalTailInspection> {
+  inspectTail(control: JournalAuthorityControl = {}): Promise<JournalTailInspection> {
     return this.enqueueControl(async () => {
-      const raw = await this.fileSystem.readFile(this.eventsPath);
+      const handle = await this.fileSystem.open(this.eventsPath, constants.O_RDONLY | noFollow);
+      let raw: Buffer;
+      try { raw = await readBoundedJournalHandle(handle, control, true); }
+      finally { await handle.close(); }
       const scanned = scanJournal(raw);
       if (!scanned.ok) throw scanned.error;
       const prefix = raw.subarray(0, scanned.value.verifiedBytes);
@@ -321,9 +372,12 @@ export class JournalStore {
   }
 
   /** Stable complete prefix used to bind a content checkpoint before its commit event. */
-  authoritySnapshot(): Promise<JournalAuthoritySnapshot> {
+  authoritySnapshot(control: JournalAuthorityControl = {}): Promise<JournalAuthoritySnapshot> {
     return this.enqueueControl(async () => {
-      const raw = await this.fileSystem.readFile(this.eventsPath);
+      const handle = await this.fileSystem.open(this.eventsPath, constants.O_RDONLY | noFollow);
+      let raw: Buffer;
+      try { raw = await readBoundedJournalHandle(handle, control, true); }
+      finally { await handle.close(); }
       const scanned = scanJournal(raw);
       if (!scanned.ok) throw scanned.error;
       if (scanned.value.verifiedBytes !== raw.length)
@@ -339,17 +393,18 @@ export class JournalStore {
   }
 
   /** Truncate only a parser-proven incomplete final record. Callers must own the writer lease. */
-  repairIncompleteTail(): Promise<JournalTailRepairOutcome> {
+  repairIncompleteTail(control: JournalAuthorityControl = {}): Promise<JournalTailRepairOutcome> {
     return this.enqueueControl(async () => {
       let handle: JournalFileHandle | undefined;
       let primary: unknown;
       try {
-        handle = await this.fileSystem.open(this.eventsPath, "r+");
-        const raw = await handle.readFile();
+        handle = await this.fileSystem.open(this.eventsPath, constants.O_RDWR | noFollow);
+        const raw = await readBoundedJournalHandle(handle, control, true);
         const scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
         const removedBytes = raw.length - scanned.value.verifiedBytes;
         if (removedBytes > 0) {
+          control.checkpoint?.();
           await handle.truncate(scanned.value.verifiedBytes);
           await handle.sync();
         }
@@ -395,8 +450,12 @@ export class JournalStore {
       let failure: JournalAppendError | undefined;
 
       try {
-        handle = await this.fileSystem.open(this.eventsPath, "a+", 0o600);
-        let raw = await handle.readFile();
+        handle = await this.fileSystem.open(
+          this.eventsPath,
+          constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | noFollow,
+          0o600,
+        );
+        let raw = await readBoundedJournalHandle(handle);
         let scanned = scanJournal(raw);
         if (!scanned.ok) throw scanned.error;
         if (scanned.value.verifiedBytes !== raw.length) {
@@ -458,6 +517,8 @@ export class JournalStore {
               refreshStatus = false;
             } else {
               const line = recordLine(record);
+              if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_AUTHORITY_BYTES - baseBytes)
+                throw interpreterError("JOURNAL_CORRUPT", "journal append exceeds the authority byte limit");
               try {
                 await handle.appendFile(line, "utf8");
               } catch (cause) {
@@ -517,7 +578,11 @@ export class JournalStore {
     line: string,
     expectedBatchId?: string,
   ): Promise<boolean> {
-    const raw = await this.fileSystem.readFile(this.eventsPath);
+    const raw = handle.stat && handle.read
+      ? await readBoundedJournalHandle(handle)
+      : await this.fileSystem.readFile(this.eventsPath);
+    if (raw.length > MAX_JOURNAL_AUTHORITY_BYTES)
+      throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
     const expected = Buffer.from(line, "utf8");
     const suffix = raw.subarray(baseBytes);
     const exactBytes = suffix.length === expected.length && suffix.equals(expected);
@@ -542,6 +607,8 @@ export class JournalStore {
       let raw: Buffer;
       try {
         raw = await this.fileSystem.readFile(this.eventsPath);
+        if (raw.length > MAX_JOURNAL_AUTHORITY_BYTES)
+          throw interpreterError("JOURNAL_CORRUPT", "journal exceeds its authority byte limit");
       } catch (error) {
         if (isMissing(error)) return ok([]);
         throw error;
@@ -558,7 +625,11 @@ export class JournalStore {
 
   private async writeStatus(status: RunStatus): Promise<void> {
     const tmp = `${this.statusPath}.tmp`;
-    const handle = await this.fileSystem.open(tmp, "w", 0o600);
+    const handle = await this.fileSystem.open(
+      tmp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow,
+      0o600,
+    );
     try {
       await handle.writeFile(JSON.stringify(status, null, 2), "utf8");
       await handle.sync();
@@ -567,7 +638,7 @@ export class JournalStore {
     }
     await this.fileSystem.rename(tmp, this.statusPath);
 
-    const directory = await this.fileSystem.open(this.dir, "r");
+    const directory = await this.fileSystem.open(this.dir, constants.O_RDONLY | directoryFlag | noFollow);
     try {
       await directory.sync();
     } finally {

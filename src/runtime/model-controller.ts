@@ -20,7 +20,14 @@ import {
   CONTROLLER_PROMPT_VERSION,
   CONTROLLER_TURN_VERSION,
 } from "./controller-prompt.ts";
-import type { Cell, ControllerDriver, ControllerModelOperation, FrameState } from "./controller.ts";
+import {
+  CONTROLLER_RESUME_CAPABILITY_VERSION,
+  type Cell,
+  type ControllerDriver,
+  type ControllerModelOperation,
+  type ControllerResumeCapabilityV1,
+  type FrameState,
+} from "./controller.ts";
 
 export interface ModelControllerOptions {
   readonly model?: string;
@@ -43,6 +50,16 @@ const parseCell = (text: string): Cell | undefined => {
 export class ModelController implements ControllerDriver {
   private readonly system = buildBasePrompt();
   readonly identity: RuntimeComponentIdentity;
+  readonly resumeCapability: ControllerResumeCapabilityV1 = {
+    version: CONTROLLER_RESUME_CAPABILITY_VERSION,
+    strategy: "trajectory-derived",
+    capture: (boundary) => ({ nextIteration: boundary.nextIteration }),
+    restore: (state, boundary) => {
+      if (!isJsonObject(state) || Object.keys(state).length !== 1
+        || state["nextIteration"] !== boundary.nextIteration)
+        throw new TypeError("ModelController checkpoint does not match the trajectory boundary");
+    },
+  };
 
   constructor(
     private readonly model: ModelClient,

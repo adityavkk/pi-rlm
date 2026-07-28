@@ -19,7 +19,13 @@ import {
 } from "./agent-delegation.ts";
 import { recoverLatestRunCheckpoint } from "./checkpoint-recovery.ts";
 import { RunCheckpointWriter } from "./checkpoint-persistence.ts";
-import type { ControllerDriver } from "./controller.ts";
+import { RunCheckpointStore } from "./checkpoint-store.ts";
+import {
+  requireControllerResumeCapability,
+  type ControllerDriver,
+  type ControllerResumeCapabilityIdentityV1,
+  type ControllerResumeCapabilityV1,
+} from "./controller.ts";
 import {
   buildExtractorModelRequest,
   normalizeExtractorResult,
@@ -31,6 +37,8 @@ import { runFrame } from "./frame.ts";
 import { MANAGED_RUN_PERSISTENCE, MANAGED_RUN_RESUME } from "./run-managed-lifecycle.ts";
 import {
   assertRunComponentsCompatible,
+  MAX_RUN_LOCK_BYTES,
+  readBoundedRunDirectoryFile,
   readRunManifest,
   RUN_LOCK_FILE,
   RunDirectoryError,
@@ -83,11 +91,14 @@ const validatePermanentClaim = async (
   input: ResumeInput,
   runId: string,
   manifestHash: string,
+  checkpoint: () => void,
 ): Promise<void> => {
   const persistence = input.runLifecycle[MANAGED_RUN_PERSISTENCE]!;
   try {
-    const raw = await persistence.runDirectoryFileSystem().readFile(join(input.dir, RUN_LOCK_FILE));
-    if (raw.length > 4096) throw new TypeError("run lock exceeds its byte limit");
+    const fileSystem = persistence.runDirectoryFileSystem();
+    const raw = await readBoundedRunDirectoryFile(
+      join(input.dir, RUN_LOCK_FILE), MAX_RUN_LOCK_BYTES, fileSystem, checkpoint,
+    );
     const text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
     const parsed = parseJsonValue(JSON.parse(text) as unknown);
     const expected = { runId, manifestHash };
@@ -98,10 +109,10 @@ const validatePermanentClaim = async (
   }
 };
 
-const readCompatibleManifest = async (input: ResumeInput) => {
+const readCompatibleManifest = async (input: ResumeInput, checkpoint: () => void) => {
   const persistence = input.runLifecycle[MANAGED_RUN_PERSISTENCE]!;
   let document;
-  try { document = await readRunManifest(input.dir, persistence.runDirectoryFileSystem()); }
+  try { document = await readRunManifest(input.dir, persistence.runDirectoryFileSystem(), checkpoint); }
   catch (cause) {
     if (cause instanceof RunDirectoryError && cause.code === "MANIFEST_INCOMPATIBLE")
       throw new RunRecoveryError("RECOVERY_INCOMPATIBLE", "stored run manifest is incompatible", cause);
@@ -235,13 +246,20 @@ const executeContinuation = async (
   return { runId, status: "completed", completionMode: "fallback_extract", answer: extracted.value };
 };
 
-const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
+const resumeProgramOwned = async (
+  input: ResumeInput,
+  controllerResume: { readonly identity: ControllerResumeCapabilityIdentityV1; readonly capability: ControllerResumeCapabilityV1 },
+): Promise<RunResult> => {
+  throwIfAborted(input.signal);
   const binding = recoveredBinding(input);
   const clock = input.clock ?? systemClock;
-  const { document, preparedAgentDelegation } = await readCompatibleManifest(input);
+  const { document, preparedAgentDelegation } = await readCompatibleManifest(input, () => throwIfAborted(input.signal));
   if (document.manifest.run.id !== binding.runId)
     throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "managed lifecycle and manifest run identities differ");
-  await validatePermanentClaim(input, document.manifest.run.id, document.manifestHash);
+  const scope = createAbortScope(input.signal, document.manifest.limits.deadlineMs, () => clock.now());
+  try {
+  throwIfAborted(scope.signal);
+  await validatePermanentClaim(input, document.manifest.run.id, document.manifestHash, () => throwIfAborted(scope.signal));
   const normalized = normalizeProgram(document.manifest.program);
   if (!normalized.ok) throw new RunRecoveryError("RECOVERY_MANIFEST_INVALID", "manifest program cannot be normalized");
   const program = normalized.value;
@@ -251,8 +269,10 @@ const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
   const contextInstrumentation = persistence.contextInstrumentation();
   const journal = new JournalStore(input.dir, journalFileSystem);
   const store = new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation);
-  const checkpointStore = new ContextStore(input.dir, contextStoreLimits(profile), contextInstrumentation);
-  const recovered = await recoverLatestRunCheckpoint(document, journal, store, checkpointStore);
+  const checkpointStore = new RunCheckpointStore(input.dir, profile.storedByteLimit, contextInstrumentation);
+  const recovered = await recoverLatestRunCheckpoint(document, journal, store, checkpointStore, {
+    checkpoint: () => throwIfAborted(scope.signal),
+  });
   const payload = recovered.payload;
 
   const ledgerRef = { current: payload.ledger };
@@ -268,7 +288,6 @@ const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
   progress.bindRunId(runId);
   progress.setPhase("journal");
   try { input.onProgressSource?.(progress.source); } catch { /* Progress observers have no run authority. */ }
-  const scope = createAbortScope(input.signal, document.manifest.limits.deadlineMs, () => clock.now());
   const operationAuthority = createRunOperationAuthority();
   const agentDelegationRuntime = bindAgentDelegationRuntime(preparedAgentDelegation, scope.signal);
   let checkpointWriter: RunCheckpointWriter | undefined;
@@ -301,7 +320,9 @@ const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
     checkpoint: { commit: (continuation) => checkpointWriter!.commit(continuation) },
     progress,
   };
-  checkpointWriter = new RunCheckpointWriter({ state, document, checkpointStore, signal: scope.signal });
+  checkpointWriter = new RunCheckpointWriter({
+    state, document, checkpointStore, controllerResume, signal: scope.signal,
+  });
   progress.setRuntimeGetter(() => ({ activeCalls: state.inflight.size }));
   const rootFrame: FrameRef = {
     frameId: payload.root.frame.frameId,
@@ -318,6 +339,16 @@ const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
     entries: payload.root.trajectory,
     ...(payload.root.lastOutcome ? { lastOutcome: payload.root.lastOutcome } : {}),
   };
+  try {
+    controllerResume.capability.restore(payload.controller.state, {
+      frameId: rootFrame.frameId,
+      nextIteration: payload.root.nextIteration,
+      trajectoryLength: payload.root.trajectory.length,
+    });
+  } catch (cause) {
+    scope.dispose();
+    throw new RunRecoveryError("RECOVERY_CONTROLLER_STATE_INVALID", "controller checkpoint state is invalid", cause);
+  }
 
   let phase: Phase = "controller";
   const setPhase = (value: Phase): void => { phase = value; progress.setPhase(value as RunProgressPhase); };
@@ -336,12 +367,78 @@ const resumeProgramOwned = async (input: ResumeInput): Promise<RunResult> => {
   progress.frameClosed();
   progress.finish(finalized.status);
   return finalized;
+  } finally {
+    scope.dispose();
+  }
+};
+
+export interface ResumableManagedRunInspection {
+  readonly runId: string;
+  readonly manifestHash: string;
+  readonly checkpointSequence: number;
+  readonly nextIteration: number;
+  readonly nextControllerTurn: number;
+  readonly incompleteTailBytes: number;
+}
+
+const inspectResumableManagedRunOwned = async (input: ResumeInput): Promise<ResumableManagedRunInspection> => {
+  throwIfAborted(input.signal);
+  requireControllerResumeCapability(input.controller);
+  const binding = recoveredBinding(input);
+  const clock = input.clock ?? systemClock;
+  const { document } = await readCompatibleManifest(input, () => throwIfAborted(input.signal));
+  if (document.manifest.run.id !== binding.runId)
+    throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "managed lifecycle and manifest run identities differ");
+  const scope = createAbortScope(input.signal, document.manifest.limits.deadlineMs, () => clock.now());
+  try {
+    throwIfAborted(scope.signal);
+    await validatePermanentClaim(input, document.manifest.run.id, document.manifestHash, () => throwIfAborted(scope.signal));
+    const profile = document.manifest.profile as unknown as Profile;
+    const persistence = input.runLifecycle[MANAGED_RUN_PERSISTENCE]!;
+    const instrumentation = persistence.contextInstrumentation();
+    const recovered = await recoverLatestRunCheckpoint(
+      document,
+      new JournalStore(input.dir, persistence.journalFileSystem()),
+      new ContextStore(input.dir, contextStoreLimits(profile), instrumentation),
+      new RunCheckpointStore(input.dir, profile.storedByteLimit, instrumentation),
+      { repair: false, checkpoint: () => throwIfAborted(scope.signal) },
+    );
+    return {
+      runId: document.manifest.run.id,
+      manifestHash: document.manifestHash,
+      checkpointSequence: recovered.event.checkpointSequence,
+      nextIteration: recovered.event.nextIteration,
+      nextControllerTurn: recovered.event.nextControllerTurn,
+      incompleteTailBytes: recovered.incompleteTailBytes,
+    };
+  } finally { scope.dispose(); }
+};
+
+/** Read-only resumability preflight. It never repairs, restores a controller, or invokes a provider/backend. */
+export const inspectResumableManagedRun = (input: ResumeInput): Promise<ResumableManagedRunInspection> => {
+  try { requireControllerResumeCapability(input.controller); }
+  catch (cause) {
+    return Promise.reject(new RunRecoveryError(
+      "RECOVERY_CONTROLLER_UNSUPPORTED", "controller does not support managed checkpoint resume", cause,
+    ));
+  }
+  const persistence = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE];
+  if (!persistence)
+    return Promise.reject(new RunRecoveryError("RECOVERY_DIRECTORY_INVALID", "custom run directories are not resumable"));
+  return persistence.runTransaction(() => inspectResumableManagedRunOwned(input));
 };
 
 /** Continue one lease-owned managed run from its exact checkpoint boundary. */
 export const resumeProgram = (input: ResumeInput): Promise<RunResult> => {
+  let controllerResume;
+  try { controllerResume = requireControllerResumeCapability(input.controller); }
+  catch (cause) {
+    return Promise.reject(new RunRecoveryError(
+      "RECOVERY_CONTROLLER_UNSUPPORTED", "controller does not support managed checkpoint resume", cause,
+    ));
+  }
   const persistence = input.runLifecycle?.[MANAGED_RUN_PERSISTENCE];
   if (!persistence)
     return Promise.reject(new RunRecoveryError("RECOVERY_DIRECTORY_INVALID", "custom run directories are not resumable"));
-  return persistence.runTransaction(() => resumeProgramOwned(input));
+  return persistence.runTransaction(() => resumeProgramOwned(input, controllerResume));
 };

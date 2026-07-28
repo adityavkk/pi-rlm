@@ -6,15 +6,16 @@ import { canonicalStringify, isJsonObject, parseJsonValue, type JsonValue } from
 import type { CallUsage } from "../core/usage.ts";
 import type { ContextDescriptor, ContextStore } from "../shell/context-store.ts";
 import { sha256, sha256Bytes } from "../shell/hash.ts";
-import type { JournalStore } from "../shell/journal-store.ts";
+import type { JournalStore, JournalTailInspection } from "../shell/journal-store.ts";
 import { parseRunCheckpointPayload, RunCheckpointValidationError } from "./checkpoint-schema.ts";
 import {
-  MAX_RUN_CHECKPOINT_BYTES,
   RUN_CHECKPOINT_SCHEMA_VERSION,
   RUN_CHECKPOINT_VERSION,
   type CheckpointFrameV1,
+  runCheckpointPayloadByteLimit,
   type RunCheckpointPayloadV1,
 } from "./checkpoint-types.ts";
+import { RunCheckpointStore } from "./checkpoint-store.ts";
 import { validateRecoveryJournal } from "./run-recovery-journal.ts";
 import { RunRecoveryError } from "./run-recovery-types.ts";
 import type { RunManifestDocument } from "./run-manifest.ts";
@@ -372,60 +373,91 @@ export interface RecoveredRunCheckpoint {
   readonly event: Extract<RlmEvent, { type: "checkpoint_committed" }>;
   readonly events: readonly RlmEvent[];
   readonly repairedTailBytes: number;
+  readonly incompleteTailBytes: number;
 }
 
-/** Repair only a proven torn final record, then select and validate the exact journal-tail checkpoint. */
+export interface RunCheckpointRecoveryOptions {
+  readonly repair?: boolean;
+  readonly checkpoint?: () => void;
+}
+
+const checkpointEventIdentity = (event: Extract<RlmEvent, { type: "checkpoint_committed" }>) => ({
+  schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
+  checkpointVersion: RUN_CHECKPOINT_VERSION,
+  runId: event.runId,
+  frameId: event.frameId,
+  manifestHash: event.manifestHash,
+  checkpointSequence: event.checkpointSequence,
+  checkpointRef: event.checkpointRef,
+  checkpointSha256: event.checkpointSha256,
+  checkpointBytes: event.checkpointBytes,
+  journalPrefixSha256: event.journalPrefixSha256,
+  journalPrefixBytes: event.journalPrefixBytes,
+  journalPrefixEventCount: event.journalPrefixEventCount,
+  nextIteration: event.nextIteration,
+  nextControllerTurn: event.nextControllerTurn,
+} as const);
+
+const validateEveryCheckpointEvent = (
+  document: RunManifestDocument,
+  snapshot: JournalTailInspection,
+): void => {
+  const byteLimit = runCheckpointPayloadByteLimit(document.manifest.limits.storedByteLimit);
+  for (let index = 0; index < snapshot.events.length; index++) {
+    const event = snapshot.events[index]!;
+    if (event.type !== "checkpoint_committed") continue;
+    const position = snapshot.eventPositions[index];
+    if (!position || position.eventIndex !== index
+      || event.journalPrefixBytes !== position.prefixBytes || event.journalPrefixEventCount !== index
+      || event.journalPrefixSha256 !== sha256Bytes(snapshot.verifiedPrefix.subarray(0, position.prefixBytes)))
+      invalid("checkpoint event does not bind its exact journal prefix");
+    if (event.checkpointBytes < 1 || event.checkpointBytes > byteLimit)
+      invalid("checkpoint payload exceeds its profile-scaled byte limit");
+    if (event.checkpointId !== `cp_${sha256(canonicalStringify(checkpointEventIdentity(event) as unknown as JsonValue))}`)
+      invalid("checkpoint event identity hash is invalid");
+    const anchor = snapshot.events[index - 1];
+    if (!anchor || anchor.type !== "cell_committed" || anchor.frameId !== event.frameId
+      || anchor.iteration + 1 !== event.nextIteration)
+      invalid("checkpoint is not immediately anchored to its committed root cell");
+  }
+};
+
+/** Validate one exact journal-tail checkpoint, optionally repairing only a proven torn final record. */
 export const recoverLatestRunCheckpoint = async (
   document: RunManifestDocument,
   journal: JournalStore,
   runtimeStore: ContextStore,
-  checkpointStore: ContextStore,
+  checkpointStore: RunCheckpointStore,
+  options: RunCheckpointRecoveryOptions = {},
 ): Promise<RecoveredRunCheckpoint> => {
+  const checkpoint = options.checkpoint ?? (() => {});
+  checkpoint();
   let snapshot;
-  try { snapshot = await journal.inspectTail(); }
+  try { snapshot = await journal.inspectTail({ checkpoint }); }
   catch (cause) { throw new RunRecoveryError("RECOVERY_JOURNAL_CORRUPT", "run journal is corrupt", cause); }
+  checkpoint();
   const model = validateRecoveryJournal(document, snapshot.events);
   if (model.terminal) throw new RunRecoveryError("RECOVERY_TERMINAL", "terminal runs are immutable and cannot be resumed");
   const selectedIndex = snapshot.events.findLastIndex((event) => event.type === "checkpoint_committed");
   if (selectedIndex < 0) throw new RunRecoveryError("RECOVERY_CHECKPOINT_MISSING", "run has no authoritative checkpoint");
   if (selectedIndex !== snapshot.events.length - 1)
     throw new RunRecoveryError("RECOVERY_UNSAFE_TAIL", "journal has authoritative events after its latest checkpoint");
+  validateEveryCheckpointEvent(document, snapshot);
   const event = snapshot.events[selectedIndex] as Extract<RlmEvent, { type: "checkpoint_committed" }>;
   const position = snapshot.eventPositions[selectedIndex];
-  if (!position || position.eventIndex !== selectedIndex || position.endBytes !== snapshot.verifiedBytes
-    || event.journalPrefixBytes !== position.prefixBytes || event.journalPrefixEventCount !== selectedIndex
-    || event.journalPrefixSha256 !== sha256Bytes(snapshot.verifiedPrefix.subarray(0, position.prefixBytes)))
-    invalid("checkpoint event does not bind its exact journal prefix");
-  if (event.checkpointBytes > MAX_RUN_CHECKPOINT_BYTES)
-    invalid("checkpoint payload exceeds the checkpoint byte limit");
+  if (!position || position.endBytes !== snapshot.verifiedBytes)
+    invalid("latest checkpoint is not the complete verified journal tail");
 
   let checkpointBytes: Uint8Array;
   try {
-    checkpointBytes = await checkpointStore.loadFromDisk({
+    checkpointBytes = await checkpointStore.read({
+      checkpointSequence: event.checkpointSequence,
       id: event.checkpointRef,
       sha256: event.checkpointSha256,
       bytes: event.checkpointBytes,
-    });
+    }, checkpoint);
   } catch (cause) { return invalid("checkpoint payload is missing or failed integrity validation", cause); }
   const payload = parseCanonicalPayload(checkpointBytes, document);
-  const eventIdentity = {
-    schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
-    checkpointVersion: RUN_CHECKPOINT_VERSION,
-    runId: event.runId,
-    frameId: event.frameId,
-    manifestHash: event.manifestHash,
-    checkpointSequence: event.checkpointSequence,
-    checkpointRef: event.checkpointRef,
-    checkpointSha256: event.checkpointSha256,
-    checkpointBytes: event.checkpointBytes,
-    journalPrefixSha256: event.journalPrefixSha256,
-    journalPrefixBytes: event.journalPrefixBytes,
-    journalPrefixEventCount: event.journalPrefixEventCount,
-    nextIteration: event.nextIteration,
-    nextControllerTurn: event.nextControllerTurn,
-  } as const;
-  if (event.checkpointId !== `cp_${sha256(canonicalStringify(eventIdentity as unknown as JsonValue))}`)
-    invalid("checkpoint event identity hash is invalid");
   if (payload.identity.checkpointSequence !== event.checkpointSequence
     || payload.run.rootFrameId !== event.frameId || payload.root.frame.frameId !== event.frameId
     || payload.root.nextIteration !== event.nextIteration || payload.run.nextControllerTurn !== event.nextControllerTurn
@@ -434,18 +466,27 @@ export const recoverLatestRunCheckpoint = async (
       bytes: event.journalPrefixBytes,
       eventCount: event.journalPrefixEventCount,
     })) invalid("checkpoint payload identity does not match its commit event");
-  const beforeCheckpoint = snapshot.events[selectedIndex - 1];
-  if (!beforeCheckpoint || beforeCheckpoint.type !== "cell_committed" || beforeCheckpoint.frameId !== event.frameId
-    || beforeCheckpoint.iteration + 1 !== event.nextIteration)
-    invalid("checkpoint is not immediately anchored to its committed root cell");
-
   await validateExactState(payload, document, snapshot.events, runtimeStore);
+  checkpoint();
+  if (options.repair === false) return {
+    payload,
+    event,
+    events: snapshot.events,
+    repairedTailBytes: 0,
+    incompleteTailBytes: snapshot.incompleteTailBytes,
+  };
 
   let repaired;
-  try { repaired = await journal.repairIncompleteTail(); }
+  try { repaired = await journal.repairIncompleteTail({ checkpoint }); }
   catch (cause) { throw new RunRecoveryError("RECOVERY_UNSTABLE", "validated journal tail could not be repaired", cause); }
   if (repaired.verifiedBytes !== snapshot.verifiedBytes || repaired.prefixSha256 !== snapshot.prefixSha256
     || repaired.events.length !== snapshot.events.length || repaired.removedBytes !== snapshot.incompleteTailBytes)
     throw new RunRecoveryError("RECOVERY_UNSTABLE", "run journal changed during checkpoint recovery");
-  return { payload, event, events: repaired.events, repairedTailBytes: repaired.removedBytes };
+  return {
+    payload,
+    event,
+    events: repaired.events,
+    repairedTailBytes: repaired.removedBytes,
+    incompleteTailBytes: snapshot.incompleteTailBytes,
+  };
 };

@@ -18,7 +18,9 @@ export type RunRecoveryErrorCode =
   | "RECOVERY_CHECKPOINT_INVALID"
   | "RECOVERY_UNSAFE_TAIL"
   | "RECOVERY_UNSUPPORTED_STATE"
-  | "RECOVERY_COMPONENT_MISMATCH";
+  | "RECOVERY_COMPONENT_MISMATCH"
+  | "RECOVERY_CONTROLLER_UNSUPPORTED"
+  | "RECOVERY_CONTROLLER_STATE_INVALID";
 
 export class RunRecoveryError extends Error {
   override readonly name = "RunRecoveryError";

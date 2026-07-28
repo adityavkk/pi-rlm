@@ -7,6 +7,7 @@ import type { TrajectoryEntry } from "../core/trajectory.ts";
 import type { CallUsage } from "../core/usage.ts";
 import type { ContextDescriptor } from "../shell/context-store.ts";
 import type { GuestCallResult } from "./call-result.ts";
+import type { ControllerResumeCapabilityIdentityV1 } from "./controller.ts";
 import type { ArtifactDescriptor, FrameRef } from "./state.ts";
 
 export const RUN_CHECKPOINT_SCHEMA_VERSION = 1 as const;
@@ -14,6 +15,18 @@ export const RUN_CHECKPOINT_VERSION = "pi-rlm.checkpoint.v1" as const;
 export const MAX_RUN_CHECKPOINT_BYTES = 256 * 1024 * 1024;
 export const MAX_RUN_CHECKPOINT_ITEMS = 100_000;
 export const MAX_RUN_CHECKPOINT_STRING_BYTES = 1024 * 1024;
+export const RUN_CHECKPOINT_METADATA_ALLOWANCE_BYTES = 1024 * 1024;
+export const RUN_CHECKPOINT_RETAINED_SLOTS = 2;
+export const RUN_CHECKPOINT_MAX_PHYSICAL_ENTRIES = 3;
+
+/** Per-payload and aggregate physical bounds scale with the run's retained-data budget. */
+export const runCheckpointPayloadByteLimit = (storedByteLimit: number): number =>
+  Math.min(MAX_RUN_CHECKPOINT_BYTES, storedByteLimit > MAX_RUN_CHECKPOINT_BYTES - RUN_CHECKPOINT_METADATA_ALLOWANCE_BYTES
+    ? MAX_RUN_CHECKPOINT_BYTES
+    : storedByteLimit + RUN_CHECKPOINT_METADATA_ALLOWANCE_BYTES);
+
+export const runCheckpointAggregateByteLimit = (storedByteLimit: number): number =>
+  runCheckpointPayloadByteLimit(storedByteLimit) * RUN_CHECKPOINT_MAX_PHYSICAL_ENTRIES;
 
 export interface CheckpointJournalPrefixV1 {
   readonly sha256: string;
@@ -87,6 +100,10 @@ export interface RunCheckpointPayloadV1 {
     readonly nextControllerTurn: number;
   };
   readonly journalPrefix: CheckpointJournalPrefixV1;
+  readonly controller: {
+    readonly capability: ControllerResumeCapabilityIdentityV1;
+    readonly state: JsonValue;
+  };
   readonly frames: readonly CheckpointFrameV1[];
   readonly root: {
     readonly frame: CheckpointRootFrameV1;
