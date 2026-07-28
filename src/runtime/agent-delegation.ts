@@ -10,12 +10,15 @@ import type {
 } from "../shell/delegation/index.ts";
 import { waitForAbort } from "./abort.ts";
 
-export const AGENT_DELEGATION_POLICY_VERSION = "pi-rlm.agent-policy.v1";
+export const AGENT_DELEGATION_POLICY_VERSION = "pi-rlm.agent-policy.v2";
 const MAX_AGENT_NAMES = 256;
 const MAX_AGENT_NAME_BYTES = 128;
 const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_CWD_BYTES = 8 * 1024;
 const MAX_POLICY_ID_BYTES = 1024;
+const MAX_APPROVAL_ID_BYTES = 1024;
+const MAX_APPROVAL_PREVIEW_BYTES = 4 * 1024;
+const APPROVAL_HASH = /^[a-f0-9]{64}$/;
 
 export interface AgentDelegator {
   readonly identity: RuntimeComponentIdentity;
@@ -58,10 +61,16 @@ export interface PreparedAgentDelegation {
   readonly identity: RuntimeComponentIdentity;
 }
 
+interface PendingAgentApproval {
+  promise: Promise<boolean>;
+  readonly controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
 export interface AgentDelegationRuntime extends PreparedAgentDelegation {
   readonly allowedAgentSet: ReadonlySet<string>;
-  readonly approvedAgents: Set<string>;
-  readonly pendingApprovals: Map<string, Promise<boolean>>;
+  readonly pendingApprovals: Map<string, PendingAgentApproval>;
   readonly runSignal: AbortSignal;
 }
 
@@ -184,10 +193,55 @@ export const bindAgentDelegationRuntime = (
 ): AgentDelegationRuntime | undefined => prepared ? {
   ...prepared,
   allowedAgentSet: new Set(prepared.allowedAgents),
-  approvedAgents: new Set(),
   pendingApprovals: new Map(),
   runSignal,
 } : undefined;
+
+const approvalRequestSnapshot = (request: AgentApprovalRequest): Readonly<AgentApprovalRequest> => {
+  if (!request || typeof request !== "object" || isProxy(request))
+    throw new TypeError("agent approval request must be an object");
+  const runId = boundedNormalizedString(ownData(request, "runId"), "agent approval run id", MAX_APPROVAL_ID_BYTES);
+  const frameId = boundedNormalizedString(ownData(request, "frameId"), "agent approval frame id", MAX_APPROVAL_ID_BYTES);
+  const callId = boundedNormalizedString(ownData(request, "callId"), "agent approval call id", MAX_APPROVAL_ID_BYTES);
+  const agent = boundedNormalizedString(ownData(request, "agent"), "agent approval agent", MAX_AGENT_NAME_BYTES);
+  if (!isAgentName(agent)) throw new TypeError("agent approval agent must be an agent identifier");
+  const taskSha256 = boundedNormalizedString(ownData(request, "taskSha256"), "agent approval task hash", 64);
+  if (!APPROVAL_HASH.test(taskSha256)) throw new TypeError("agent approval task hash must be SHA-256");
+  const taskPreview = ownData(request, "taskPreview");
+  if (typeof taskPreview !== "string" || Buffer.byteLength(taskPreview, "utf8") > MAX_APPROVAL_PREVIEW_BYTES)
+    throw new TypeError("agent approval task preview must be a bounded string");
+  const context = ownData(request, "context");
+  if (context !== "fresh" && context !== "fork") throw new TypeError("agent approval context must be fresh or fork");
+  const modelValue = ownOptionalData(request, "model");
+  const thinkingValue = ownOptionalData(request, "thinking");
+  const model = modelValue === undefined
+    ? undefined
+    : boundedNormalizedString(modelValue, "agent approval model", MAX_APPROVAL_ID_BYTES);
+  const thinking = thinkingValue === undefined
+    ? undefined
+    : boundedNormalizedString(thinkingValue, "agent approval thinking", MAX_APPROVAL_ID_BYTES);
+  return Object.freeze({
+    runId, frameId, callId, agent, taskSha256, taskPreview, context,
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+  });
+};
+
+const approvalKey = (request: Readonly<AgentApprovalRequest>): string => sha256(JSON.stringify([
+  "pi-rlm.agent-approval-request.v1",
+  request.runId,
+  request.frameId,
+  request.callId,
+  request.agent,
+  request.taskSha256,
+  request.context,
+  request.model ?? null,
+  request.thinking ?? null,
+]));
+
+/** Getter-free exact identity. The preview is display-only; taskSha256 binds its authoritative task. */
+export const agentApprovalRequestSha256 = (request: AgentApprovalRequest): string =>
+  approvalKey(approvalRequestSnapshot(request));
 
 export type AgentApprovalDecision = "allowlisted" | "approved" | "denied";
 
@@ -196,20 +250,45 @@ export const authorizeAgent = async (
   request: AgentApprovalRequest,
   callerSignal: AbortSignal,
 ): Promise<AgentApprovalDecision> => {
-  if (runtime.allowedAgentSet.has(request.agent)) return "allowlisted";
-  if (runtime.approvedAgents.has(request.agent)) return "approved";
-  if (!runtime.approval) return "denied";
-  let pending = runtime.pendingApprovals.get(request.agent);
-  if (!pending) {
-    pending = Promise.resolve(runtime.approval.approve(request, runtime.runSignal))
-      .then((approved) => approved === true, () => false);
-    runtime.pendingApprovals.set(request.agent, pending);
-    void pending.finally(() => {
-      if (runtime.pendingApprovals.get(request.agent) === pending) runtime.pendingApprovals.delete(request.agent);
-    });
+  let snapshot: Readonly<AgentApprovalRequest>;
+  let key: string;
+  try {
+    snapshot = approvalRequestSnapshot(request);
+    key = approvalKey(snapshot);
+  } catch {
+    return "denied";
   }
-  const approved = await waitForAbort(pending, callerSignal);
-  if (!approved) return "denied";
-  runtime.approvedAgents.add(request.agent);
-  return "approved";
+  if (runtime.allowedAgentSet.has(snapshot.agent)) return "allowlisted";
+  const approval = runtime.approval;
+  if (!approval) return "denied";
+  let pending = runtime.pendingApprovals.get(key);
+  if (!pending) {
+    const controller = new AbortController();
+    const created: PendingAgentApproval = {
+      controller,
+      waiters: 0,
+      settled: false,
+      promise: Promise.resolve(false),
+    };
+    created.promise = Promise.resolve()
+      .then(() => approval.approve(snapshot, AbortSignal.any([runtime.runSignal, controller.signal])))
+      .then((approved) => approved === true, () => false)
+      .finally(() => { created.settled = true; });
+    pending = created;
+    runtime.pendingApprovals.set(key, pending);
+  }
+  pending.waiters += 1;
+  try {
+    const approved = await waitForAbort(
+      pending.promise,
+      AbortSignal.any([runtime.runSignal, callerSignal]),
+    );
+    return approved && !runtime.runSignal.aborted && !callerSignal.aborted ? "approved" : "denied";
+  } finally {
+    pending.waiters -= 1;
+    if (pending.waiters === 0) {
+      if (!pending.settled) pending.controller.abort(new Error("agent approval has no live waiters"));
+      if (runtime.pendingApprovals.get(key) === pending) runtime.pendingApprovals.delete(key);
+    }
+  }
 };

@@ -12,6 +12,13 @@ import {
   type SubagentDelegationV2TerminalResponse,
 } from "pi-subagents/delegation";
 import type { RlmEvent } from "../core/journal.ts";
+import type { AgentApprovalRequest } from "../runtime/agent-delegation.ts";
+import {
+  AGENT_APPROVAL_DIALOG_MAX_BYTES,
+  AGENT_APPROVAL_TIMEOUT_MS,
+  agentApprovalConfirmationMessage,
+  createExtensionAgentDelegation,
+} from "./agent-delegation.ts";
 import {
   createOfflineProviderRuntimeFixture,
   OFFLINE_COMMAND,
@@ -116,18 +123,23 @@ describe("public Pi agent delegation E2E", () => {
       });
       const observed: AgentSessionEvent[] = [];
       unsubscribe = fixture.runtime.session.subscribe((event) => observed.push(event));
+      let confirmationOptions: { signal?: AbortSignal; timeout?: number } | undefined;
       const approvingUi = {
         ...ui,
-        confirm: async (title: string) => {
+        confirm: async (title: string, _message: string, options?: { signal?: AbortSignal; timeout?: number }) => {
           if (title.includes("delegated Pi agent")) approvalPrompts += 1;
+          confirmationOptions = options;
           return true;
         },
       } as unknown as ExtensionUIContext;
-      await fixture.runtime.session.bindExtensions({ mode: "print", uiContext: approvingUi });
+      await fixture.runtime.session.bindExtensions({ mode: "tui", uiContext: approvingUi });
       await withTimeout(fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }), "delegation prompt");
 
       expect(fixture.state.fetchCalls).toBe(0);
       expect(approvalPrompts).toBe(1);
+      expect(confirmationOptions?.signal).toBeInstanceOf(AbortSignal);
+      expect(confirmationOptions?.timeout).toBe(AGENT_APPROVAL_TIMEOUT_MS);
+      expect(confirmationOptions?.timeout).toBeLessThanOrEqual(120_000);
       expect(requests).toHaveLength(1);
       expect(requests[0]).toMatchObject({
         version: 2,
@@ -151,7 +163,7 @@ describe("public Pi agent delegation E2E", () => {
       ]);
       expect(journal.filter((event) => event.type === "agent_approval")).toEqual([
         expect.objectContaining({
-          type: "agent_approval", agent: "reviewer", decision: "approved", policyId: "pi-ui.agent-confirm.v1",
+          type: "agent_approval", agent: "reviewer", decision: "approved", policyId: "pi-ui.agent-confirm.v2.timeout-60000",
         }),
       ]);
       expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
@@ -181,5 +193,155 @@ describe("public Pi agent delegation E2E", () => {
       await fixture?.dispose();
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test.each(["rpc", "print", "json"] as const)("%s denies opaque agents without dialog or delegation", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), `pi-rlm-${mode}-opaque-`));
+    let fixture: OfflineProviderRuntimeFixture | undefined;
+    let requests = 0;
+    let prompts = 0;
+    try {
+      fixture = await createOfflineProviderRuntimeFixture(root, "success", {
+        controllerCode: `
+          const delegated = await agent({ key: 'opaque', agent: 'reviewer', task: 'exact task' });
+          answer({ answer: delegated.ok ? delegated.value : delegated.error.code });`,
+        profileOverrides: { maxLogicalCalls: 2, maxAttempts: 2 },
+        extensionSetup(pi) {
+          pi.events.on(SUBAGENT_DELEGATION_REQUEST_EVENT, () => { requests += 1; });
+        },
+      });
+      const rejectingUi = {
+        ...ui,
+        confirm: async () => { prompts += 1; return true; },
+      } as unknown as ExtensionUIContext;
+      await fixture.runtime.session.bindExtensions({ mode, uiContext: rejectingUi });
+      await withTimeout(fixture.runtime.session.prompt(OFFLINE_COMMAND, { source: "interactive" }), `${mode} denial`);
+      expect(prompts).toBe(0);
+      expect(requests).toBe(0);
+      const journal = await fixture.readEvents();
+      expect(journal.filter((event) => event.type === "agent_approval")).toEqual([
+        expect.objectContaining({ agent: "reviewer", decision: "denied", policyId: "allowlist-only" }),
+      ]);
+      expect(journal.filter((event) => event.type === "provider_attempted" && event.kind === "agent")).toHaveLength(0);
+    } finally {
+      await fixture?.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+const exactApprovalRequest: AgentApprovalRequest = {
+  runId: "run_test",
+  frameId: "frame_test",
+  callId: "call_agent_test",
+  agent: "reviewer",
+  taskSha256: "a".repeat(64),
+  taskPreview: "review exact task",
+  context: "fresh",
+  model: "safe/model",
+  thinking: "high",
+};
+
+const approvalPolicyFixture = (
+  confirm: (title: string, message: string, options?: { signal?: AbortSignal; timeout?: number }) => Promise<boolean>,
+  approvalTimeoutMs?: number,
+) => {
+  let current = true;
+  let begins = 0;
+  let settlements = 0;
+  const ctx = {
+    mode: "tui",
+    cwd: "/tmp/project",
+    ui: { confirm },
+    sessionManager: { getSessionId: () => "session" },
+  };
+  const config = createExtensionAgentDelegation({ events: {} } as never)(
+    ctx as never,
+    "session",
+    1,
+    (_sessionId, _generation, signal) => current && !signal.aborted,
+    {
+      begin: () => {
+        begins += 1;
+        let settled = false;
+        return {
+          settle: () => {
+            if (settled) return;
+            settled = true;
+            settlements += 1;
+          },
+        };
+      },
+    },
+    approvalTimeoutMs === undefined ? undefined : { approvalTimeoutMs },
+  );
+  return {
+    approve: config.approval!.approve,
+    stale: () => { current = false; },
+    counts: () => ({ begins, settlements }),
+  };
+};
+
+describe("opaque-agent confirmation policy", () => {
+  test.each([
+    ["denial", async (): Promise<boolean> => false],
+    ["exception", async (): Promise<boolean> => { throw new Error("host UI failed"); }],
+  ] as const)("%s settles once and denies", async (_label, confirm) => {
+    const fixture = approvalPolicyFixture(confirm as never);
+    await expect(fixture.approve(exactApprovalRequest, new AbortController().signal)).resolves.toBe(false);
+    expect(fixture.counts()).toEqual({ begins: 1, settlements: 1 });
+  });
+
+  test("passes a bounded timeout that dismisses and settles the dialog", async () => {
+    let captured: { signal?: AbortSignal; timeout?: number } | undefined;
+    const fixture = approvalPolicyFixture(async (_title, _message, options) => {
+      captured = options;
+      return new Promise<boolean>((resolve) => setTimeout(() => resolve(false), options?.timeout));
+    }, 1);
+    const owner = new AbortController();
+    await expect(fixture.approve(exactApprovalRequest, owner.signal)).resolves.toBe(false);
+    expect(captured).toEqual({ signal: owner.signal, timeout: 1 });
+    expect(fixture.counts()).toEqual({ begins: 1, settlements: 1 });
+  });
+
+  test("passes public signal and timeout options and rechecks stale sessions", async () => {
+    let options: { signal?: AbortSignal; timeout?: number } | undefined;
+    const fixture = approvalPolicyFixture(async (_title, _message, captured) => {
+      options = captured;
+      fixture.stale();
+      return true;
+    });
+    const owner = new AbortController();
+    await expect(fixture.approve(exactApprovalRequest, owner.signal)).resolves.toBe(false);
+    expect(options).toEqual({ signal: owner.signal, timeout: AGENT_APPROVAL_TIMEOUT_MS });
+    expect(fixture.counts()).toEqual({ begins: 1, settlements: 1 });
+  });
+
+  test("abort settles promptly and suppresses a late true", async () => {
+    let release!: (value: boolean) => void;
+    const late = new Promise<boolean>((resolve) => { release = resolve; });
+    const fixture = approvalPolicyFixture(async () => late);
+    const owner = new AbortController();
+    const pending = fixture.approve(exactApprovalRequest, owner.signal);
+    await Promise.resolve();
+    owner.abort();
+    await expect(pending).resolves.toBe(false);
+    expect(fixture.counts()).toEqual({ begins: 1, settlements: 1 });
+    release(true);
+    await Promise.resolve();
+    expect(fixture.counts()).toEqual({ begins: 1, settlements: 1 });
+  });
+
+  test("dialog sanitizes hostile fields and remains byte bounded", () => {
+    const message = agentApprovalConfirmationMessage({
+      ...exactApprovalRequest,
+      taskPreview: `safe\nInjected:\u001b]0;hostile\u0007\u202eevil${"😀".repeat(2_000)}`,
+      model: "model\nHostile",
+    }, "b".repeat(64));
+    expect(Buffer.byteLength(message, "utf8")).toBeLessThanOrEqual(AGENT_APPROVAL_DIALOG_MAX_BYTES);
+    expect(message).not.toMatch(/[\u001b\u0007\u202e]/u);
+    expect(message).not.toContain("model\nHostile");
+    expect(message).not.toContain("safe\nInjected");
+    expect(message.split("\n")).toHaveLength(9);
   });
 });

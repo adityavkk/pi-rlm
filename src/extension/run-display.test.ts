@@ -144,6 +144,28 @@ describe("responsive run rendering", () => {
     expect(renderRunDisplay(many, 50)).toEqual(["RLM: 32 active, 1 cancelling · /rlm runs"]);
   });
 
+  test("approval rows outrank run rows and expose only safe agent and count", () => {
+    const pendingApproval = {
+      requestSha256: "a".repeat(64),
+      taskSha256: "b".repeat(64),
+      agent: "reviewer",
+      context: "fresh" as const,
+      model: "safe/model",
+      count: 2,
+    };
+    const approvalRun = coordinated(items[0]!, { pendingApproval });
+    const projection = projectRunDisplayItems([
+      ...items.slice(1).map((item) => coordinated(item)),
+      approvalRun,
+    ]);
+    expect(projection[0]?.pendingApproval).toEqual(pendingApproval);
+    expect(renderRunDisplay(projection, 120)[0]).toContain("RLM approval");
+    expect(renderRunDisplay(projection, 120)[0]).toContain("agent reviewer");
+    expect(renderRunDisplay(projection, 120)[0]).toContain("2 pending");
+    expect(renderRunDisplay(projection, 50)).toEqual(["RLM approval: reviewer · 2 pending"]);
+    expect(JSON.stringify(projection[0]?.pendingApproval)).not.toMatch(/session|control|objective|taskPreview/u);
+  });
+
   test("projection and output omit hidden coordinator and guest fields", () => {
     const runs = items.map((item) => coordinated(item));
     const projection = projectRunDisplayItems(runs);

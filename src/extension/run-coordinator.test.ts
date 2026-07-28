@@ -6,6 +6,7 @@ import {
   createRunCoordinator,
   objectivePreview,
   RUN_COORDINATOR_MAX_ACTIVE,
+  RUN_COORDINATOR_MAX_PENDING_APPROVALS,
   RUN_COORDINATOR_MAX_RECENT,
   RUN_COORDINATOR_MAX_SUBSCRIBERS,
 } from "./run-coordinator.ts";
@@ -93,11 +94,20 @@ describe("run coordinator", () => {
       sessionId: "session", authorizationGeneration: 1, objective: "tool", ownerSignal: toolOwner.signal,
     });
     const command = coordinator.create({ sessionId: "session", authorizationGeneration: 1, objective: "command" });
+    tool.beginAgentApproval({
+      requestSha256: "a".repeat(64), taskSha256: "b".repeat(64), agent: "reviewer", context: "fresh",
+    });
+    command.beginAgentApproval({
+      requestSha256: "c".repeat(64), taskSha256: "d".repeat(64), agent: "worker", context: "fork",
+    });
     toolOwner.abort();
     expect(tool.signal.aborted).toBe(true);
     expect(command.signal.aborted).toBe(false);
+    expect(coordinator.resolve(tool.control.localId)?.pendingApproval).toBeUndefined();
+    expect(coordinator.resolve(command.control.localId)?.pendingApproval?.agent).toBe("worker");
     coordinator.invalidateSession();
     expect(command.signal.aborted).toBe(true);
+    expect(coordinator.resolve(command.control.localId)?.pendingApproval).toBeUndefined();
     expect(coordinator.resolve(tool.control.localId)?.state).toBe("cancelling");
     expect(coordinator.resolve(command.control.localId)?.state).toBe("cancelling");
   });
@@ -201,6 +211,66 @@ describe("run coordinator", () => {
     expect(reads).toBe(terminalReads);
     expect(handle.finish(terminal(runId("d")))).toMatchObject({ ok: false, code: "RUN_TERMINAL" });
     expect(coordinator.resolve(handle.control.localId)).toEqual(terminalRun);
+  });
+
+  test("pending exact approvals are bounded, oldest-only, idempotent, and cleared by cancellation", () => {
+    const coordinator = fixture();
+    const handle = coordinator.create({ sessionId: "session", authorizationGeneration: 1, objective: "secret task" });
+    const registrations = Array.from({ length: RUN_COORDINATOR_MAX_PENDING_APPROVALS }, (_, index) =>
+      handle.beginAgentApproval({
+        requestSha256: index.toString(16).padStart(64, "0"),
+        taskSha256: (index + 100).toString(16).padStart(64, "0"),
+        agent: index === 0 ? "reviewer" : `worker-${index}`,
+        context: index % 2 ? "fork" : "fresh",
+        model: `safe/model-${index}`,
+        thinking: "high",
+      }));
+    expect(registrations.every(Boolean)).toBe(true);
+    expect(handle.beginAgentApproval({
+      requestSha256: "f".repeat(64), taskSha256: "e".repeat(64), agent: "overflow", context: "fresh",
+    })).toBeUndefined();
+    const projected = coordinator.resolve(handle.control.localId)?.pendingApproval;
+    expect(projected).toEqual({
+      requestSha256: "0".repeat(64),
+      taskSha256: (100).toString(16).padStart(64, "0"),
+      agent: "reviewer",
+      context: "fresh",
+      model: "safe/model-0",
+      thinking: "high",
+      count: RUN_COORDINATOR_MAX_PENDING_APPROVALS,
+    });
+    expect(JSON.stringify(projected)).not.toMatch(/secret|session|control|path|taskPreview/u);
+
+    const duplicate = handle.beginAgentApproval({
+      requestSha256: "0".repeat(64), taskSha256: (100).toString(16).padStart(64, "0"),
+      agent: "reviewer", context: "fresh", model: "safe/model-0", thinking: "high",
+    });
+    expect(duplicate).toBeDefined();
+    registrations[0]!.settle();
+    registrations[0]!.settle();
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval?.agent).toBe("reviewer");
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval?.count)
+      .toBe(RUN_COORDINATOR_MAX_PENDING_APPROVALS);
+    duplicate!.settle();
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval?.agent).toBe("worker-1");
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval?.count)
+      .toBe(RUN_COORDINATOR_MAX_PENDING_APPROVALS - 1);
+    handle.cancel();
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval).toBeUndefined();
+    registrations[1]!.settle();
+    expect(coordinator.resolve(handle.control.localId)?.pendingApproval).toBeUndefined();
+  });
+
+  test("pending approval input rejects accessors without invocation", () => {
+    const coordinator = fixture();
+    const handle = coordinator.create({ sessionId: "session", authorizationGeneration: 1, objective: "x" });
+    let reads = 0;
+    const input = {
+      requestSha256: "a".repeat(64), taskSha256: "b".repeat(64), agent: "reviewer", context: "fresh" as const,
+    };
+    Object.defineProperty(input, "agent", { get() { reads += 1; return "reviewer"; } });
+    expect(handle.beginAgentApproval(input)).toBeUndefined();
+    expect(reads).toBe(0);
   });
 
   test("objective preview is scalar, sanitized, and byte bounded", () => {
