@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { RlmEvent } from "../core/journal.ts";
 import { JournalStore } from "../shell/journal-store.ts";
+import { sha256 } from "../shell/hash.ts";
 import { readRunManifest, RUN_MANIFEST_FILE } from "./run-manifest.ts";
 import { MANAGED_RUN_PERSISTENCE, MANAGED_RUN_RESUME } from "./run-managed-lifecycle.ts";
 import { assertFailedGenesisRetirement, inspectFailedWriterGenesis } from "./run-genesis-recovery.ts";
@@ -384,6 +385,14 @@ class RetentionPreflightChanged extends Error {
   override readonly name = "RetentionPreflightChanged";
 }
 
+export interface ManagedResumeWriterIdentity {
+  readonly managedName: string;
+  readonly runId: string;
+  readonly writerOrdinal: number;
+  /** One-way identity only. Raw arbitration tokens never cross this boundary. */
+  readonly writerTokenSha256: string;
+}
+
 export class ManagedRunLease {
   private runId: string | undefined;
   private closed = false;
@@ -398,7 +407,7 @@ export class ManagedRunLease {
     private metadata: RunLifecycleMetadata,
     private readonly writer: RunWriterLease,
     private readonly persistence: LeaseOwnedRunPersistence,
-    resumed = false,
+    private readonly resumed = false,
   ) {
     if (resumed) {
       if (metadata.status !== "active" || !metadata.runId)
@@ -437,6 +446,18 @@ export class ManagedRunLease {
     readonly onManifest: (runId: string) => Promise<void>;
     readonly onRunStarted: (runId: string) => Promise<void>;
   };
+
+  /** Safe exact generation binding for host resume authorization. */
+  resumeWriterIdentity(): ManagedResumeWriterIdentity {
+    if (!this.resumed || this.closed || !this.runId)
+      throw new RunRetentionError("RUN_RETENTION_RESUME_FAILED", "managed lease is not an open resume authority");
+    return Object.freeze({
+      managedName: this.name,
+      runId: this.runId,
+      writerOrdinal: this.writer.generation.ordinal,
+      writerTokenSha256: sha256(this.writer.generation.token),
+    });
+  }
 
   private combine(primary: unknown, secondary: unknown): unknown {
     return primary === undefined ? secondary : new AggregateError([primary, secondary]);

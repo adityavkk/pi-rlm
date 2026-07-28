@@ -399,6 +399,18 @@ export interface RunCheckpointRecoveryOptions {
   ) => void;
 }
 
+export interface RunCheckpointAuthorityInspection {
+  readonly runId: string;
+  readonly manifestHash: string;
+  readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
+  readonly journalPrefixSha256: string;
+  readonly nextIteration: number;
+  readonly nextControllerTurn: number;
+  readonly incompleteTailBytes: number;
+}
+
 const checkpointEventIdentity = (event: Extract<RlmEvent, { type: "checkpoint_committed" }>) => ({
   schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
   checkpointVersion: RUN_CHECKPOINT_VERSION,
@@ -459,17 +471,18 @@ const validateEveryCheckpointEvent = (
   }
 };
 
-/** Validate one exact journal-tail checkpoint, optionally repairing only a proven torn final record. */
-export const recoverLatestRunCheckpoint = async (
+interface SelectedCheckpointAuthority {
+  readonly snapshot: JournalTailInspection;
+  readonly event: Extract<RlmEvent, { type: "checkpoint_committed" }>;
+}
+
+const selectCheckpointAuthority = async (
   document: RunManifestDocument,
   journal: JournalStore,
-  runtimeStore: ContextStore,
-  checkpointStore: RunCheckpointStore,
-  options: RunCheckpointRecoveryOptions = {},
-): Promise<RecoveredRunCheckpoint> => {
-  const checkpoint = options.checkpoint ?? (() => {});
+  checkpoint: () => void,
+): Promise<SelectedCheckpointAuthority> => {
   checkpoint();
-  let snapshot;
+  let snapshot: JournalTailInspection;
   try { snapshot = await journal.inspectTail({ checkpoint }); }
   catch (cause) {
     preserveControlFailure(cause);
@@ -487,6 +500,40 @@ export const recoverLatestRunCheckpoint = async (
   const position = snapshot.eventPositions[selectedIndex];
   if (!position || position.endBytes !== snapshot.verifiedBytes)
     invalid("latest checkpoint is not the complete verified journal tail");
+  return { snapshot, event };
+};
+
+/** Metadata-only journal/checkpoint authority inspection. It never reads checkpoint payload content or repairs. */
+export const inspectLatestRunCheckpointAuthority = async (
+  document: RunManifestDocument,
+  journal: JournalStore,
+  options: Pick<RunCheckpointRecoveryOptions, "checkpoint"> = {},
+): Promise<RunCheckpointAuthorityInspection> => {
+  const selected = await selectCheckpointAuthority(document, journal, options.checkpoint ?? (() => {}));
+  const { event, snapshot } = selected;
+  return {
+    runId: event.runId,
+    manifestHash: event.manifestHash,
+    checkpointSequence: event.checkpointSequence,
+    checkpointSha256: event.checkpointSha256,
+    checkpointPrefixSha256: event.journalPrefixSha256,
+    journalPrefixSha256: snapshot.prefixSha256,
+    nextIteration: event.nextIteration,
+    nextControllerTurn: event.nextControllerTurn,
+    incompleteTailBytes: snapshot.incompleteTailBytes,
+  };
+};
+
+/** Validate one exact journal-tail checkpoint, optionally repairing only a proven torn final record. */
+export const recoverLatestRunCheckpoint = async (
+  document: RunManifestDocument,
+  journal: JournalStore,
+  runtimeStore: ContextStore,
+  checkpointStore: RunCheckpointStore,
+  options: RunCheckpointRecoveryOptions = {},
+): Promise<RecoveredRunCheckpoint> => {
+  const checkpoint = options.checkpoint ?? (() => {});
+  const { snapshot, event } = await selectCheckpointAuthority(document, journal, checkpoint);
 
   let checkpointBytes: Uint8Array;
   try {

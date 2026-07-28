@@ -385,6 +385,8 @@ export interface ResumableManagedRunInspection {
   readonly runId: string;
   readonly manifestHash: string;
   readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
   readonly nextIteration: number;
   readonly nextControllerTurn: number;
   readonly incompleteTailBytes: number;
@@ -420,6 +422,8 @@ const inspectResumableManagedRunOwned = async (input: ResumeInput): Promise<Resu
       runId: document.manifest.run.id,
       manifestHash: document.manifestHash,
       checkpointSequence: recovered.event.checkpointSequence,
+      checkpointSha256: recovered.event.checkpointSha256,
+      checkpointPrefixSha256: recovered.event.journalPrefixSha256,
       nextIteration: recovered.event.nextIteration,
       nextControllerTurn: recovered.event.nextControllerTurn,
       incompleteTailBytes: recovered.incompleteTailBytes,

@@ -33,6 +33,7 @@ import {
 import { ManagedRunStore } from "./run-retention.ts";
 import { managedRunStoreTestOptions } from "./run-retention-test-support.ts";
 import { RunRecoveryError, type RunRecoveryErrorCode } from "./run-recovery-types.ts";
+import { inspectManagedResumeCandidate } from "./run-inspection.ts";
 import { inspectResumableManagedRun, resumeProgram } from "./run-resume.ts";
 import { runProgram } from "./run.ts";
 
@@ -337,7 +338,20 @@ describe("managed checkpoint continuation", () => {
     try {
       const name = await crashAtCheckpoint(root);
       const store = new ManagedRunStore({ root });
+      const beforeLease = await inspectManagedResumeCandidate(name, { root });
+      expect(beforeLease).toMatchObject({
+        managedName: name,
+        checkpointSequence: 1,
+        nextIteration: 2,
+        nextControllerTurn: 2,
+        incompleteTailBytes: 0,
+      });
+      expect(Object.keys(beforeLease)).not.toContain("path");
       const lease = await store.openForResume(name);
+      const writerIdentity = lease.resumeWriterIdentity();
+      expect(writerIdentity).toMatchObject({ managedName: name, runId: beforeLease.runId, writerOrdinal: 2 });
+      expect(writerIdentity.writerTokenSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(writerIdentity)).not.toContain("token\"");
       await appendFile(join(lease.dir, "events.jsonl"), '{"type":');
       const model = new MockModelClient(() => "must-not-run", modelIdentity);
       const result = await resumeWith(lease, backend, model);
@@ -646,6 +660,7 @@ describe("managed checkpoint continuation", () => {
       });
       await lease.finish(result.status, result.runId);
       expect(result.status).toBe("completed");
+      await expectRecoveryCode(inspectManagedResumeCandidate(lease.name, { root }), "RECOVERY_TERMINAL");
       await expect(store.openForResume(lease.name)).rejects.toMatchObject({ code: "RUN_RETENTION_RESUME_FAILED" });
     } finally {
       await rm(root, { recursive: true, force: true });
