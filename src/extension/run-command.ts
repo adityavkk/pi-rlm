@@ -4,13 +4,15 @@ import type { CoordinatorCancelResult, RunCoordinator } from "./run-coordinator.
 
 const RUN_NAME = /^run-[a-f0-9]{32}$/;
 const LOCAL_ALIAS = /^[A-Za-z0-9_.:-]{1,128}$/;
-const RESERVED_MANAGEMENT_PREFIX = /^(?:runs|inspect|cancel)(?:$|[^\p{L}\p{N}_])/u;
+const RESERVED_MANAGEMENT_PREFIX = /^(?:runs|inspect|resume|cleanup|cancel)(?:$|[^\p{L}\p{N}_])/u;
 const FORBIDDEN_CONTROL = /[\p{Cc}\p{Cf}]/u;
 
 export type RlmCommandRoute =
   | { readonly kind: "launch"; readonly args: string }
   | { readonly kind: "runs" }
   | { readonly kind: "inspect"; readonly target: string }
+  | { readonly kind: "resume"; readonly target: string }
+  | { readonly kind: "cleanup"; readonly mode: "apply" | "dry-run" | "force" }
   | { readonly kind: "cancel"; readonly target: string }
   | { readonly kind: "invalid-management" };
 
@@ -19,8 +21,16 @@ export const routeRlmCommand = (args: string): RlmCommandRoute => {
   if (typeof args !== "string" || FORBIDDEN_CONTROL.test(args)) return { kind: "invalid-management" };
   const input = args.trim();
   if (input === "runs") return { kind: "runs" };
-  const matched = /^(inspect|cancel) ([^\s]+)$/.exec(input);
-  if (matched) return Object.freeze({ kind: matched[1] as "inspect" | "cancel", target: matched[2]! });
+  if (input === "cleanup") return { kind: "cleanup", mode: "apply" };
+  if (input === "cleanup --dry-run") return { kind: "cleanup", mode: "dry-run" };
+  if (input === "cleanup --force") return { kind: "cleanup", mode: "force" };
+  const matched = /^(inspect|resume|cancel) ([^\s]+)$/.exec(input);
+  if (matched) {
+    const kind = matched[1] as "inspect" | "resume" | "cancel";
+    const target = matched[2]!;
+    if (kind === "resume" && !RUN_NAME.test(target)) return { kind: "invalid-management" };
+    return Object.freeze({ kind, target });
+  }
   if (RESERVED_MANAGEMENT_PREFIX.test(input)) return { kind: "invalid-management" };
   return { kind: "launch", args };
 };
