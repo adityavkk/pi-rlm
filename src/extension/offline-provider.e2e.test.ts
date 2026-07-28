@@ -49,7 +49,7 @@ const customMessage = (event: AgentSessionEvent): CustomMessage | undefined => {
 const terminalEvents = (events: readonly RlmEvent[]) => events.filter((event) =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled");
 
-const withTimeout = async <T>(work: Promise<T>, label: string, ms = 3_000): Promise<T> => {
+const withTimeout = async <T>(work: Promise<T>, label: string, ms = 5_000): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([

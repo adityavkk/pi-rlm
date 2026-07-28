@@ -247,7 +247,7 @@ describe("public AgentSession rlm_run grant lifecycle", () => {
         status: "completed",
         truncation: { omittedBytes: 0, originalBytes: 36, truncated: false },
         usage: {
-          activeLeafCalls: 1, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
+          activeLeafCalls: 0, attempts: 1, controllerTurns: 1, costUsd: 0, framesOpened: 0,
           inputTokensUsed: 11, logicalCalls: 1, outputTokensUsed: 7,
           providerDurationMs: completedDuration, storedBytes: 70, tokensReserved: 0, tokensUsed: 18,
         },
