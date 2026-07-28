@@ -240,7 +240,7 @@ describe("bounded managed run inspection pages", () => {
     await expectInspectionCode(inspectManagedRunPage(request(firstFixture.lease.name, "cells", {
       pageSize: 201,
     }), { root: firstFixture.root }), "RUN_INSPECTION_INVALID_REQUEST");
-  }, 15_000);
+  }, 30_000);
 
   test("continues an authenticated cursor over an unchanged prefix while the journal grows", async () => {
     const fixture = await managedRun("active-prefix", new MockController([

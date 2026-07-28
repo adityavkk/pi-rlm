@@ -70,6 +70,17 @@ import { Semaphore } from "./semaphore.ts";
 import type { FrameRef, InternalRunState, KeyIdentityBinding } from "./state.ts";
 import { resolveControllerTurnObserver } from "./testing/controller-turn-observer.ts";
 
+export interface ConsumedResumeExpectedIdentity {
+  readonly managedName: string;
+  readonly runId: string;
+  readonly manifestHash: string;
+  readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
+  readonly writerOrdinal: number;
+  readonly writerTokenSha256: string;
+}
+
 export interface ResumeInput {
   readonly controller: ControllerDriver;
   readonly model: ModelClient;
@@ -81,6 +92,8 @@ export interface ResumeInput {
   readonly clock?: Clock;
   /** Must come from ManagedRunStore.openForResume for this exact directory name. */
   readonly runLifecycle: RunLifecycleHooks;
+  /** Consumed host identity; direct writer-only runtime callers and read-only inspection may omit it. */
+  readonly expectedIdentity?: ConsumedResumeExpectedIdentity;
   readonly onProgress?: RunProgressObserver;
   readonly onProgressSource?: (source: RunProgressSource) => void;
 }
@@ -116,7 +129,11 @@ const validatePermanentClaim = async (
   }
 };
 
-const readCompatibleManifest = async (input: ResumeInput, checkpoint: () => void) => {
+const readCompatibleManifest = async (
+  input: ResumeInput,
+  checkpoint: () => void,
+  expected?: ConsumedResumeExpectedIdentity,
+) => {
   const persistence = input.runLifecycle[MANAGED_RUN_PERSISTENCE]!;
   let document;
   try { document = await readRunManifest(input.dir, persistence.runDirectoryFileSystem(), checkpoint); }
@@ -126,6 +143,8 @@ const readCompatibleManifest = async (input: ResumeInput, checkpoint: () => void
       throw new RunRecoveryError("RECOVERY_INCOMPATIBLE", "stored run manifest is incompatible", cause);
     throw new RunRecoveryError("RECOVERY_MANIFEST_INVALID", "stored run manifest is invalid", cause);
   }
+  if (expected && (document.manifest.run.id !== expected.runId || document.manifestHash !== expected.manifestHash))
+    throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "consumed manifest identity was substituted");
   try {
     const preparedAgentDelegation = prepareAgentDelegation(input.agentDelegation);
     assertRunComponentsCompatible(document, {
@@ -149,6 +168,19 @@ const recoveredBinding = (input: ResumeInput): NonNullable<RunLifecycleHooks[typ
   if (!persistence || !binding || input.dir !== persistence.runPath || binding.runName !== persistence.runName)
     throw new RunRecoveryError("RECOVERY_DIRECTORY_INVALID", "resume requires an exact managed openForResume lifecycle");
   return binding;
+};
+
+const consumedExpectedIdentity = (
+  input: ResumeInput,
+  binding: NonNullable<RunLifecycleHooks[typeof MANAGED_RUN_RESUME]>,
+): ConsumedResumeExpectedIdentity | undefined => {
+  const expected = input.expectedIdentity;
+  if (!expected) return undefined;
+  if (expected.managedName !== binding.runName || expected.runId !== binding.runId
+    || expected.writerOrdinal !== binding.writerOrdinal
+    || expected.writerTokenSha256 !== binding.writerTokenSha256)
+    throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "consumed writer identity was substituted");
+  return expected;
 };
 
 const hydratedKeyBindings = (
@@ -260,8 +292,11 @@ const resumeProgramOwned = async (
 ): Promise<RunResult> => {
   throwIfAborted(input.signal);
   const binding = recoveredBinding(input);
+  const expected = consumedExpectedIdentity(input, binding);
   const clock = input.clock ?? systemClock;
-  const { document, preparedAgentDelegation } = await readCompatibleManifest(input, () => throwIfAborted(input.signal));
+  const { document, preparedAgentDelegation } = await readCompatibleManifest(
+    input, () => throwIfAborted(input.signal), expected,
+  );
   if (document.manifest.run.id !== binding.runId)
     throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "managed lifecycle and manifest run identities differ");
   const scope = createAbortScope(input.signal, document.manifest.limits.deadlineMs, () => clock.now());
@@ -280,6 +315,13 @@ const resumeProgramOwned = async (
   const checkpointStore = new RunCheckpointStore(input.dir, profile.storedByteLimit, contextInstrumentation);
   const recovered = await recoverLatestRunCheckpoint(document, journal, store, checkpointStore, {
     checkpoint: () => throwIfAborted(scope.signal),
+    ...(expected ? { expectedAuthority: {
+      runId: expected.runId,
+      manifestHash: expected.manifestHash,
+      checkpointSequence: expected.checkpointSequence,
+      checkpointSha256: expected.checkpointSha256,
+      checkpointPrefixSha256: expected.checkpointPrefixSha256,
+    } } : {}),
     validateControllerState: (state, boundary) => controllerResume.capability.validate(state, boundary),
   });
   const payload = recovered.payload;
@@ -385,6 +427,8 @@ export interface ResumableManagedRunInspection {
   readonly runId: string;
   readonly manifestHash: string;
   readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
   readonly nextIteration: number;
   readonly nextControllerTurn: number;
   readonly incompleteTailBytes: number;
@@ -420,6 +464,8 @@ const inspectResumableManagedRunOwned = async (input: ResumeInput): Promise<Resu
       runId: document.manifest.run.id,
       manifestHash: document.manifestHash,
       checkpointSequence: recovered.event.checkpointSequence,
+      checkpointSha256: recovered.event.checkpointSha256,
+      checkpointPrefixSha256: recovered.event.journalPrefixSha256,
       nextIteration: recovered.event.nextIteration,
       nextControllerTurn: recovered.event.nextControllerTurn,
       incompleteTailBytes: recovered.incompleteTailBytes,
@@ -441,7 +487,7 @@ export const inspectResumableManagedRun = (input: ResumeInput): Promise<Resumabl
   return persistence.runTransaction(() => inspectResumableManagedRunOwned(input));
 };
 
-/** Continue one lease-owned managed run from its exact checkpoint boundary. */
+/** Continue one lease-owned managed run, enforcing consumed identity when supplied by the host boundary. */
 export const resumeProgram = (input: ResumeInput): Promise<RunResult> => {
   let controllerResume;
   try { controllerResume = requireControllerResumeCapability(input.controller); }

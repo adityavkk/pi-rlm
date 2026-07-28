@@ -8,7 +8,8 @@ import { isProxy } from "node:util/types";
 import type { RlmEvent } from "../core/journal.ts";
 import { canonicalStringify, parseJsonValue, type JsonValue } from "../core/json.ts";
 import { sha256, sha256Bytes } from "../shell/hash.ts";
-import { parseJournalSnapshotBytes } from "../shell/journal-store.ts";
+import { JournalStore, parseJournalSnapshotBytes } from "../shell/journal-store.ts";
+import { inspectLatestRunCheckpointAuthority } from "./checkpoint-recovery.ts";
 import { validateRecoveryJournal, type RecoveryJournalModel } from "./run-recovery-journal.ts";
 import { MAX_RECOVERY_JOURNAL_BYTES } from "./run-recovery.ts";
 import { RunRecoveryError, type RunRecoveryErrorCode } from "./run-recovery-types.ts";
@@ -436,6 +437,58 @@ const measuredPage = (page: Omit<RunInspectionPage, "serializedBytes">): RunInsp
 };
 
 /** Inspect one host-managed run name. Caller-controlled filesystem paths are not accepted. */
+export interface ManagedResumeCandidateInspection {
+  readonly managedName: string;
+  readonly runId: string;
+  readonly manifestHash: string;
+  readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
+  readonly journalPrefixSha256: string;
+  readonly nextIteration: number;
+  readonly nextControllerTurn: number;
+  readonly incompleteTailBytes: number;
+  readonly deadlineMs: number;
+  readonly agentDelegationRequired: boolean;
+}
+
+/** Effect-free, metadata-only resume preflight over one exact managed name. */
+export const inspectManagedResumeCandidate = async (
+  managedName: string,
+  options: ManagedRunStoreOptions = {},
+): Promise<ManagedResumeCandidateInspection> => {
+  if (!RUN_NAME.test(managedName))
+    throw new RunRecoveryError("RECOVERY_DIRECTORY_INVALID", "resume requires one exact managed run name");
+  const listing = await new ManagedRunStore(options).list();
+  const run = listing.runs.find((candidate) => candidate.name === managedName);
+  if (!run)
+    throw new RunRecoveryError("RECOVERY_DIRECTORY_INVALID", "managed resume target was not found or was invalid");
+  if (run.metadata.status !== "active")
+    throw new RunRecoveryError("RECOVERY_TERMINAL", "terminal managed runs are inspect-only");
+  const snapshot = await readAuthority(run.path);
+  const checkpoint = await inspectLatestRunCheckpointAuthority(snapshot.document, new JournalStore(run.path));
+  const currentPrefix = sha256Bytes(snapshot.prefix);
+  if (checkpoint.runId !== snapshot.document.manifest.run.id
+    || checkpoint.manifestHash !== snapshot.document.manifestHash
+    || checkpoint.journalPrefixSha256 !== currentPrefix
+    || run.metadata.runId !== checkpoint.runId)
+    throw new RunRecoveryError("RECOVERY_UNSTABLE", "managed resume identity changed during inspection");
+  return Object.freeze({
+    managedName,
+    runId: checkpoint.runId,
+    manifestHash: checkpoint.manifestHash,
+    checkpointSequence: checkpoint.checkpointSequence,
+    checkpointSha256: checkpoint.checkpointSha256,
+    checkpointPrefixSha256: checkpoint.checkpointPrefixSha256,
+    journalPrefixSha256: checkpoint.journalPrefixSha256,
+    nextIteration: checkpoint.nextIteration,
+    nextControllerTurn: checkpoint.nextControllerTurn,
+    incompleteTailBytes: checkpoint.incompleteTailBytes,
+    deadlineMs: snapshot.document.manifest.limits.deadlineMs,
+    agentDelegationRequired: snapshot.document.manifest.components.agentDelegation !== null,
+  });
+};
+
 export const inspectManagedRunPage = async (
   rawRequest: unknown,
   options: ManagedRunInspectionOptions = {},

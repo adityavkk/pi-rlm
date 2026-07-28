@@ -393,10 +393,30 @@ export interface RecoveredRunCheckpoint {
 export interface RunCheckpointRecoveryOptions {
   readonly repair?: boolean;
   readonly checkpoint?: () => void;
+  /** Consumed host authority, compared before payload reads, hydration, callbacks, or repair. */
+  readonly expectedAuthority?: {
+    readonly runId: string;
+    readonly manifestHash: string;
+    readonly checkpointSequence: number;
+    readonly checkpointSha256: string;
+    readonly checkpointPrefixSha256: string;
+  };
   readonly validateControllerState?: (
     state: JsonValue,
     boundary: { readonly frameId: string; readonly nextIteration: number; readonly trajectoryLength: number },
   ) => void;
+}
+
+export interface RunCheckpointAuthorityInspection {
+  readonly runId: string;
+  readonly manifestHash: string;
+  readonly checkpointSequence: number;
+  readonly checkpointSha256: string;
+  readonly checkpointPrefixSha256: string;
+  readonly journalPrefixSha256: string;
+  readonly nextIteration: number;
+  readonly nextControllerTurn: number;
+  readonly incompleteTailBytes: number;
 }
 
 const checkpointEventIdentity = (event: Extract<RlmEvent, { type: "checkpoint_committed" }>) => ({
@@ -459,17 +479,18 @@ const validateEveryCheckpointEvent = (
   }
 };
 
-/** Validate one exact journal-tail checkpoint, optionally repairing only a proven torn final record. */
-export const recoverLatestRunCheckpoint = async (
+interface SelectedCheckpointAuthority {
+  readonly snapshot: JournalTailInspection;
+  readonly event: Extract<RlmEvent, { type: "checkpoint_committed" }>;
+}
+
+const selectCheckpointAuthority = async (
   document: RunManifestDocument,
   journal: JournalStore,
-  runtimeStore: ContextStore,
-  checkpointStore: RunCheckpointStore,
-  options: RunCheckpointRecoveryOptions = {},
-): Promise<RecoveredRunCheckpoint> => {
-  const checkpoint = options.checkpoint ?? (() => {});
+  checkpoint: () => void,
+): Promise<SelectedCheckpointAuthority> => {
   checkpoint();
-  let snapshot;
+  let snapshot: JournalTailInspection;
   try { snapshot = await journal.inspectTail({ checkpoint }); }
   catch (cause) {
     preserveControlFailure(cause);
@@ -487,6 +508,47 @@ export const recoverLatestRunCheckpoint = async (
   const position = snapshot.eventPositions[selectedIndex];
   if (!position || position.endBytes !== snapshot.verifiedBytes)
     invalid("latest checkpoint is not the complete verified journal tail");
+  return { snapshot, event };
+};
+
+/** Metadata-only journal/checkpoint authority inspection. It never reads checkpoint payload content or repairs. */
+export const inspectLatestRunCheckpointAuthority = async (
+  document: RunManifestDocument,
+  journal: JournalStore,
+  options: Pick<RunCheckpointRecoveryOptions, "checkpoint"> = {},
+): Promise<RunCheckpointAuthorityInspection> => {
+  const selected = await selectCheckpointAuthority(document, journal, options.checkpoint ?? (() => {}));
+  const { event, snapshot } = selected;
+  return {
+    runId: event.runId,
+    manifestHash: event.manifestHash,
+    checkpointSequence: event.checkpointSequence,
+    checkpointSha256: event.checkpointSha256,
+    checkpointPrefixSha256: event.journalPrefixSha256,
+    journalPrefixSha256: snapshot.prefixSha256,
+    nextIteration: event.nextIteration,
+    nextControllerTurn: event.nextControllerTurn,
+    incompleteTailBytes: snapshot.incompleteTailBytes,
+  };
+};
+
+/** Validate one exact journal-tail checkpoint, optionally repairing only a proven torn final record. */
+export const recoverLatestRunCheckpoint = async (
+  document: RunManifestDocument,
+  journal: JournalStore,
+  runtimeStore: ContextStore,
+  checkpointStore: RunCheckpointStore,
+  options: RunCheckpointRecoveryOptions = {},
+): Promise<RecoveredRunCheckpoint> => {
+  const checkpoint = options.checkpoint ?? (() => {});
+  const { snapshot, event } = await selectCheckpointAuthority(document, journal, checkpoint);
+  const expected = options.expectedAuthority;
+  if (expected && (event.runId !== expected.runId || event.manifestHash !== expected.manifestHash
+    || event.checkpointSequence !== expected.checkpointSequence
+    || event.checkpointSha256 !== expected.checkpointSha256
+    || event.journalPrefixSha256 !== expected.checkpointPrefixSha256))
+    throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "consumed checkpoint identity was substituted");
+  checkpoint();
 
   let checkpointBytes: Uint8Array;
   try {

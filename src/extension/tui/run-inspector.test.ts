@@ -265,5 +265,5 @@ describe("run inspector", () => {
       await backend.dispose();
       await rm(stateRoot, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });

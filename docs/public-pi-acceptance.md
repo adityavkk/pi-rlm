@@ -46,6 +46,19 @@ The cancellation case calls public `AgentSession.abort()` only after the pending
 
 The same fixture runs through actual public `runPrintMode` text/JSON and `runRpcMode` success/failure adapters. Subprocesses have wall-clock termination, bounded stdout/stderr while reading, bounded RPC records/content, and deterministic cleanup. Their result files retain bounded provider observations and fetch-attempt counts. Text mode keeps command-only custom results in session history but prints no assistant text. JSON and RPC expose the custom-message lifecycle. Terminal `InteractiveMode` remains the boundary described below.
 
+The packed `managed-commands.public.integration.test.ts` fixture uses public
+`createAgentSessionServices`, `createAgentSessionFromServices`,
+`createAgentSessionRuntime`, and resource-loader extension factories in TUI,
+RPC, print, and JSON bindings. It seeds terminal and crashed-checkpoint runs only
+through exported `ManagedRunStore`/`runProgram` APIs. It requires bounded
+metadata-only list/inspect results, terminal rejection before factories, explicit
+non-TUI host authorization, offline checkpoint continuation without replay or
+model calls, cleanup dry-run/apply, and a single winner under writer contention.
+No confirmation/custom overlay is allowed outside TUI; terminal resume does not
+open a dialog in any mode. The packed smoke runs this fixture with empty
+credential stores under its OS network-denial boundary. The separately active
+`pi-subagents` packed fixture remains loaded and tested in its own isolated root.
+
 The actual public `runPrintMode()` adapter is exercised in both text and JSON modes. JSON exposes the custom-message lifecycle. Pi's text adapter owns output policy and prints only a final assistant message, so a command-only custom result remains durable in the session but is not written to text stdout. The actual public `runRpcMode()` adapter is exercised in a subprocess through its JSON stdin/stdout protocol; the test observes the custom event, reads the durable entry with `get_entries`, closes stdin, and requires deterministic process shutdown.
 
 `AgentSessionRuntime` can receive injected resource loaders and extension factories through its public factory. Remaining limits are adapter-owned I/O and lifecycle: `runRpcMode()` owns process stdin/stdout and exits the process on shutdown; print mode owns its output/disposal lifecycle; and `InteractiveMode` requires a real terminal/TUI event loop. The grant matrix binds a real public `AgentSession`/`ExtensionRunner` with `mode: "tui"` and a deterministic public `ExtensionUIContext.confirm`; this exercises actual mode binding, UI authorization, host model streaming, tool execution, and session persistence. It is not the terminal-bound `InteractiveMode` adapter and makes no visual-TUI claim. Actual print, JSON, and RPC adapters are headless and cannot supply an approving human confirmation for `rlm_run`; their bounded `RLM_OPT_IN_REQUIRED` denial is already covered by extension mode tests. `/rlm` remains their direct host-action path. `ExtensionAPI.sendMessage()` also returns `void`, so Pi 0.80.10 exposes no awaited message-persistence acknowledgement to extensions.

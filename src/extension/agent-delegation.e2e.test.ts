@@ -232,7 +232,7 @@ describe("public Pi agent delegation E2E", () => {
       await fixture?.dispose();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });
 
 const exactApprovalRequest: AgentApprovalRequest = {

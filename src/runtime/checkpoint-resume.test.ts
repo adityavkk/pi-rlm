@@ -33,6 +33,7 @@ import {
 import { ManagedRunStore } from "./run-retention.ts";
 import { managedRunStoreTestOptions } from "./run-retention-test-support.ts";
 import { RunRecoveryError, type RunRecoveryErrorCode } from "./run-recovery-types.ts";
+import { inspectManagedResumeCandidate } from "./run-inspection.ts";
 import { inspectResumableManagedRun, resumeProgram } from "./run-resume.ts";
 import { runProgram } from "./run.ts";
 
@@ -337,7 +338,20 @@ describe("managed checkpoint continuation", () => {
     try {
       const name = await crashAtCheckpoint(root);
       const store = new ManagedRunStore({ root });
+      const beforeLease = await inspectManagedResumeCandidate(name, { root });
+      expect(beforeLease).toMatchObject({
+        managedName: name,
+        checkpointSequence: 1,
+        nextIteration: 2,
+        nextControllerTurn: 2,
+        incompleteTailBytes: 0,
+      });
+      expect(Object.keys(beforeLease)).not.toContain("path");
       const lease = await store.openForResume(name);
+      const writerIdentity = lease.resumeWriterIdentity();
+      expect(writerIdentity).toMatchObject({ managedName: name, runId: beforeLease.runId, writerOrdinal: 2 });
+      expect(writerIdentity.writerTokenSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(writerIdentity)).not.toContain("token\"");
       await appendFile(join(lease.dir, "events.jsonl"), '{"type":');
       const model = new MockModelClient(() => "must-not-run", modelIdentity);
       const result = await resumeWith(lease, backend, model);
@@ -362,6 +376,80 @@ describe("managed checkpoint continuation", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 90_000);
+
+  test("enforces consumed manifest and checkpoint identity inside recovery before hydration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-consumed-identity-"));
+    const backend = await QuickJsBackend.create();
+    let lease: Awaited<ReturnType<ManagedRunStore["openForResume"]>> | undefined;
+    let contextOperations = 0;
+    try {
+      const name = await crashAtCheckpoint(root);
+      const inspected = await inspectManagedResumeCandidate(name, { root });
+      const store = new ManagedRunStore(managedRunStoreTestOptions({
+        root,
+        contextStoreInstrumentation: {
+          async runFileSystemOperation(_path, effect) { contextOperations++; return effect(); },
+        },
+      }));
+      lease = await store.openForResume(name);
+      const writer = lease.resumeWriterIdentity();
+      const expectedIdentity = {
+        managedName: inspected.managedName,
+        runId: inspected.runId,
+        manifestHash: inspected.manifestHash,
+        checkpointSequence: inspected.checkpointSequence,
+        checkpointSha256: inspected.checkpointSha256,
+        checkpointPrefixSha256: inspected.checkpointPrefixSha256,
+        writerOrdinal: writer.writerOrdinal,
+        writerTokenSha256: writer.writerTokenSha256,
+      };
+      await expectRecoveryCode(resumeProgram({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend,
+        dir: lease.dir,
+        signal: new AbortController().signal,
+        runLifecycle: lease.lifecycle,
+        expectedIdentity: { ...expectedIdentity, writerOrdinal: expectedIdentity.writerOrdinal + 1 },
+      }), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+
+      const manifestPath = join(lease.dir, RUN_MANIFEST_FILE);
+      const originalManifest = await readFile(manifestPath);
+      const document = JSON.parse(originalManifest.toString("utf8")) as {
+        manifest: Record<string, unknown>;
+        manifestHash: string;
+      };
+      const launchAuthorization = document.manifest["launchAuthorization"] as Record<string, unknown>;
+      launchAuthorization["mode"] = launchAuthorization["mode"] === "direct" ? "confirmed" : "direct";
+      document.manifestHash = sha256(canonicalStringify(document.manifest as unknown as JsonValue));
+      await writeFile(manifestPath, `${canonicalStringify(document as unknown as JsonValue)}\n`, { mode: 0o600 });
+
+      const attempt = () => resumeProgram({
+        controller: new ResumeFixtureController(),
+        model: new MockModelClient(() => "must-not-run", modelIdentity),
+        backend,
+        dir: lease!.dir,
+        signal: new AbortController().signal,
+        runLifecycle: lease!.lifecycle,
+        expectedIdentity,
+      });
+      await expectRecoveryCode(attempt(), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+
+      await writeFile(manifestPath, originalManifest, { mode: 0o600 });
+      await rewriteCheckpointPayload(lease.dir, (payload) => {
+        const run = payload["run"] as Record<string, unknown>;
+        run["nextControllerTurn"] = (run["nextControllerTurn"] as number) + 1;
+      });
+      await expectRecoveryCode(attempt(), "RECOVERY_IDENTITY_MISMATCH");
+      expect(contextOperations).toBe(0);
+    } finally {
+      await lease?.abandon().catch(() => undefined);
+      await backend.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("rejects component drift before controller, model, or backend execution", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-checkpoint-components-"));
@@ -646,6 +734,7 @@ describe("managed checkpoint continuation", () => {
       });
       await lease.finish(result.status, result.runId);
       expect(result.status).toBe("completed");
+      await expectRecoveryCode(inspectManagedResumeCandidate(lease.name, { root }), "RECOVERY_TERMINAL");
       await expect(store.openForResume(lease.name)).rejects.toMatchObject({ code: "RUN_RETENTION_RESUME_FAILED" });
     } finally {
       await rm(root, { recursive: true, force: true });

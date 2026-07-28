@@ -30,8 +30,9 @@ What works and is tested offline with no provider credentials:
   repair, and fallback extraction on turn exhaustion.
 - A one-response controller driver (LLM-backed) exercised end to end with a mock
   model, plus the durable event journal with torn-write recovery.
-- The Pi extension wiring: the `/rlm` command, the `rlm_run` tool, and a
-  host-side launch gate that refuses unsolicited runs.
+- The Pi extension wiring: strict `/rlm` launch and managed-run commands, the
+  `rlm_run` tool, and separate host-side launch/resume gates that refuse
+  unsolicited execution.
 - `agent()` through the public `pi-subagents` version 2 protocol, including
   context-file references, approval, cancellation, accounting, caching, and
   credential-free public `AgentSession` acceptance.
@@ -41,9 +42,9 @@ What is not done yet:
 - The live provider path (real model calls through Pi) is implemented against
   the SDK and type-checks, but it needs configured model auth and has not been
   run end to end here. Treat it as interactive-use code pending live testing.
-- Read-only recovery inspection validates terminal and nonterminal run state from
-  the manifest, journal, and content store. Cross-process execution resume and the
-  TUI inspector remain in progress.
+- Read-only recovery inspection, the TUI navigator/inspector, textual managed-run
+  operations, and exact checkpoint continuation are implemented. Live-provider
+  resume still has the same pending-live-testing status as ordinary launches.
 
 ## Install
 
@@ -89,6 +90,31 @@ Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
   fail with a typed `RLM_SOURCE_*` result before authorization or runtime setup.
   Inline and file sources are capped at 64 MiB UTF-8. Session projection is
   compaction-aware and capped at 16 MiB and 10,000 active entries.
+
+- Managed host operations use only these exact forms:
+
+  ```text
+  /rlm runs
+  /rlm inspect run-<32 lowercase hex>
+  /rlm resume run-<32 lowercase hex>
+  /rlm cleanup --dry-run
+  /rlm cleanup
+  /rlm cleanup --force
+  /rlm cancel <current local alias>
+  ```
+
+  Malformed reserved prefixes never become launch input. `runs`, `inspect`, and
+  cleanup are textual and safe in TUI, RPC, print, and JSON modes; TUI also keeps
+  the interactive navigator/inspector. Results contain bounded metadata only,
+  never paths, source/output text, checkpoint payloads, lifecycle owners, raw
+  writer tokens, or exception text. Cleanup apply/force requires a durable audit
+  before the shared retention protocol mutates anything; dry-run is advisory.
+
+  Resume accepts an exact managed name only, never a path, run ID, local alias,
+  or custom directory. TUI requires exact confirmation. Non-TUI modes fail closed
+  unless the embedding host supplies the explicit `authorizeResume` policy to
+  `createRlmExtension`. A terminal, ambiguous, incompatible, checkpoint-less, or
+  expired run remains inspect-only.
 
 - Tool call (model initiated): `rlm_run` accepts either a non-empty
   `{ objective, context }` or a typed `{ program, sources }`. A typed program
@@ -167,9 +193,14 @@ deferreds plus a single centralized job-pump loop. See
 QuickJS, fresh contexts, budgets, and tool filtering are capability controls,
 not an operating-system sandbox. The guest has no `process`, `require`, dynamic
 import, network, timers, `Date`, or `Math.random`. CPU time and heap are capped
-per cell. Every run consumes one host-owned grant created by `/rlm` or an exact-
-request UI confirmation and bound to its Pi session, host turn identity,
-originating-input hash, normalized request hash, and exact tool call. The model
+per cell. Every new run consumes one host-owned launch grant created by `/rlm` or an
+exact-request UI confirmation and bound to its Pi session, host turn identity,
+originating-input hash, normalized request hash, and exact tool call. Resume uses
+an independent fresh one-shot grant bound to session and authorization generation,
+command nonce and origin, managed name/run ID, manifest and checkpoint identities,
+writer ordinal and a one-way writer-token hash, host mode, and TTL. It is consumed
+immediately before hydration and continuation. Session switch/fork/resume/shutdown,
+abort, denial, expiry, mismatch, and replay invalidate resume authority. The model
 cannot create authority with prompt wording, submit a grant ID, or reuse a
 consumed call. A delegated Pi agent runs outside QuickJS with the tools and
 filesystem access configured for that named agent. Unknown names require a
@@ -186,11 +217,14 @@ bun run smoke:packed         # packed imports plus both Pi package-loading paths
 bun run test:smoke-isolation # same smoke; caller environment and cleanup check
 ```
 
-The packed smoke uses clean, separate HOME/XDG/npm/Bun directories for two
-credential-free cases: the worktree entry loaded directly with
-`pi -e <worktree>/index.ts /rlm`, and an installed packed package discovered
-from Pi settings without `-e`. Both require the exact bounded and durable
-`RLM_SOURCE_REQUIRED` custom result lifecycle without an agent/provider turn.
+The packed smoke uses clean, separate HOME/XDG/npm/Bun directories for direct
+worktree loading, installed-package discovery, managed-command acceptance, and
+an active optional `pi-subagents` package. It runs with credentials removed and
+OS network denial. Beyond the exact durable `RLM_SOURCE_REQUIRED` lifecycle, it
+seeds managed runs through exported runtime APIs and checks metadata-only
+list/inspect, terminal rejection before factories, offline checkpoint
+continuation, cleanup dry-run/apply, and writer contention across public Pi mode
+bindings.
 
 ### Manual InteractiveMode visual acceptance
 
@@ -235,9 +269,9 @@ provided and provider/network access was not attempted.
 
 ## Roadmap
 
-- Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls.
-- Phase 3: read-only recovery inspection is complete. Writer fencing,
-  checkpoints, cross-process execution resume, and host lifecycle commands remain.
+- Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls are complete.
+- Phase 3: read-only recovery, writer fencing, checkpoints, cross-process
+  continuation, and host lifecycle commands are complete.
 - Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
   compaction, and ordinary subagent fan-out.
 
