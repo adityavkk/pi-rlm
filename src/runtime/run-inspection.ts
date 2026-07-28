@@ -61,7 +61,16 @@ const TRUSTED_ERROR_CODES = new Set([
 type Terminal = Extract<RlmEvent, { type: "run_completed" | "run_failed" | "run_cancelled" }>;
 type Cell = Extract<RlmEvent, { type: "cell_committed" }>;
 type Call = Extract<RlmEvent, { type: "call_committed" }>;
-type Provider = Extract<RlmEvent, { type: "provider_attempted" }>;
+type OperationIntent = Extract<RlmEvent, { type: "operation_intended" }>;
+interface ObservedOperation {
+  readonly frameId: string;
+  readonly operationId: string;
+  readonly kind: OperationIntent["kind"];
+  readonly attempt: number;
+  readonly outcome: Extract<RlmEvent, { type: "operation_settled" }>["outcome"];
+  readonly usage: Extract<RlmEvent, { type: "operation_settled" }>["usage"];
+  readonly errorCode?: string;
+}
 type MutableObservedUsage = { -readonly [Key in keyof RunInspectionObservedUsage]: RunInspectionObservedUsage[Key] };
 
 export interface ManagedRunInspectionOptions extends ManagedRunStoreOptions, RunInspectionOptions {}
@@ -267,7 +276,8 @@ const project = (
   const cells = new Map<string, Cell>();
   const calls = new Map<string, Call[]>();
   const callExecutionHashes = new Map<string, Set<string>>();
-  const providers = new Map<string, Provider[]>();
+  const operationIntents = new Map<string, OperationIntent>();
+  const providers = new Map<string, ObservedOperation[]>();
   const providerAttempts = new Set<string>();
   let terminal: Terminal | undefined;
   let providerCount = 0;
@@ -305,14 +315,27 @@ const project = (
       ids.add(event.callId);
       frameCalls.set(event.frameId, ids);
       guard(calls.size);
-    } else if (event.type === "provider_attempted") {
+    } else if (event.type === "operation_intended") {
       boundedIdentity(event.operationId, "operation identity");
-      const key = `${event.frameId}\0${event.operationId}`;
-      const attemptIdentity = `${key}\0${event.attempt}`;
+      operationIntents.set(event.intentId, event);
+      guard(operationIntents.size);
+    } else if (event.type === "operation_settled") {
+      const intent = operationIntents.get(event.intentId);
+      if (!intent) continue;
+      const key = `${intent.frameId}\0${intent.operationId}`;
+      const attemptIdentity = `${key}\0${intent.attempt}`;
       if (!providerAttempts.has(attemptIdentity)) {
         providerAttempts.add(attemptIdentity);
         const attempts = providers.get(key) ?? [];
-        attempts.push(event);
+        attempts.push({
+          frameId: intent.frameId,
+          operationId: intent.operationId,
+          kind: intent.kind,
+          attempt: intent.attempt,
+          outcome: event.outcome,
+          usage: event.usage,
+          ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+        });
         providers.set(key, attempts);
         providerCount += 1;
         guard(providerCount);

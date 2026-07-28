@@ -13,5 +13,6 @@ export * from "./budget.ts";
 export * from "./grant.ts";
 export * from "./trajectory.ts";
 export * from "./journal.ts";
+export * from "./operation.ts";
 
 export * from "./identity.ts";

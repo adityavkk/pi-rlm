@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { settledOperations } from "../runtime/testing/operation-events.ts";
 import type { AgentSessionEvent, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
   SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -166,10 +167,10 @@ describe("public Pi agent delegation E2E", () => {
           type: "agent_approval", agent: "reviewer", decision: "approved", policyId: "pi-ui.agent-confirm.v2.timeout-60000",
         }),
       ]);
-      expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
-        expect.objectContaining({ type: "provider_attempted", kind: "controller", outcome: "ok" }),
+      expect(settledOperations(journal)).toEqual([
+        expect.objectContaining({ type: "operation_settled", kind: "controller", outcome: "ok" }),
         expect.objectContaining({
-          type: "provider_attempted",
+          type: "operation_settled",
           kind: "agent",
           outcome: "ok",
           usage: { attempts: 1, inputTokens: 4, outputTokens: 2, totalTokens: 6, costUsd: 0, durationMs: 12 },
@@ -222,7 +223,7 @@ describe("public Pi agent delegation E2E", () => {
       expect(journal.filter((event) => event.type === "agent_approval")).toEqual([
         expect.objectContaining({ agent: "reviewer", decision: "denied", policyId: "allowlist-only" }),
       ]);
-      expect(journal.filter((event) => event.type === "provider_attempted" && event.kind === "agent")).toHaveLength(0);
+      expect(settledOperations(journal).filter((event) => event.kind === "agent")).toHaveLength(0);
     } finally {
       await fixture?.dispose();
       await rm(root, { recursive: true, force: true });

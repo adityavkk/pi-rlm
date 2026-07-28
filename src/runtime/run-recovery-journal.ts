@@ -104,10 +104,11 @@ export const validateRecoveryJournal = (
   const calls = new Map<string, CallEvent[]>();
   const keys = new Map<string, Extract<RlmEvent, { type: "key_bound" }>>();
   const approvals = new Map<string, Extract<RlmEvent, { type: "agent_approval" }>>();
-  const attemptEvents = new Map<string, Extract<RlmEvent, { type: "provider_attempted" }>>();
+  const intents = new Map<string, Extract<RlmEvent, { type: "operation_intended" }>>();
+  const settlements = new Map<string, Extract<RlmEvent, { type: "operation_settled" }>>();
+  const attemptIntents = new Map<string, Extract<RlmEvent, { type: "operation_intended" }>>();
   const operations = new Map<string, {
-    readonly kind: Extract<RlmEvent, { type: "provider_attempted" }>["kind"];
-    readonly key: string;
+    readonly kind: Extract<RlmEvent, { type: "operation_intended" }>["kind"];
     lastAttempt: number;
   }>();
   let terminal: TerminalEvent | undefined;
@@ -181,23 +182,29 @@ export const validateRecoveryJournal = (
       case "agent_approval":
         rememberExact(approvals, `${event.frameId}\0${event.callId}`, event, "agent approval");
         break;
-      case "provider_attempted": {
+      case "operation_intended": {
+        if (event.runId !== runId) throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation intent run does not match the manifest");
+        if (intents.has(event.intentId)) semanticError("duplicate operation intent");
         const operationKey = `${event.frameId}\0${event.operationId}`;
         const operation = operations.get(operationKey);
-        if (operation && (operation.kind !== event.kind || operation.key !== event.key))
-          semanticError("provider operation identity changed between attempts");
+        if (operation && operation.kind !== event.kind)
+          semanticError("operation kind changed between attempts");
         const attemptKey = `${operationKey}\0${event.attempt}`;
-        const existingAttempt = attemptEvents.get(attemptKey);
-        if (existingAttempt) {
-          if (!same(existingAttempt, event)) semanticError("conflicting provider attempt event");
-          break;
-        }
+        if (attemptIntents.has(attemptKey)) semanticError("duplicate operation attempt intent");
         if (operation ? event.attempt !== operation.lastAttempt + 1 : event.attempt !== 1)
-          semanticError("provider attempts are not contiguous");
-        attemptEvents.set(attemptKey, event);
-        operations.set(operationKey, {
-          kind: event.kind, key: event.key, lastAttempt: event.attempt,
-        });
+          semanticError("operation attempts are not contiguous");
+        intents.set(event.intentId, event);
+        attemptIntents.set(attemptKey, event);
+        operations.set(operationKey, { kind: event.kind, lastAttempt: event.attempt });
+        break;
+      }
+      case "operation_settled": {
+        if (event.runId !== runId) throw new RunRecoveryError("RECOVERY_IDENTITY_MISMATCH", "operation settlement run does not match the manifest");
+        const intent = intents.get(event.intentId);
+        if (!intent) throw new RunRecoveryError("RECOVERY_SEMANTIC_CORRUPTION", "operation settlement has no prior intent");
+        if (intent.frameId !== event.frameId) semanticError("operation settlement frame does not match its intent");
+        if (settlements.has(event.intentId)) semanticError("duplicate operation settlement");
+        settlements.set(event.intentId, event);
         break;
       }
       case "call_committed": {
@@ -314,6 +321,10 @@ export const validateRecoveryJournal = (
       throw new RunRecoveryError("RECOVERY_TERMINAL_INCONSISTENT", "failed terminal has inconsistent root state");
     }
   }
+
+  const unresolved = [...intents.keys()].filter((intentId) => !settlements.has(intentId));
+  if (unresolved.length > 0)
+    throw new RunRecoveryError("RECOVERY_AMBIGUOUS", "one or more external operation intents have no authoritative settlement");
 
   return {
     rootFrameId,

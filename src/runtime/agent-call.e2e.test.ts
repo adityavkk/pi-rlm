@@ -2,6 +2,7 @@ import { readFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
+import { settledOperations } from "./testing/operation-events.ts";
 import { normalizeProgram } from "../core/program.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import type {
@@ -133,9 +134,9 @@ describe("agent() delegation E2E", () => {
     expect(journal.filter((event) => event.type === "agent_approval")).toEqual([
       expect.objectContaining({ type: "agent_approval", agent: "reviewer", decision: "allowlisted", policyId: "allowlist-only" }),
     ]);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
+    expect(settledOperations(journal)).toEqual([
       expect.objectContaining({
-        type: "provider_attempted",
+        type: "operation_settled",
         kind: "agent",
         outcome: "ok",
         requestIdentityVersion: "pi-rlm.agent-request.v1",
@@ -173,8 +174,8 @@ describe("agent() delegation E2E", () => {
     expect(result.answer).toEqual({ answer: "INVALID_RESULT" });
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, tokensUsed: 20 });
     const journal = await events(dir);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
-      expect.objectContaining({ type: "provider_attempted", kind: "agent", outcome: "invalid_result", errorCode: "INVALID_RESULT" }),
+    expect(settledOperations(journal)).toEqual([
+      expect.objectContaining({ type: "operation_settled", kind: "agent", outcome: "invalid_result", errorCode: "INVALID_RESULT" }),
     ]);
     expect(journal.filter((event) => event.type === "call_committed")).toHaveLength(0);
   });
@@ -210,7 +211,7 @@ describe("agent() delegation E2E", () => {
     expect(client.requests).toHaveLength(0);
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 0, attempts: 0, activeLeafCalls: 0 });
     const journal = await events(dir);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toHaveLength(0);
+    expect(settledOperations(journal)).toHaveLength(0);
     expect(journal.filter((event) => event.type === "run_cancelled")).toHaveLength(1);
   });
 
@@ -244,7 +245,7 @@ describe("agent() delegation E2E", () => {
     expect(journal.filter((event) => event.type === "agent_approval")).toEqual([
       expect.objectContaining({ decision: "denied", policyId: "test-deny-v1" }),
     ]);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toHaveLength(0);
+    expect(settledOperations(journal)).toHaveLength(0);
   });
 
   test("rejects an accessor-bearing custom delegator outcome without invoking it", async () => {
@@ -264,8 +265,8 @@ describe("agent() delegation E2E", () => {
     });
     expect(result.answer).toEqual({ answer: "INVALID_RESULT" });
     expect(traps).toBe(0);
-    expect((await events(dir)).filter((event) => event.type === "provider_attempted")).toEqual([
-      expect.objectContaining({ type: "provider_attempted", kind: "agent", outcome: "invalid_result" }),
+    expect(settledOperations(await events(dir))).toEqual([
+      expect.objectContaining({ type: "operation_settled", kind: "agent", outcome: "invalid_result" }),
     ]);
   });
 
@@ -289,9 +290,9 @@ describe("agent() delegation E2E", () => {
     expect(result.answer).toEqual({ answer: "INVALID_RESULT" });
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, tokensUsed: 0, activeLeafCalls: 0 });
     const journal = await events(dir);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
+    expect(settledOperations(journal)).toEqual([
       expect.objectContaining({
-        type: "provider_attempted", kind: "agent", outcome: "invalid_result", errorCode: "INVALID_RESULT",
+        type: "operation_settled", kind: "agent", outcome: "invalid_result", errorCode: "INVALID_RESULT",
         usage: { attempts: 1, durationMs: expect.any(Number) },
       }),
     ]);
@@ -318,8 +319,8 @@ describe("agent() delegation E2E", () => {
     expect(result.answer).toEqual({ answer: "CANCELLED" });
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 1, attempts: 1, tokensUsed: 20, activeLeafCalls: 0 });
     const journal = await events(dir);
-    expect(journal.filter((event) => event.type === "provider_attempted")).toEqual([
-      expect.objectContaining({ type: "provider_attempted", kind: "agent", outcome: "cancelled", errorCode: "CANCELLED" }),
+    expect(settledOperations(journal)).toEqual([
+      expect.objectContaining({ type: "operation_settled", kind: "agent", outcome: "cancelled", errorCode: "CANCELLED" }),
     ]);
   });
 
@@ -347,7 +348,7 @@ describe("agent() delegation E2E", () => {
     expect(result.ledger.usage).toMatchObject({ logicalCalls: 2, attempts: 2, tokensUsed: 40 });
     const journal = await events(dir);
     expect(journal.filter((event) => event.type === "key_bound" && event.kind === "agent")).toHaveLength(1);
-    expect(journal.filter((event) => event.type === "provider_attempted" && event.kind === "agent")).toHaveLength(2);
+    expect(settledOperations(journal).filter((event) => event.kind === "agent")).toHaveLength(2);
     expect(journal.filter((event) => event.type === "call_committed" && event.kind === "agent")).toHaveLength(1);
   });
 });

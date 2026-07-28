@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { settledOperations, type SettledOperation } from "../runtime/testing/operation-events.ts";
 import type { AgentSessionEvent, ExtensionUIContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
 import { buildBasePrompt } from "../runtime/controller-prompt.ts";
@@ -86,7 +87,7 @@ const runIdentity = (events: readonly RlmEvent[]) => {
   const runId = starts[0]!.runId;
   const frameId = `${runId}:f0`;
   expect(runId).toMatch(/^run_[a-f0-9]{64}$/);
-  expect(events.filter((event) => "runId" in event && event.runId === runId)).toHaveLength(2);
+  expect(events.filter((event) => "runId" in event && event.runId === runId)).toHaveLength(4);
   expect(events.filter((event) => "frameId" in event && event.frameId !== frameId)).toHaveLength(0);
   const terminals = terminalEvents(events);
   expect(terminals).toHaveLength(1);
@@ -95,7 +96,7 @@ const runIdentity = (events: readonly RlmEvent[]) => {
 };
 
 const exactAttempt = (
-  event: Extract<RlmEvent, { type: "provider_attempted" }>,
+  event: SettledOperation,
   frameId: string,
   outcome: "ok" | "error" | "cancelled",
 ) => {
@@ -103,12 +104,11 @@ const exactAttempt = (
   const tokens = outcome === "ok"
     ? { inputTokens: 11, outputTokens: 7, totalTokens: 18, costUsd: 0 }
     : outcome === "error" ? { inputTokens: 11, outputTokens: 0, totalTokens: 11, costUsd: 0 } : {};
-  expect(event).toEqual({
-    type: "provider_attempted",
+  expect(event).toMatchObject({
+    type: "operation_settled",
     frameId,
     operationId: `${frameId}:controller:1`,
     kind: "controller",
-    key: "1",
     attempt: 1,
     outcome,
     usage: { attempts: 1, ...tokens, durationMs: event.usage.durationMs },
@@ -142,11 +142,10 @@ describe("credential-free offline Pi provider E2E", () => {
       const events = await fixture.readEvents();
       const { runId, frameId, terminal } = runIdentity(events);
       expect(events.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "provider_attempted", "workspace_committed",
+        "run_started", "frame_opened", "operation_intended", "operation_settled", "workspace_committed",
         "cell_committed", "answer_committed", "frame_closed", "run_completed",
       ]);
-      const attempts = events.filter((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
-        event.type === "provider_attempted");
+      const attempts = settledOperations(events);
       expect(attempts).toHaveLength(1);
       exactAttempt(attempts[0]!, frameId, "ok");
       const cell = events.find((event): event is Extract<RlmEvent, { type: "cell_committed" }> => event.type === "cell_committed")!;
@@ -199,10 +198,9 @@ describe("credential-free offline Pi provider E2E", () => {
       const events = await fixture.readEvents();
       const { runId, frameId, terminal } = runIdentity(events);
       expect(events.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_failed",
+        "run_started", "frame_opened", "operation_intended", "operation_settled", "frame_closed", "run_failed",
       ]);
-      const attempt = events.find((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
-        event.type === "provider_attempted")!;
+      const attempt = settledOperations(events)[0]!;
       exactAttempt(attempt, frameId, "error");
       expect(terminal).toEqual({ type: "run_failed", runId, code: "FAILED", message: "model provider failed" });
       expect(events.find((event) => event.type === "frame_closed")).toEqual({ type: "frame_closed", frameId, state: "failed" });
@@ -248,10 +246,9 @@ describe("credential-free offline Pi provider E2E", () => {
       const events = await fixture.readEvents();
       const { runId, frameId, terminal } = runIdentity(events);
       expect(events.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_cancelled",
+        "run_started", "frame_opened", "operation_intended", "operation_settled", "frame_closed", "run_cancelled",
       ]);
-      const attempt = events.find((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
-        event.type === "provider_attempted")!;
+      const attempt = settledOperations(events)[0]!;
       exactAttempt(attempt, frameId, "cancelled");
       expect(Object.keys(attempt.usage).sort()).toEqual(["attempts", "durationMs"]);
       expect(terminal).toEqual({ type: "run_cancelled", runId, code: "CANCELLED", message: "run cancelled by owner" });

@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { settledOperations } from "../runtime/testing/operation-events.ts";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { canonicalStringify, parseJsonValue } from "../core/index.ts";
 import { PROVIDER_REQUEST_IDENTITY_VERSION, type RlmEvent } from "../core/journal.ts";
@@ -326,20 +327,18 @@ describe("public AgentSession rlm_run grant lifecycle", () => {
       assertGrant(fixture, confirmations);
       const journal = await fixture.readEvents();
       expect(journal.map((event) => event.type)).toEqual([
-        "run_started", "frame_opened", "provider_attempted", "frame_closed", "run_cancelled",
+        "run_started", "frame_opened", "operation_intended", "operation_settled", "frame_closed", "run_cancelled",
       ]);
-      const attempts = journal.filter((event): event is Extract<RlmEvent, { type: "provider_attempted" }> =>
-        event.type === "provider_attempted");
+      const attempts = settledOperations(journal);
       expect(attempts).toHaveLength(1);
       const runStarted = journal[0];
       if (runStarted?.type !== "run_started") throw new Error("cancelled journal does not start with run_started");
       const frameId = `${runStarted.runId}:f0`;
-      expect(attempts[0]).toEqual({
-        type: "provider_attempted",
+      expect(attempts[0]).toMatchObject({
+        type: "operation_settled",
         frameId,
         operationId: `${frameId}:controller:1`,
         kind: "controller",
-        key: "1",
         attempt: 1,
         outcome: "cancelled",
         usage: { attempts: 1, durationMs: attempts[0]!.usage.durationMs },

@@ -283,7 +283,7 @@ describe("source-bound run identity and manifest", () => {
     }
   });
 
-  test("runtime-dynamic provider prompts are journaled by hash, not predicted in the manifest", async () => {
+  test("runtime-dynamic provider prompts are write-ahead journaled by hash, not predicted in the manifest", async () => {
     const dir = await tmp();
     const prompt = "runtime-only prompt with private evidence";
     const dynamicProfile = { ...profile, maxControllerTurns: 1 };
@@ -313,13 +313,15 @@ describe("source-bound run identity and manifest", () => {
     expect(storedManifest).not.toContain(prompt);
     expect(storedManifest).not.toContain("turnRenderedSha256");
     const events = (await readFile(join(dir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    const attempted = events.find((event) => event.type === "provider_attempted");
-    expect(attempted).toMatchObject({
+    const intended = events.find((event) => event.type === "operation_intended");
+    const settled = events.find((event) => event.type === "operation_settled");
+    expect(intended).toMatchObject({
       requestIdentityVersion: PROVIDER_REQUEST_IDENTITY_VERSION,
       requestSha256: providerRequestIdentity(dynamicModel, { prompt }).sha256,
-      outcome: "ok",
+      reservation: { logicalCalls: 1, attempts: 1 },
     });
-    expect(JSON.stringify(attempted)).not.toContain(prompt);
+    expect(settled).toMatchObject({ intentId: intended.intentId, outcome: "ok" });
+    expect(JSON.stringify([intended, settled])).not.toContain(prompt);
   });
 
   test("readRunManifest applies strict compatibility and canonical hash checks", async () => {
