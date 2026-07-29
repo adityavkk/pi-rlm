@@ -76,8 +76,9 @@ const mapMessage = (message: AssistantMessage, provider: string, model: string, 
       const textParts = message.content.filter(
         (part): part is { type: "text"; text: string } => part.type === "text",
       );
-      if (textParts.length === 0) return fail("MISSING_TEXT", `no text returned by ${provider}/${model}`);
-      return { text: textParts.map((part) => part.text).join(""), usage };
+      const text = textParts.map((part) => part.text).join("");
+      if (text.trim().length === 0) return fail("MISSING_TEXT", `no text returned by ${provider}/${model}`);
+      return { text, usage };
     }
   }
 };
@@ -139,6 +140,17 @@ export class PiModelClient implements ModelClient {
       );
     }
 
-    return mapMessage(message, provider, model, elapsedMs(startedMs, this.clock.now()));
+    const durationMs = elapsedMs(startedMs, this.clock.now());
+    if (request.maxOutputTokens !== undefined && message.usage.output > request.maxOutputTokens) {
+      throw new PiModelError(
+        "OUTPUT_TRUNCATED",
+        message.stopReason,
+        provider,
+        model,
+        mapUsage(message, durationMs),
+        `reported output exceeded the requested cap for ${provider}/${model}`,
+      );
+    }
+    return mapMessage(message, provider, model, durationMs);
   }
 }

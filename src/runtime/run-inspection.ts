@@ -449,6 +449,7 @@ export interface ManagedResumeCandidateInspection {
   readonly nextControllerTurn: number;
   readonly incompleteTailBytes: number;
   readonly deadlineMs: number;
+  readonly extractorRequired: boolean;
   readonly agentDelegationRequired: boolean;
 }
 
@@ -485,6 +486,7 @@ export const inspectManagedResumeCandidate = async (
     nextControllerTurn: checkpoint.nextControllerTurn,
     incompleteTailBytes: checkpoint.incompleteTailBytes,
     deadlineMs: snapshot.document.manifest.limits.deadlineMs,
+    extractorRequired: snapshot.document.manifest.components.extractor !== null,
     agentDelegationRequired: snapshot.document.manifest.components.agentDelegation !== null,
   });
 };

@@ -15,8 +15,9 @@ it needs, and does the heavy joining, counting, and fan-out in code.
 
 ## Status
 
-This repository is an honest Phase 0 and Phase 1 foundation, not a finished
-product.
+This repository implements the version 1 runtime and Pi extension. The default
+suite remains offline and deterministic. A separate one-shot campaign validates
+configured providers only after exact operator consent.
 
 What works and is tested offline with no provider credentials:
 
@@ -37,14 +38,25 @@ What works and is tested offline with no provider credentials:
   context-file references, approval, cancellation, accounting, caching, and
   credential-free public `AgentSession` acceptance.
 
-What is not done yet:
+Live provider evidence:
 
-- The live provider path (real model calls through Pi) is implemented against
-  the SDK and type-checks, but it needs configured model auth and has not been
-  run end to end here. Treat it as interactive-use code pending live testing.
-- Read-only recovery inspection, the TUI navigator/inspector, textual managed-run
-  operations, and exact checkpoint continuation are implemented. Live-provider
-  resume still has the same pending-live-testing status as ordinary launches.
+- Commit `5594641` passed the one-shot campaign on two distinct configured
+  OpenAI Codex model routes through Pi 0.80.10.
+- Both routes passed direct completion, the public `AgentSession` `/rlm` path,
+  structured output, ordered batch concurrency, recursion, provider fallback,
+  truncation, cancellation, provider failure, retry accounting, containment,
+  and a 192 KiB direct-versus-RLM comparison.
+- The campaign made 34 observed Pi completions and reconciled 62,234 settled,
+  reported tokens. Pi's catalog estimate was $0.219819. Cancellation usage
+  after abort remains unknown, and the estimate is not a billed-cost claim.
+- The canonical numeric report is
+  [`docs/evidence/live-provider-acceptance-5594641.json`](docs/evidence/live-provider-acceptance-5594641.json).
+  It contains aliases, hashes, allowlisted outcomes, and numbers only.
+
+The current evidence uses two models on one provider and one API family. It
+proves route-level compatibility, not cross-provider diversity. Exact checkpoint
+resume remains covered by deterministic fresh-process tests rather than a paid
+live interruption campaign.
 
 ## Install
 
@@ -217,6 +229,15 @@ bun run smoke:packed         # packed imports plus both Pi package-loading paths
 bun run test:smoke-isolation # same smoke; caller environment and cleanup check
 ```
 
+Configured-provider acceptance is separate and never runs from `bun test`:
+
+```bash
+bun run acceptance:live --consent /private/consent.json --output /private/report.json
+```
+
+See [live provider acceptance](docs/live-provider-acceptance.md) before creating
+consent. Credentials are necessary but never authorize the campaign.
+
 The packed smoke uses clean, separate HOME/XDG/npm/Bun directories for direct
 worktree loading, installed-package discovery, managed-command acceptance, and
 an active optional `pi-subagents` package. It runs with credentials removed and
@@ -272,8 +293,9 @@ provided and provider/network access was not attempted.
 - Phase 2: the TUI inspector, widget, completed-run views, and cancellation controls are complete.
 - Phase 3: read-only recovery, writer fencing, checkpoints, cross-process
   continuation, and host lifecycle commands are complete.
-- Phase 4: provider-backed evaluations comparing pi-rlm against direct Pi,
-  compaction, and ordinary subagent fan-out.
+- Phase 4: provider-backed conformance and direct-versus-RLM evaluation are
+  complete. Compaction remains Pi-owned, and ordinary subagent fan-out is
+  covered through the public delegation protocol.
 
 Direct host tools are outside the version 1 scope. A later version may accept
 an explicit list of host functions, similar to DSPy's `RLM(tools=[...])`. It

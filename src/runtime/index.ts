@@ -3,6 +3,7 @@ export * from "./profile.ts";
 export * from "./controller.ts";
 export * from "./mock-controller.ts";
 export * from "./model-controller.ts";
+export * from "./model-extractor.ts";
 export * from "./controller-prompt.ts";
 export * from "./call-result.ts";
 export * from "./agent-delegation.ts";

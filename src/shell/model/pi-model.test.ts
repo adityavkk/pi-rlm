@@ -107,6 +107,16 @@ const cases: readonly AdapterCase[] = [
     fixture: { stopReason: "stop", content: [{ type: "thinking", thinking: "no answer" }] },
     code: "MISSING_TEXT",
   },
+  {
+    name: "rejects stop with an empty text part",
+    fixture: { stopReason: "stop", content: [{ type: "text", text: "" }] },
+    code: "MISSING_TEXT",
+  },
+  {
+    name: "rejects stop with only whitespace across text parts",
+    fixture: { stopReason: "stop", content: [{ type: "text", text: " \n" }, { type: "text", text: "\t" }] },
+    code: "MISSING_TEXT",
+  },
 ];
 
 describe("PiModelClient stop reasons", () => {
@@ -122,6 +132,16 @@ describe("PiModelClient stop reasons", () => {
       expect(error).toBeInstanceOf(PiModelError);
       expect((error as PiModelError).usage.durationMs).toBe(275);
     }
+  });
+
+  test("fails closed when reported output exceeds the requested cap", async () => {
+    const completion = clientFor({ stopReason: "stop", content: [{ type: "text", text: "nonempty" }] })
+      .complete({ prompt: "test", maxOutputTokens: 1 });
+    await expect(completion).rejects.toMatchObject({
+      code: "OUTPUT_TRUNCATED",
+      stopReason: "stop",
+      usage: EXPECTED_USAGE,
+    });
   });
 
   test("sanitizes ordinary runtime rejection and includes elapsed duration", async () => {

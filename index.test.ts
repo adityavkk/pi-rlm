@@ -13,6 +13,7 @@ import {
   RUN_INACTIVE_FILE_PREFIX,
   RUN_LIFECYCLE_FILE,
   resolveLimits,
+  type Extractor,
   type RunResult,
   type RunRetentionMetadataFileSystem,
 } from "./src/runtime/index.ts";
@@ -528,6 +529,7 @@ const resumeCandidate = (overrides: Partial<ManagedResumeCandidateInspection> = 
   nextControllerTurn: 5,
   incompleteTailBytes: 0,
   deadlineMs: 10_000,
+  extractorRequired: false,
   agentDelegationRequired: false,
   ...overrides,
 });
@@ -910,7 +912,8 @@ describe("pi-rlm extension wiring", () => {
         expect(h.audits.some((entry) => entry.type === "pi-rlm-resume-grant")).toBe(true);
         events.push("adopt");
       },
-      resume: async (_input, expected) => {
+      resume: async (input, expected) => {
+        expect(input.extractor).toBe(extractor);
         expect(expected).toEqual({
           managedName: MANAGED_NAME, runId: MANAGED_ID, manifestHash: MANAGED_HASH,
           checkpointSequence: 3, checkpointSha256: "4".repeat(64), checkpointPrefixSha256: "5".repeat(64),
@@ -935,14 +938,22 @@ describe("pi-rlm extension wiring", () => {
       identity: { id: "test/resume-controller", version: "1", configuration: {} },
       async next() { throw new Error("not used"); }, fork() { return this; },
     };
+    const extractor: Extractor = {
+      identity: { id: "test/resume-extractor", version: "1", configuration: {} },
+      async extract() { return { ok: false, code: "FAILED", message: "not used" }; },
+    };
     h = harness({
       runtime: {
         resolveProfile: () => DEFAULT_PROFILE,
         createBackend: () => { events.push("factory-backend"); return backend; },
         createModel: () => { events.push("factory-model"); return model; },
         createController: () => { events.push("factory-controller"); return controller; },
+        createExtractor: () => { events.push("factory-extractor"); return extractor; },
       },
-      inspectManagedResumeCandidate: async () => { events.push("inspect-metadata"); return resumeCandidate(); },
+      inspectManagedResumeCandidate: async () => {
+        events.push("inspect-metadata");
+        return resumeCandidate({ extractorRequired: true });
+      },
       acquireManagedResumeLease: async () => { events.push("acquire-writer"); return lease; },
       cleanupManagedRuns: async () => { events.push("cleanup"); return cleanupResult(); },
       authorizeResume: async (request) => {
@@ -956,7 +967,7 @@ describe("pi-rlm extension wiring", () => {
 
     expect(events).toEqual([
       "inspect-metadata", "acquire-writer", "inspect-metadata", "approve", "inspect-metadata", "adopt",
-      "factory-backend", "factory-model", "factory-controller", "resume", "finish", "cleanup",
+      "factory-backend", "factory-model", "factory-controller", "factory-extractor", "resume", "finish", "cleanup",
     ]);
     expect(authorizationRequests).toHaveLength(1);
     expect(authorizationRequests[0]).toMatchObject({
@@ -1132,6 +1143,7 @@ describe("pi-rlm extension wiring", () => {
       { label: "checkpoint sequence", candidate: { checkpointSequence: 4 } },
       { label: "checkpoint hash", candidate: { checkpointSha256: "e".repeat(64) } },
       { label: "checkpoint prefix", candidate: { checkpointPrefixSha256: "e".repeat(64) } },
+      { label: "extractor requirement", candidate: { extractorRequired: true } },
       { label: "writer ordinal", writer: { writerOrdinal: 3 } },
       { label: "writer token", writer: { writerTokenSha256: "e".repeat(64) } },
     ];
