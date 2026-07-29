@@ -27,7 +27,7 @@ The release operator also runs the interactive TUI checklist in `README.md`. The
 
 The release candidate passed the following checks on Darwin 26.4.1 arm64 with Bun 1.3.14 and Pi 0.80.10:
 
-- 933 offline tests, 0 failures, 3 snapshots, and 10,769 expectations.
+- The complete offline test suite with no failures.
 - Strict TypeScript checking.
 - Bun and npm dependency audits with no known advisories.
 - The source package check with 236 tracked files and 231 packed files.
