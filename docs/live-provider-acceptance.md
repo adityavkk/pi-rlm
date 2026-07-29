@@ -19,14 +19,14 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `48e7f07469559942c1a38dbe91e96c36be590a840cddd7cb09793036727a59fb`
+- `suiteDigest`: `263ba204ed4e7f643e09f3b6f25081c6776f185ec97e032d1df6809a25dbd228`
 - `fixtureDigest`: `bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
 - `routes`: exactly two `{ provider, model, apiFamily }` objects
 - `bounds`: the five authority limits below
 
-Routes require distinct provider/model identities, distinct providers, and distinct expected API families. `apiFamily` is confirmed through exact model discovery. Route aliases are prohibited in consent. Do not put credentials, prompts, responses, errors, environment values, headers, or URLs in consent.
+Routes require distinct exact provider/model identities. `apiFamily` is confirmed through exact model discovery. Prefer different providers and API families when two working credentialed routes are available, but two distinct models on one provider still satisfy this compatibility campaign. Route aliases are prohibited in consent. Do not put credentials, prompts, responses, errors, environment values, headers, or URLs in consent.
 
 Bounds:
 

@@ -66,6 +66,9 @@ export const LIVE_REPORT_CANARIES = [
 ] as const;
 
 export const liveSuiteDescriptor = (): JsonValue => ({
+  version: 1,
+  authorityContractVersion: 1,
+  scenarioImplementationVersion: 1,
   cases: LIVE_CASE_DESCRIPTORS as unknown as JsonValue,
   thresholds: LIVE_BENCHMARK_THRESHOLDS as unknown as JsonValue,
 });

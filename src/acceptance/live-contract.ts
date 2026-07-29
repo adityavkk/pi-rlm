@@ -37,7 +37,7 @@ export {
 
 export const LIVE_ACCEPTANCE_PURPOSE = "pi-rlm-live-provider-acceptance" as const;
 export const LIVE_ACCEPTANCE_VERSION = 1 as const;
-export const LIVE_SUITE_DIGEST = "48e7f07469559942c1a38dbe91e96c36be590a840cddd7cb09793036727a59fb" as const;
+export const LIVE_SUITE_DIGEST = "263ba204ed4e7f643e09f3b6f25081c6776f185ec97e032d1df6809a25dbd228" as const;
 export const LIVE_FIXTURE_DIGEST = "bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434" as const;
 export const MAX_LIVE_CONSENT_BYTES = 64 * 1024;
 
@@ -107,9 +107,8 @@ export const parseLiveConsent = (input: unknown): LiveConsent => {
   if (!Array.isArray(values) || values.length !== 2) liveFail("consent.routes must contain exactly two routes");
   const routeValues = values as JsonValue[];
   const routes = [route(routeValues[0]!, "consent.routes[0]"), route(routeValues[1]!, "consent.routes[1]")] as const;
-  if (routes[0].provider === routes[1].provider || routes[0].apiFamily === routes[1].apiFamily
-    || `${routes[0].provider}\0${routes[0].model}` === `${routes[1].provider}\0${routes[1].model}`)
-    liveFail("consent routes, providers, and API families must be distinct");
+  if (`${routes[0].provider}\0${routes[0].model}` === `${routes[1].provider}\0${routes[1].model}`)
+    liveFail("consent routes must be distinct");
   const issuedAtMs = liveInteger(liveOwn(value, "issuedAtMs"), 0, Number.MAX_SAFE_INTEGER, "consent.issuedAtMs");
   const expiresAtMs = liveInteger(liveOwn(value, "expiresAtMs"), 0, Number.MAX_SAFE_INTEGER, "consent.expiresAtMs");
   if (expiresAtMs <= issuedAtMs) liveFail("consent expiry must follow issuance");

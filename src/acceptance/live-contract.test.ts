@@ -76,8 +76,7 @@ describe("live consent contract", () => {
     for (const mutation of [
       (value: any) => { value.prompt = "forbidden"; },
       (value: any) => { value.routes.push(value.routes[0]); },
-      (value: any) => { value.routes[1].provider = value.routes[0].provider; },
-      (value: any) => { value.routes[1].apiFamily = value.routes[0].apiFamily; },
+      (value: any) => { value.routes[1] = structuredClone(value.routes[0]); },
       (value: any) => { value.bounds.maxInvocations = Infinity; },
       (value: any) => { value.bounds.maxAggregateTokens = 1; },
     ]) {
