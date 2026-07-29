@@ -19,7 +19,7 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `6c20457675dc439f5e0ba577f8460873fdf8e5e06b2e3be844bfb91534ee1228`
+- `suiteDigest`: `eec3091ee4221054fc92bb34ba2481ff728c204ba1bb40b49295e5627bb28d9b`
 - `fixtureDigest`: `af4c961a5d783e60f2116bb749bdef08e75c212190e3824bcb74ffd0b95405fb`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters

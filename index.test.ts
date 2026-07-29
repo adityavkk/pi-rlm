@@ -528,6 +528,7 @@ const resumeCandidate = (overrides: Partial<ManagedResumeCandidateInspection> = 
   nextControllerTurn: 5,
   incompleteTailBytes: 0,
   deadlineMs: 10_000,
+  extractorRequired: false,
   agentDelegationRequired: false,
   ...overrides,
 });
@@ -1132,6 +1133,7 @@ describe("pi-rlm extension wiring", () => {
       { label: "checkpoint sequence", candidate: { checkpointSequence: 4 } },
       { label: "checkpoint hash", candidate: { checkpointSha256: "e".repeat(64) } },
       { label: "checkpoint prefix", candidate: { checkpointPrefixSha256: "e".repeat(64) } },
+      { label: "extractor requirement", candidate: { extractorRequired: true } },
       { label: "writer ordinal", writer: { writerOrdinal: 3 } },
       { label: "writer token", writer: { writerTokenSha256: "e".repeat(64) } },
     ];

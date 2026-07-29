@@ -173,7 +173,7 @@ export const runLiveProviderAcceptanceSuite = async (
           input.consent.bounds,
           input.consent.bounds.maxInvocations - usedInvocations,
           input.consent.bounds.maxAggregateTokens - usedTokens - reserveTokens,
-          input.consent.bounds.maxWallTimeMs - elapsed - (index === 0 ? plan.maxWallTimeMs : 0),
+          input.consent.bounds.maxWallTimeMs - elapsed,
         ),
         // Preserve a positive share of the post-reported estimate ceiling for
         // every remaining route. This is not a billed-cost guarantee.

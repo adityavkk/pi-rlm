@@ -197,6 +197,7 @@ const sameResumeCandidate = (
   && left.nextIteration === right.nextIteration
   && left.nextControllerTurn === right.nextControllerTurn
   && left.deadlineMs === right.deadlineMs
+  && left.extractorRequired === right.extractorRequired
   && left.agentDelegationRequired === right.agentDelegationRequired;
 
 const resumeErrorProjection = (error: unknown, managedName: string): RlmManagementMetadata => {
@@ -1007,9 +1008,11 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         ?? ((client: ModelClient, selectedProfile: Profile) =>
           new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
       if (!current()) return;
-      const extractor = (dependencies.runtime?.createExtractor
-        ?? ((_client: ModelClient, selectedProfile: Profile) =>
-          new ModelExtractor({ model: selectedProfile.models.medium })))(model, profile);
+      const extractor = candidate.extractorRequired
+        ? (dependencies.runtime?.createExtractor
+          ?? ((_client: ModelClient, selectedProfile: Profile) =>
+            new ModelExtractor({ model: selectedProfile.models.medium })))(model, profile)
+        : undefined;
       if (!current()) return;
       const agentDelegation = candidate.agentDelegationRequired ? extensionAgentDelegation(
         ctx,
