@@ -10,6 +10,7 @@ import {
   type LiveConsent,
 } from "../src/acceptance/live-contract.ts";
 import { withConsumedLiveConsent, type LiveConsentDependencies } from "../src/acceptance/live-consent.ts";
+import { LIVE_REPORT_CANARIES } from "../src/acceptance/live-descriptors.ts";
 import { publishLiveReport } from "../src/acceptance/live-report.ts";
 
 interface LiveSuiteModule {
@@ -95,11 +96,12 @@ export const runLiveProviderAcceptance = async (
     nowMs: dependencies.nowMs,
   }, async (consent) => {
     const suite = await (dependencies.loadSuite ?? (() => import("../src/acceptance/live-suite.ts")))();
+    const canaries = [...LIVE_REPORT_CANARIES, ...(dependencies.canaries ?? [])];
     const report = validateReportAuthority(
-      await suite.runLiveProviderAcceptanceSuite({ consent, canaries: dependencies.canaries ?? [] }),
+      await suite.runLiveProviderAcceptanceSuite({ consent, canaries }),
       consent,
     );
-    return (dependencies.publishReport ?? publishLiveReport)(outputPath, report, dependencies.canaries ?? []);
+    return (dependencies.publishReport ?? publishLiveReport)(outputPath, report, canaries);
   }, dependencies.consent);
 };
 
@@ -108,6 +110,8 @@ const CLI_CODES = new Set<string>([
   "LIVE_CONTRACT_INVALID", "CONSENT_FILE_INVALID", "CONSENT_EXPIRED", "CONSENT_NOT_YET_VALID",
   "CONSENT_COMMIT_MISMATCH", "CONSENT_SUITE_MISMATCH", "CONSENT_FIXTURE_MISMATCH",
   "CONSENT_CONSUMPTION_FAILED", "REPORT_PUBLICATION_FAILED", "SUITE_NOT_IMPLEMENTED",
+  "LIVE_PLAN_OUTSIDE_AUTHORITY", "CHILD_FAILED", "CHILD_TIMEOUT", "CHILD_OUTPUT",
+  "CHILD_REPORT_INVALID", "CHILD_CONTAINMENT_FAILED",
 ]);
 const safeCode = (error: unknown): string => {
   if (typeof error !== "object" || error === null || !("code" in error)) return "LIVE_ACCEPTANCE_FAILED";

@@ -128,7 +128,7 @@ describe("live provider parent runner refusal boundary", () => {
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 
-  test("valid authority reaches only the typed phase-1 placeholder and creates no output", async () => {
+  test("valid but undersized authority reaches the suite plan and creates no output", async () => {
     const root = await directory();
     const consentPath = join(root, "consent.json");
     const outputPath = join(root, "report.json");
@@ -136,7 +136,7 @@ describe("live provider parent runner refusal boundary", () => {
     await expect(runLiveProviderAcceptance(["--consent", consentPath, "--output", outputPath], {
       gitCommit: () => COMMIT,
       nowMs: 1_500,
-    })).rejects.toMatchObject({ code: "SUITE_NOT_IMPLEMENTED" });
+    })).rejects.toMatchObject({ code: "LIVE_PLAN_OUTSIDE_AUTHORITY" });
     expect(await Bun.file(consentPath).exists()).toBe(false);
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });

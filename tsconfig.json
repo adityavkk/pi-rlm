@@ -19,6 +19,6 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["index.ts", "src/**/*.ts", "scripts/live-provider-acceptance.ts"],
+  "include": ["index.ts", "src/**/*.ts", "scripts/live-provider-acceptance.ts", "scripts/live-provider-worker.ts"],
   "exclude": ["node_modules", "dist"]
 }

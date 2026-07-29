@@ -1,6 +1,6 @@
 # Live provider acceptance
 
-Phase 1 defines authority, reporting, and a fail-closed parent runner. The live suite is not implemented yet. A valid consent is consumed before the runner dynamically imports the suite seam, which currently fails with `SUITE_NOT_IMPLEMENTED`. No provider call should occur in this phase.
+The live suite is an operator-authorized, one-shot campaign against exactly two configured Pi routes. The normal test suite never constructs a live runtime or calls a provider. The campaign runs each route in a separate child process and publishes only a canonical numeric/allowlisted report.
 
 ## Invocation
 
@@ -8,64 +8,60 @@ Phase 1 defines authority, reporting, and a fail-closed parent runner. The live 
 bun run acceptance:live --consent /absolute/path/consent.json --output /absolute/path/report.json
 ```
 
-Arguments are exact. Extra, reordered, missing, or same-path arguments are rejected. Invalid authority is rejected before any suite or provider-capable module import. A report is published only after a suite returns a valid report within the consumed authority.
+Arguments are exact. Extra, reordered, missing, or same-path arguments are rejected. Invalid authority is rejected before the provider-capable suite is dynamically imported. The inherited environment is passed unchanged to route children; the runner never reads or prints credential values.
 
 ## Consent contract
 
 Consent is canonical JSON: UTF-8, no whitespace outside JSON strings, object keys sorted recursively, no duplicate keys. Maximum size: 64 KiB. The file must be a current-user-owned regular file, exact mode `0600`, one link, and opened without following symlinks.
 
-Exact top-level fields:
+Exact identity fields:
 
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `0be38bf0ffe26c9e5affc9071bcc0c415c2f63073a0ff0d04beca92bd43de514`
-- `fixtureDigest`: `c116e7ff4037956b274a3c5e102759db5a35eb69b4b550451e5756e21b643480`
-- `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry must follow issuance
+- `suiteDigest`: `48e7f07469559942c1a38dbe91e96c36be590a840cddd7cb09793036727a59fb`
+- `fixtureDigest`: `bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434`
+- `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
 - `routes`: exactly two `{ provider, model, apiFamily }` objects
 - `bounds`: the five authority limits below
 
-Routes must have distinct provider/model identities, distinct providers, and distinct expected API families. `apiFamily` is the exact value discovery must confirm. Route aliases are prohibited in consent. Provider, model, and API-family values are bounded identifiers, not URLs or headers.
+Routes require distinct provider/model identities, distinct providers, and distinct expected API families. `apiFamily` is confirmed through exact model discovery. Route aliases are prohibited in consent. Do not put credentials, prompts, responses, errors, environment values, headers, or URLs in consent.
 
 Bounds:
 
 - `maxInvocations`: 1 to 10,000
 - `maxOutputTokensPerInvocation`: 1 to 1,000,000
-- `maxAggregateTokens`: 1 to 100,000,000 and not below the per-invocation output limit
+- `maxAggregateTokens`: 1 to 100,000,000
 - `maxWallTimeMs`: 1 to 86,400,000
 - `maxPiCatalogEstimateUsd`: 0 to 10,000
 
-Construct the JSON offline, canonicalize it with a trusted local tool, and set mode `0600` before invocation. Do not put credentials, prompts, responses, errors, environment values, headers, or URLs in consent.
+The fixed two-route plan currently requires at least 62 invocations, 1,024 output tokens per invocation, 413,282 estimated aggregate tokens, and 1,650,000 ms wall time. Use a deliberate catalog-estimate ceiling appropriate for the selected routes. The catalog estimate is post-reported from Pi usage metadata, not an actual or billed-cost guarantee.
 
-The runner validates file identity before and after its bounded read, validates time/commit/digests, then atomically renames the authority away from its original path before suite loading. Callback failure and process crash after rename consume authority. A normal callback completion or failure removes the renamed file; a crash can leave a hidden consumed file for the operator to delete securely. Never reuse or copy a nonce-bearing consent.
+Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
 
-## Report contract
+## Fixed campaign
 
-Maximum canonical JSON size: 256 KiB. Publication is a same-directory, atomic no-clobber link from a synced exact-mode `0600` temporary file. Existing output is never replaced.
+Each route runs the same committed fixtures: exact direct nonce; public `AgentSession` `/rlm` extension path; structured leaf; ordered four-item batch at observed concurrency two; one child recurse with one live leaf; provider-backed fallback extraction after deterministic controller exhaustion; low-cap truncation; in-flight cancellation after a Pi stream start; isolated invalid-runtime-key provider error; controller repair accounting; and one 192 KiB direct/RLM long-context pair.
 
-Reports contain only:
+The long-context threshold is one fixed campaign, not a statistical or p95 claim:
 
-- fixed version and allowlisted result/cancellation codes
-- git, suite, fixture, and route digests
-- `route-1` and `route-2` aliases
-- bounded finite numeric timestamps, durations, counts, token usage, and estimates
+- exact correctness: 100%
+- RLM attempts: at most 12
+- token ratio: at most 6x direct
+- Pi catalog-estimate ratio: at most 6x direct
+- wall-latency ratio: at most 8x direct
+- RLM wall time: at most 180 seconds
+- full-source sentinel: present in the direct request and absent from every RLM provider request
 
-All other keys are rejected. In particular, provider/model names, prompts, source, raw errors, environment values, headers, URLs, actual cost, and billed cost are prohibited. Callers supply secret canaries to both report validation and publication; any canary match rejects publication.
+The child enforces fixed per-case and route invocation/output caps before calls. Every non-cancel runtime case reconciles observed completion boundaries, journal intents/settlements, and ledger attempts/usage. Cancellation may report `unknown_after_cancel`; unsettled provider work is never represented as zero usage.
 
-Cost is named `piCatalogEstimateUsd`. It is only an estimate from Pi's model catalog, never actual or billed cost. Invocation/token/cost totals must reconcile with both route records. Cancellation usage is one of:
+## Containment and report
 
-- `{ "status": "not_cancelled" }`
-- `{ "status": "known", "aggregateTokens": N }`
-- `{ "status": "unknown_after_cancel" }`
+The parent expands and verifies the full plan before spawning. Route children run serially with the current Bun executable, inherited environment, private `0700` roots, private canonical request/report files, bounded silent stdout/stderr drains, wall timeout, kill/reap, strict route binding, and cleanup in `finally`. Any child stdout or stderr byte fails the campaign and is discarded.
 
-Unsettled provider work must use `unknown_after_cancel`; it must not be represented as zero.
+The final report is at most 256 KiB, canonical JSON, and published as a same-directory atomic no-clobber `0600` file. It contains only fixed versions, aliases, digests, allowlisted case/code/verdict/usage-completeness values, booleans for committed thresholds, and bounded finite numeric accounting. Per-case records include calls, intents, settlements, attempts, tokens, Pi catalog estimate, provider/wall duration, output bytes, correctness ppm, concurrency, and source-sentinel hits. Provider/model names, prompts, source, raw outputs, errors, paths, URLs, headers, environment values, actual cost, and billed cost are rejected. Supplied secret canaries are checked against child and final canonical reports.
 
-## Security limits
+## CI policy
 
-- Phase 1 does not implement provider discovery, calls, cancellation, scenarios, or credential loading.
-- Post-run accounting validation detects excess but cannot undo provider work. Phase 2 orchestration must enforce bounds before and during calls.
-- Filesystem checks reduce symlink, mode, owner, size, and replacement risk on local POSIX filesystems. Do not place consent or output on network, shared, or filesystem implementations with weak rename/link semantics.
-- Consent contains route metadata and authority. Keep it private even though credentials are forbidden.
-- The runner emits only typed failure codes. It never prints consent or arbitrary provider errors.
-- The manual GitHub workflow intentionally fails closed. CI has no secure one-shot `0600` consent provisioning mechanism yet and does not pretend to run the suite. Do not add provider credentials until protected provisioning and environment approval are designed and reviewed.
+The manual workflow remains fail closed because CI cannot securely provision a current-user `0600` one-shot consent. It has no push, pull-request, or scheduled trigger and starts no provider-capable process. Do not add provider credentials until protected provisioning and environment approval exist.
