@@ -39,6 +39,10 @@ const within = async <T>(promise: Promise<T>, timeoutMs = 250): Promise<T> => {
   }
 };
 
+const waitUntil = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => within((async () => {
+  while (!predicate()) await new Promise((resolve) => setTimeout(resolve, 5));
+})(), timeoutMs);
+
 const brokerState = async (model: ModelClient, runId: string, clock: Clock = systemClock): Promise<RunState> => {
   const normalized = normalizeProgram({
     objective: "broker error boundary",
@@ -247,7 +251,7 @@ describe("dispatchCall cancellation ownership", () => {
     expect(retentionAcquisitions).toBe(0);
 
     rejectStuck(new Error("late model rejection"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitUntil(() => state.inflight.size === 0);
     expect(state.inflight.size).toBe(0);
     expect(state.callCache.size).toBe(0);
     expect(state.ledger.current.usage.activeLeafCalls).toBe(0);
