@@ -76,8 +76,9 @@ const mapMessage = (message: AssistantMessage, provider: string, model: string, 
       const textParts = message.content.filter(
         (part): part is { type: "text"; text: string } => part.type === "text",
       );
-      if (textParts.length === 0) return fail("MISSING_TEXT", `no text returned by ${provider}/${model}`);
-      return { text: textParts.map((part) => part.text).join(""), usage };
+      const text = textParts.map((part) => part.text).join("");
+      if (text.trim().length === 0) return fail("MISSING_TEXT", `no text returned by ${provider}/${model}`);
+      return { text, usage };
     }
   }
 };

@@ -107,6 +107,16 @@ const cases: readonly AdapterCase[] = [
     fixture: { stopReason: "stop", content: [{ type: "thinking", thinking: "no answer" }] },
     code: "MISSING_TEXT",
   },
+  {
+    name: "rejects stop with an empty text part",
+    fixture: { stopReason: "stop", content: [{ type: "text", text: "" }] },
+    code: "MISSING_TEXT",
+  },
+  {
+    name: "rejects stop with only whitespace across text parts",
+    fixture: { stopReason: "stop", content: [{ type: "text", text: " \n" }, { type: "text", text: "\t" }] },
+    code: "MISSING_TEXT",
+  },
 ];
 
 describe("PiModelClient stop reasons", () => {
