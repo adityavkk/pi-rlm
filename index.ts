@@ -25,6 +25,8 @@ import {
 import {
   DEFAULT_PROFILE,
   ModelController,
+  ModelExtractor,
+  type Extractor,
   type LaunchAuthorizationMode,
   type Profile,
   preflightRunComponents,
@@ -255,6 +257,8 @@ export interface RlmRuntimeDependencies {
   readonly createBackend?: () => InterpreterBackend | Promise<InterpreterBackend>;
   readonly createModel?: (profile: Profile) => ModelClient | Promise<ModelClient>;
   readonly createController?: (model: ModelClient, profile: Profile) => ControllerDriver;
+  /** Return undefined only when a host intentionally disables provider fallback extraction. */
+  readonly createExtractor?: (model: ModelClient, profile: Profile) => Extractor | undefined;
   /** Custom directories retain the legacy caller-owned lifecycle and are never swept. */
   readonly createRunDirectory?: () => Promise<string>;
   readonly createRunNonce?: () => string;
@@ -299,10 +303,13 @@ const executeRun = async (
   throwIfAborted(signal);
   const controller = (dependencies.createController ??
     ((client, selectedProfile) => new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
+  const extractor = (dependencies.createExtractor ??
+    ((_client, selectedProfile) => new ModelExtractor({ model: selectedProfile.models.medium })))(model, profile);
   preflightRunComponents({
     backend,
     model,
     controller,
+    ...(extractor ? { extractor } : {}),
     ...(preparedAgentDelegation ? { agentDelegation: preparedAgentDelegation } : {}),
   });
   requireCoordinatorMutation(ownership.setPhase("allocating"), "allocation");
@@ -320,6 +327,7 @@ const executeRun = async (
       throwIfAborted(signal);
       const result = await runProgram({
         program: request.program, sources: request.sources, controller, model, backend, dir, profile, signal,
+        ...(extractor ? { extractor } : {}),
         authorizationMode, createRunNonce: dependencies.createRunNonce,
         onProgress: ownership.observe,
         onProgressSource: ownership.attachProgress,
@@ -356,6 +364,7 @@ const executeRun = async (
     throwIfAborted(signal);
     result = await runProgram({
       program: request.program, sources: request.sources, controller, model, backend, dir: lease.dir, profile, signal,
+      ...(extractor ? { extractor } : {}),
       authorizationMode,
       createRunNonce: dependencies.createRunNonce,
       onProgress: ownership.observe,
@@ -998,6 +1007,10 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         ?? ((client: ModelClient, selectedProfile: Profile) =>
           new ModelController(client, { model: selectedProfile.models.large })))(model, profile);
       if (!current()) return;
+      const extractor = (dependencies.runtime?.createExtractor
+        ?? ((_client: ModelClient, selectedProfile: Profile) =>
+          new ModelExtractor({ model: selectedProfile.models.medium })))(model, profile);
+      if (!current()) return;
       const agentDelegation = candidate.agentDelegationRequired ? extensionAgentDelegation(
         ctx,
         sessionId,
@@ -1015,13 +1028,16 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
         },
         dependencies.runtime?.agentPolicy,
       ) : undefined;
-      preflightRunComponents({ backend, model, controller, ...(agentDelegation ? {
-        agentDelegation: prepareAgentDelegation(agentDelegation)!,
-      } : {}) });
+      preflightRunComponents({
+        backend, model, controller,
+        ...(extractor ? { extractor } : {}),
+        ...(agentDelegation ? { agentDelegation: prepareAgentDelegation(agentDelegation)! } : {}),
+      });
       const resumeInput = {
         controller,
         model,
         backend,
+        ...(extractor ? { extractor } : {}),
         signal: ownership.signal,
         onProgress: ownership.observe,
         onProgressSource: ownership.attachProgress,
