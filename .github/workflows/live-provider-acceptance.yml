@@ -1,0 +1,24 @@
+name: Live provider acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      consent_provisioned:
+        description: "Reserved for a future secure one-shot consent provisioning mechanism"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  fail-closed-until-secure-consent-provisioning-exists:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse live execution
+        shell: bash
+        run: |
+          echo "Live acceptance disabled: CI cannot yet construct and consume a current-user 0600 one-shot consent safely."
+          echo "No provider credentials or provider-capable process was started."
+          exit 1

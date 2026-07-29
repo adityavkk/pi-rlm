@@ -42,6 +42,7 @@
     "test:runtime": "bun test src/runtime",
     "smoke:packed": "bash scripts/smoke-packed-install.sh",
     "test:smoke-isolation": "bash scripts/test-smoke-packed-install-isolation.sh",
+    "acceptance:live": "bun scripts/live-provider-acceptance.ts",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
