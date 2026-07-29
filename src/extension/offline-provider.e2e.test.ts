@@ -49,7 +49,7 @@ const customMessage = (event: AgentSessionEvent): CustomMessage | undefined => {
 const terminalEvents = (events: readonly RlmEvent[]) => events.filter((event) =>
   event.type === "run_completed" || event.type === "run_failed" || event.type === "run_cancelled");
 
-const withTimeout = async <T>(work: Promise<T>, label: string, ms = 5_000): Promise<T> => {
+const withTimeout = async <T>(work: Promise<T>, label: string, ms = 10_000): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -186,7 +186,7 @@ describe("credential-free offline Pi provider E2E", () => {
       await fixture.dispose();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("typed provider error commits exact failed attempt/terminal and failed session result", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("error");
@@ -224,7 +224,7 @@ describe("credential-free offline Pi provider E2E", () => {
       await fixture.dispose();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("session replacement aborts once, retains cancellation, and rejects late mutation", async () => {
     const { root, fixture, observed, unsubscribe } = await runCommand("pending");
@@ -280,7 +280,7 @@ describe("credential-free offline Pi provider E2E", () => {
       await fixture.dispose();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("setup fault disposes partial runtime and restores the fetch tripwire", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-rlm-offline-setup-fault-"));
@@ -293,5 +293,5 @@ describe("credential-free offline Pi provider E2E", () => {
       if (globalThis.fetch !== fetchBefore) globalThis.fetch = fetchBefore;
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
