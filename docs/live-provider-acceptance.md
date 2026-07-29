@@ -62,6 +62,10 @@ The parent expands and verifies the full plan before spawning. Route children ru
 
 The final report is at most 256 KiB, canonical JSON, and published as a same-directory atomic no-clobber `0600` file. It contains only fixed versions, aliases, digests, allowlisted case/code/verdict/usage-completeness values, booleans for committed thresholds, and bounded finite numeric accounting. Per-case records include calls, intents, settlements, attempts, tokens, Pi catalog estimate, provider/wall duration, output bytes, correctness ppm, concurrency, and source-sentinel hits. Provider/model names, prompts, source, raw outputs, errors, paths, URLs, headers, environment values, actual cost, and billed cost are rejected. Supplied secret canaries are checked against child and final canonical reports.
 
+## Accepted evidence
+
+Commit `d7dd195` passed both exact routes in one contained campaign. The report records 34 Pi completion boundaries, 62,209 settled reported tokens, a $0.2771525 Pi catalog estimate, one observed HTTP 4xx provider response per route, explicit cancellation usage `unknown_after_cancel`, and every benchmark threshold as true. See [`evidence/live-provider-acceptance-d7dd195.json`](evidence/live-provider-acceptance-d7dd195.json).
+
 ## CI policy
 
 The manual workflow remains fail closed because CI cannot securely provision a current-user `0600` one-shot consent. It has no push, pull-request, or scheduled trigger and starts no provider-capable process. Do not add provider credentials until protected provisioning and environment approval exist.
