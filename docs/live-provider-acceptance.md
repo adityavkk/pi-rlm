@@ -19,7 +19,7 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `263ba204ed4e7f643e09f3b6f25081c6776f185ec97e032d1df6809a25dbd228`
+- `suiteDigest`: `a4536fe491b2eabb72eb249eabdd97b2d6d8a60b992ea7636da4d142bca4ba86`
 - `fixtureDigest`: `bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
@@ -54,7 +54,7 @@ The long-context threshold is one fixed campaign, not a statistical or p95 claim
 - RLM wall time: at most 180 seconds
 - full-source sentinel: present in the direct request and absent from every RLM provider request
 
-The child enforces fixed per-case and route invocation/output caps before calls. Every non-cancel runtime case reconciles observed completion boundaries, journal intents/settlements, and ledger attempts/usage. Cancellation may report `unknown_after_cancel`; unsettled provider work is never represented as zero usage.
+The child enforces fixed per-case and route invocation/output caps before calls. If a provider reports more output than requested, `PiModelClient` fails the call as `OUTPUT_TRUNCATED`, charges the reported usage, and the truncation case records the bounded overshoot rather than accepting the text. Every non-cancel runtime case reconciles observed completion boundaries, journal intents/settlements, and ledger attempts/usage. Cancellation may report `unknown_after_cancel`; unsettled provider work is never represented as zero usage.
 
 ## Containment and report
 

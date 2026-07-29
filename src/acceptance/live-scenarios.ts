@@ -82,6 +82,9 @@ const providerErrorScenario = async (
 export const generateLiveLongSource = (): string => {
   const size = LIVE_FIXTURE_DESCRIPTOR.longSourceBytes;
   const bytes = Buffer.alloc(size, 0x78);
+  // Keep every synthetic line well below ContextStore's line bound. The fixed
+  // markers below remain isolated without making the source provider-visible.
+  for (let offset = 255; offset < bytes.length; offset += 256) bytes[offset] = 0x0a;
   const lines = [
     `\nBENCHMARK_TARGET_FIRST=${LIVE_FIXTURE_DESCRIPTOR.longNeedles[0]}\n`,
     `\n${LIVE_FIXTURE_DESCRIPTOR.longSourceSentinel}\n`,

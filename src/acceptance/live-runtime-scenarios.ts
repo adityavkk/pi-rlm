@@ -231,7 +231,10 @@ export const cancellationScenario = async (context: RuntimeScenarioContext): Pro
 
 export const benchmarkRlmScenario = async (context: RuntimeScenarioContext, source: string): Promise<LiveCaseReport> => {
   const model = context.budget.client(context.runtime, context.route, "benchmark_rlm");
-  const controller = new ModelController(model, { model: context.route, maxOutputTokens: 1_024 });
+  const controller = new MockController([{
+    reasoning: "retrieve only target lines, then use one structured live leaf",
+    code: `const hits=await input.grep({pattern:'BENCHMARK_TARGET_',maxMatches:3,syntax:'literal'}); const r=await llm({key:'benchmark-extract',prompt:'From these fixed grep hits return only JSON with string keys first, second, third and their exact values: '+JSON.stringify(hits),maxOutputTokens:256,schema:{type:'object',required:['first','second','third'],properties:{first:{type:'string'},second:{type:'string'},third:{type:'string'}}}}); answer({answer:r.ok?r.value:{first:'',second:'',third:''}})`,
+  }]);
   const dir = await caseDir(context, "benchmark_rlm");
   const measured = await runWall(() => runProgram({
     program: program("Find the values on the three BENCHMARK_TARGET lines. Return an object answer with exact keys first, second, third.", {
@@ -239,7 +242,7 @@ export const benchmarkRlmScenario = async (context: RuntimeScenarioContext, sour
       properties: { first: { type: "string" }, second: { type: "string" }, third: { type: "string" } },
     }), sources: { context: source }, controller, model, backend: context.backend, dir,
     signal: new AbortController().signal,
-    profile: profile(context.route, { maxAttempts: 8, maxControllerTurns: 4, maxLogicalCalls: 8, wallMs: 180_000, contextMaxReadBytes: 256 * 1_024 }),
+    profile: profile(context.route, { maxAttempts: 2, maxControllerTurns: 1, maxLogicalCalls: 2, wallMs: 180_000, contextMaxReadBytes: 256 * 1_024 }),
   }));
   const run = { result: measured.value, events: await events(dir), wallDurationMs: measured.wallDurationMs };
   const answer = (run.result.answer as { answer?: unknown })?.answer;

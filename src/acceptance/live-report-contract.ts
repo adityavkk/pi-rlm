@@ -161,9 +161,11 @@ const parseCase = (value: JsonValue, index: number): LiveCaseReport => {
     liveFail(`${label} code and verdict do not reconcile`);
   if (parsed.aggregateTokens < parsed.inputTokens + parsed.outputTokens) liveFail(`${label} token accounting does not reconcile`);
   const descriptor = LIVE_CASE_DESCRIPTORS[index]!;
+  const reportedOutputLimit = descriptor.maxReportedOutputTokens
+    ?? parsed.invocations * descriptor.maxOutputTokens;
   if (parsed.invocations > descriptor.maxInvocations || parsed.attempts > descriptor.maxInvocations
     || parsed.intents > descriptor.maxInvocations || parsed.settlements > descriptor.maxInvocations
-    || parsed.outputTokens > parsed.invocations * descriptor.maxOutputTokens
+    || parsed.outputTokens > reportedOutputLimit
     || parsed.wallDurationMs > descriptor.maxWallTimeMs
     || parsed.maxConcurrency > (descriptor.maxInvocations === 0 ? 0 : 2)
     || parsed.sourceSentinelHits > LIVE_FIXTURE_SENTINELS)

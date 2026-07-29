@@ -140,6 +140,17 @@ export class PiModelClient implements ModelClient {
       );
     }
 
-    return mapMessage(message, provider, model, elapsedMs(startedMs, this.clock.now()));
+    const durationMs = elapsedMs(startedMs, this.clock.now());
+    if (request.maxOutputTokens !== undefined && message.usage.output > request.maxOutputTokens) {
+      throw new PiModelError(
+        "OUTPUT_TRUNCATED",
+        message.stopReason,
+        provider,
+        model,
+        mapUsage(message, durationMs),
+        `reported output exceeded the requested cap for ${provider}/${model}`,
+      );
+    }
+    return mapMessage(message, provider, model, durationMs);
   }
 }

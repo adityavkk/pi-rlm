@@ -134,6 +134,16 @@ describe("PiModelClient stop reasons", () => {
     }
   });
 
+  test("fails closed when reported output exceeds the requested cap", async () => {
+    const completion = clientFor({ stopReason: "stop", content: [{ type: "text", text: "nonempty" }] })
+      .complete({ prompt: "test", maxOutputTokens: 1 });
+    await expect(completion).rejects.toMatchObject({
+      code: "OUTPUT_TRUNCATED",
+      stopReason: "stop",
+      usage: EXPECTED_USAGE,
+    });
+  });
+
   test("sanitizes ordinary runtime rejection and includes elapsed duration", async () => {
     const clock = new ManualClock();
     const runtime = {

@@ -7,6 +7,7 @@ import {
 import { createRlmExtension } from "../../index.ts";
 import type { RlmEvent } from "../core/journal.ts";
 import { JournalStore } from "../shell/journal-store.ts";
+import { ModelController } from "../runtime/model-controller.ts";
 import { DEFAULT_PROFILE, type Profile } from "../runtime/profile.ts";
 import type { RuntimeScenarioContext } from "./live-runtime-scenarios.ts";
 import { caseReport, runWall } from "./live-scenario-support.ts";
@@ -55,8 +56,8 @@ export const extensionScenario = async (context: RuntimeScenarioContext): Promis
     };
   }
   const selectedProfile: Profile = {
-    ...DEFAULT_PROFILE, name: "live-extension", maxDepth: 1, maxFrames: 1, maxLogicalCalls: 1,
-    maxAttempts: 2, maxControllerTurns: 1, maxConcurrency: 1, tokenLimit: 20_000,
+    ...DEFAULT_PROFILE, name: "live-extension", maxDepth: 1, maxFrames: 1, maxLogicalCalls: 2,
+    maxAttempts: 2, maxControllerTurns: 2, maxConcurrency: 1, tokenLimit: 20_000,
     wallMs: 90_000, cellWallMs: 15_000,
     models: { small: context.route, medium: context.route, large: context.route },
   };
@@ -65,6 +66,7 @@ export const extensionScenario = async (context: RuntimeScenarioContext): Promis
       resolveProfile: () => selectedProfile,
       createBackend: () => context.backend,
       createModel: () => context.budget.client(context.runtime, context.route, "extension"),
+      createController: (client) => new ModelController(client, { model: context.route, maxOutputTokens: 1_024 }),
       createExtractor: () => undefined,
       runRetention: { root: runRoot },
     },
@@ -92,6 +94,8 @@ export const extensionScenario = async (context: RuntimeScenarioContext): Promis
     const content = customContent(observed);
     let projection: Projection | undefined;
     try { projection = content ? JSON.parse(content) as Projection : undefined; } catch { /* fixed failure below */ }
+    if (projection?.status !== "completed" && typeof (projection as { errorCode?: unknown } | undefined)?.errorCode === "string")
+      throw new Error(`extension result ${(projection as { errorCode: string }).errorCode}`);
     const dir = await findRun(runRoot);
     const read = await new JournalStore(dir).readEvents();
     const journal = read.ok ? read.value : [];

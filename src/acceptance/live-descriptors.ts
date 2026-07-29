@@ -15,6 +15,8 @@ export interface LiveCaseDescriptor {
   readonly maxOutputTokens: number;
   readonly estimatedInputTokens: number;
   readonly maxWallTimeMs: number;
+  /** Higher only when the case must observe and reject a provider cap violation. */
+  readonly maxReportedOutputTokens?: number;
 }
 
 /** Fixed one-campaign plan. Invocation maxima include schema/controller repair attempts. */
@@ -26,7 +28,7 @@ export const LIVE_CASE_DESCRIPTORS: readonly LiveCaseDescriptor[] = [
   { id: "batch", maxInvocations: 8, maxOutputTokens: 64, estimatedInputTokens: 1_024, maxWallTimeMs: 60_000 },
   { id: "recurse", maxInvocations: 2, maxOutputTokens: 128, estimatedInputTokens: 1_024, maxWallTimeMs: 45_000 },
   { id: "fallback", maxInvocations: 2, maxOutputTokens: 512, estimatedInputTokens: 4_096, maxWallTimeMs: 60_000 },
-  { id: "truncation", maxInvocations: 1, maxOutputTokens: 1, estimatedInputTokens: 256, maxWallTimeMs: 45_000 },
+  { id: "truncation", maxInvocations: 1, maxOutputTokens: 1, estimatedInputTokens: 256, maxWallTimeMs: 45_000, maxReportedOutputTokens: 8_192 },
   { id: "cancellation", maxInvocations: 1, maxOutputTokens: 64, estimatedInputTokens: 256, maxWallTimeMs: 45_000 },
   { id: "provider_error", maxInvocations: 1, maxOutputTokens: 16, estimatedInputTokens: 256, maxWallTimeMs: 45_000 },
   { id: "retry", maxInvocations: 2, maxOutputTokens: 512, estimatedInputTokens: 4_096, maxWallTimeMs: 60_000 },
@@ -68,7 +70,7 @@ export const LIVE_REPORT_CANARIES = [
 export const liveSuiteDescriptor = (): JsonValue => ({
   version: 1,
   authorityContractVersion: 1,
-  scenarioImplementationVersion: 1,
+  scenarioImplementationVersion: 3,
   cases: LIVE_CASE_DESCRIPTORS as unknown as JsonValue,
   thresholds: LIVE_BENCHMARK_THRESHOLDS as unknown as JsonValue,
 });
