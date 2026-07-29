@@ -94,6 +94,16 @@ pi install npm:pi-subagents@0.36.0
 The optional package peer provides public protocol types but does not activate
 that extension. See [agent delegation](docs/agent-delegation.md).
 
+## TUI walkthrough
+
+pi-rlm runs inside the normal Pi interface and keeps the active theme, model
+profile, skills, prompts, and other extensions.
+
+![Active pi-rlm run inside a full themed Pi session](docs/images/tui-user-journey/01-running.png)
+
+See the [complete TUI user journey](docs/tui-user-journey.md) for completion,
+cancellation, retained-run navigation, inspection, and exact agent approval.
+
 ## Usage
 
 Start a run explicitly. pi-rlm never escalates an ordinary task on its own.
