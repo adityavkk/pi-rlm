@@ -64,7 +64,7 @@ The final report is at most 256 KiB, canonical JSON, and published as a same-dir
 
 ## Accepted evidence
 
-Commit `d7dd195` passed both exact routes in one contained campaign. The report records 34 Pi completion boundaries, 62,209 settled reported tokens, a $0.2771525 Pi catalog estimate, one observed HTTP 4xx provider response per route, explicit cancellation usage `unknown_after_cancel`, and every benchmark threshold as true. See [`evidence/live-provider-acceptance-d7dd195.json`](evidence/live-provider-acceptance-d7dd195.json).
+Commit `5594641` passed both exact routes in one contained campaign. The report records 34 Pi completion boundaries, 62,234 settled reported tokens, a $0.219819 Pi catalog estimate, one observed HTTP 4xx provider response per route, explicit cancellation usage `unknown_after_cancel`, and every benchmark threshold as true. See [`evidence/live-provider-acceptance-5594641.json`](evidence/live-provider-acceptance-5594641.json).
 
 ## CI policy
 

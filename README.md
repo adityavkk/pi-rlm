@@ -40,17 +40,17 @@ What works and is tested offline with no provider credentials:
 
 Live provider evidence:
 
-- Commit `d7dd195` passed the one-shot campaign on two distinct configured
+- Commit `5594641` passed the one-shot campaign on two distinct configured
   OpenAI Codex model routes through Pi 0.80.10.
 - Both routes passed direct completion, the public `AgentSession` `/rlm` path,
   structured output, ordered batch concurrency, recursion, provider fallback,
   truncation, cancellation, provider failure, retry accounting, containment,
   and a 192 KiB direct-versus-RLM comparison.
-- The campaign made 34 observed Pi completions and reconciled 62,209 settled,
-  reported tokens. Pi's catalog estimate was $0.2771525. Cancellation usage
+- The campaign made 34 observed Pi completions and reconciled 62,234 settled,
+  reported tokens. Pi's catalog estimate was $0.219819. Cancellation usage
   after abort remains unknown, and the estimate is not a billed-cost claim.
 - The canonical numeric report is
-  [`docs/evidence/live-provider-acceptance-d7dd195.json`](docs/evidence/live-provider-acceptance-d7dd195.json).
+  [`docs/evidence/live-provider-acceptance-5594641.json`](docs/evidence/live-provider-acceptance-5594641.json).
   It contains aliases, hashes, allowlisted outcomes, and numbers only.
 
 The current evidence uses two models on one provider and one API family. It
