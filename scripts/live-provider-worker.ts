@@ -29,7 +29,11 @@ const readPrivateRequest = async (path: string): Promise<LiveWorkerRequest> => {
       if (read.bytesRead === 0) break;
       offset += read.bytesRead;
     }
-    if (offset !== Number(stat.size)) throw new Error("request changed while read");
+    const after = await handle.stat({ bigint: true });
+    if (offset !== Number(stat.size) || after.dev !== stat.dev || after.ino !== stat.ino
+      || after.size !== stat.size || after.mode !== stat.mode || after.uid !== stat.uid || after.gid !== stat.gid
+      || after.nlink !== stat.nlink || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs)
+      throw new Error("request changed while read");
     return parseLiveWorkerRequestText(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset)));
   } finally { await handle.close(); }
 };

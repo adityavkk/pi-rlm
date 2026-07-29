@@ -1,6 +1,6 @@
 # Version 0.1.0 source release
 
-Version 0.1.0 is published as a signed Git tag and a GitHub release. GitHub provides the source archives. The release does not publish an npm package or a separate compiled artifact.
+Version 0.1.0 is published as an annotated Git tag and a GitHub release. GitHub provides the source archives. The release does not publish an npm package or a separate compiled artifact.
 
 Install the exact source tag through Pi. The tag includes `package-lock.json`, and every runtime dependency uses an exact version. Pi's npm install step therefore resolves the same runtime graph on later installs.
 
@@ -44,7 +44,7 @@ Pi extensions run with the user's system access. QuickJS limits controller cells
 
 Managed run state can contain objectives, source fragments, model reasoning, progress text, and answer previews. The runtime stores it in private user-owned directories. Do not upload these directories with logs, diagnostics, bug reports, or CI artifacts. Retention deletes files but does not provide secure erasure.
 
-The live acceptance parent gives each route a private temporary home. It copies only that route's stored credential and forwards a fixed environment allowlist. It removes the complete route tree after the child exits. The runner verifies the exact source commit and the installed dependency bytes at every provider boundary.
+The live acceptance parent gives each route a private temporary home. It copies only that route's stored credential and forwards a fixed environment allowlist that mirrors Pi 0.80.10. It removes the complete route tree after the child exits. The runner verifies the exact source commit and the installed dependency bytes at every provider boundary. File descriptor checks reject content changes during each read. Node does not provide `openat`, so a hostile process running as the same user can still race directory entries. Live acceptance therefore requires a trusted host.
 
 ## Release dispositions
 

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
+import {
+  closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, readlinkSync,
+} from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
@@ -54,8 +56,23 @@ export const liveDependencyTreeSha256 = (root = resolve(repository, "node_module
         hash.update(`d\0${normalized}\0`);
         visit(absolute);
       } else if (stat.isFile()) {
-        hash.update(`f\0${normalized}\0${stat.size}\0`);
-        hash.update(readFileSync(absolute));
+        const noFollow = constants.O_NOFOLLOW;
+        if (typeof noFollow !== "number") throw new LiveRevisionError("no-follow dependency reads are unavailable");
+        const descriptor = openSync(absolute, constants.O_RDONLY | noFollow);
+        try {
+          const before = fstatSync(descriptor, { bigint: true });
+          if (!before.isFile() || before.dev !== BigInt(stat.dev) || before.ino !== BigInt(stat.ino))
+            throw new LiveRevisionError("installed dependency path changed while opened");
+          const bytes = readFileSync(descriptor);
+          const after = fstatSync(descriptor, { bigint: true });
+          if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+            || before.mode !== after.mode || before.uid !== after.uid || before.gid !== after.gid
+            || before.nlink !== after.nlink || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
+            || BigInt(bytes.byteLength) !== after.size)
+            throw new LiveRevisionError("installed dependency changed while read");
+          hash.update(`f\0${normalized}\0${after.size}\0`);
+          hash.update(bytes);
+        } finally { closeSync(descriptor); }
       } else if (stat.isSymbolicLink()) {
         hash.update(`l\0${normalized}\0${readlinkSync(absolute)}\0`);
       } else throw new LiveRevisionError("installed dependency tree contains an unsupported entry");

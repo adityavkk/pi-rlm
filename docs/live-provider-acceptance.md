@@ -15,7 +15,7 @@ scripts/run-live-provider-acceptance.sh --consent /absolute/path/consent.json --
   --canary-file /absolute/path/canaries.json
 ```
 
-Arguments are exact. Extra, reordered, missing, or repeated paths are rejected. Use the wrapper, which removes loader injection variables and starts Bun with automatic environment files disabled and an empty config. Invalid authority is rejected before the provider-capable suite is dynamically imported. The parent gives each route a new private home and a filtered copy of only that route's stored credential. It forwards only fixed process settings, the route's documented provider variables, and environment names referenced by that credential. It rejects loader injection variables such as `NODE_OPTIONS`, `BUN_OPTIONS`, `LD_PRELOAD`, and `DYLD_*`. The runner never prints credential or canary values.
+Arguments are exact. Extra, reordered, missing, or repeated paths are rejected. Use the wrapper, which removes loader injection variables and starts Bun with automatic environment files disabled and an empty config. Invalid authority is rejected before the provider-capable suite is dynamically imported. The parent gives each route a new private home and a filtered copy of only that route's stored credential. It forwards only fixed process settings, the route variables used by Pi 0.80.10's pinned provider resolver, and environment names referenced by the API key template. OAuth token bodies and stored provider environment values are never scanned as templates. It rejects loader injection variables such as `NODE_OPTIONS`, `BUN_OPTIONS`, `LD_PRELOAD`, and `DYLD_*`. The runner never prints credential or canary values.
 
 ## Consent contract
 
@@ -26,7 +26,7 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `27d994e439d4c7a5cf658d5564c035e930abb1b1df8407c7b75775e08cfa33d5`
+- `suiteDigest`: `77c0a2e427a6d970bf7170e2bcd9e031db3434db67ed795ddaa71abfdb3e5723`
 - `fixtureDigest`: `af4c961a5d783e60f2116bb749bdef08e75c212190e3824bcb74ffd0b95405fb`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
@@ -45,7 +45,7 @@ Bounds:
 
 The fixed two-route plan currently requires at least 62 invocations, 1,024 output tokens per invocation, 413,282 estimated aggregate tokens, and 1,650,000 ms wall time. Use a deliberate catalog-estimate ceiling appropriate for the selected routes. The catalog estimate is post-reported from Pi usage metadata, not an actual or billed-cost guarantee.
 
-Run the campaign from a clean git checkout on the supported release platform with Bun 1.3.14 and the frozen lockfile. Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates Bun 1.3.14, the package repository revision, tracked-file cleanliness, exact installed dependency versions, and a byte-level digest of the complete installed dependency tree before consent, after consent, around each child, and before report publication. Each child repeats revision checks before importing scenarios and before publishing its result. The runner validates consent file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
+Run the campaign from a clean git checkout on the supported release platform with Bun 1.3.14 and the frozen lockfile. Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates Bun 1.3.14, the package repository revision, tracked-file cleanliness, exact installed dependency versions, and a byte-level digest of the complete installed dependency tree. Each private input and report uses a bounded file descriptor read with complete metadata checks before and after the read. Node cannot bind directory traversal to an `openat` capability, so a hostile process running as the same user can still race path entries. Run live acceptance only on a trusted host. The runner performs these checks before consent, after consent, around each child, and before report publication. Each child repeats revision checks before importing scenarios and before publishing its result. The runner validates consent file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
 
 ## Fixed campaign
 

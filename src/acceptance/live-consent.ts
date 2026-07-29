@@ -35,6 +35,10 @@ export class LiveConsentError extends Error {
 
 const sameFile = (left: BigIntStats, right: BigIntStats): boolean =>
   left.dev === right.dev && left.ino === right.ino;
+const sameSnapshot = (left: BigIntStats, right: BigIntStats): boolean =>
+  sameFile(left, right) && left.size === right.size && left.mode === right.mode
+  && left.uid === right.uid && left.gid === right.gid && left.nlink === right.nlink
+  && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 
 const readBounded = async (handle: FileHandle): Promise<Uint8Array> => {
   const output = new Uint8Array(MAX_LIVE_CONSENT_BYTES + 1);
@@ -99,12 +103,12 @@ export const withConsumedLiveConsent = async <T>(
     const bytes = await readBounded(handle);
     const after = await handle.stat({ bigint: true });
     validateFileStat(after, currentUid);
-    if (!sameFile(before, after) || before.size !== after.size || BigInt(bytes.byteLength) !== after.size)
+    if (!sameSnapshot(before, after) || BigInt(bytes.byteLength) !== after.size)
       throw new LiveConsentError("CONSENT_FILE_INVALID", "consent file changed while being read");
     consent = parseLiveConsentText(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     validateBindings(consent, expected);
     const source = await lstat(path, { bigint: true });
-    if (!sameFile(before, source))
+    if (!sameSnapshot(before, source))
       throw new LiveConsentError("CONSENT_FILE_INVALID", "consent path changed while being read");
   } catch (error) {
     try { await handle?.close(); } catch { /* primary refusal is authoritative */ }

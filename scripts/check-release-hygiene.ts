@@ -21,8 +21,13 @@ if (manifest.name !== "pi-rlm" || manifest.version !== "0.1.0" || manifest.priva
   fail("RELEASE_IDENTITY_INVALID");
 if (manifest.packageManager !== "bun@1.3.14" || manifest.engines?.bun !== ">=1.3.14 <2")
   fail("RELEASE_TOOLCHAIN_INVALID");
-if (process.env["GITHUB_REF_TYPE"] === "tag" && process.env["GITHUB_REF_NAME"] !== `v${manifest.version}`)
-  fail("RELEASE_TAG_INVALID");
+if (process.env["GITHUB_REF_TYPE"] === "tag") {
+  const tag = process.env["GITHUB_REF_NAME"];
+  if (tag !== `v${manifest.version}`) fail("RELEASE_TAG_INVALID");
+  if (run(["git", "cat-file", "-t", `refs/tags/${tag}`]).trim() !== "tag") fail("RELEASE_TAG_INVALID");
+  if (run(["git", "rev-parse", `refs/tags/${tag}^{}`]).trim()
+    !== run(["git", "rev-parse", "HEAD"]).trim()) fail("RELEASE_TAG_INVALID");
+}
 
 const tracked = run(["git", "ls-files", "-z"]).split("\0").filter(Boolean);
 const forbiddenPath = /(^|\/)(?:\.env(?:\.|$)|credentials\.json$|auth\.json$|\.tmp(?:\/|$)|\.rlm-runs(?:\/|$)|node_modules(?:\/|$))|\.(?:pem|key|p12|pfx|log)$/i;

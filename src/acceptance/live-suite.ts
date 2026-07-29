@@ -101,38 +101,44 @@ const defaultRunChild = async (input: LiveChildInput, workerPath?: string): Prom
   return { exitCode, stdoutBytes: await stdout, stderrBytes: await stderr, timedOut };
 };
 
+// Mirrors the pinned Pi 0.80.10 provider resolver. Provider configuration
+// values that Pi resolves separately from the primary key are included only
+// for that provider.
 const PROVIDER_ENVIRONMENT: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  anthropic: ["ANTHROPIC_API_KEY"],
+  "github-copilot": ["COPILOT_GITHUB_TOKEN"],
+  anthropic: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
   "ant-ling": ["ANT_LING_API_KEY"],
+  openai: ["OPENAI_API_KEY"],
   "azure-openai-responses": [
     "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME",
     "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
   ],
-  openai: ["OPENAI_API_KEY"],
-  "openai-codex": ["OPENAI_API_KEY"],
-  deepseek: ["DEEPSEEK_API_KEY"],
-  nvidia: ["NVIDIA_API_KEY"],
-  google: ["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_APPLICATION_CREDENTIALS"],
-  "amazon-bedrock": [
-    "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEDROCK_SKIP_AUTH", "AWS_BEDROCK_FORCE_HTTP1",
+  nvidia: ["NVIDIA_API_KEY"], deepseek: ["DEEPSEEK_API_KEY"], google: ["GEMINI_API_KEY"],
+  "google-vertex": [
+    "GOOGLE_CLOUD_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
   ],
-  mistral: ["MISTRAL_API_KEY"], groq: ["GROQ_API_KEY"], cerebras: ["CEREBRAS_API_KEY"],
-  "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
-  "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID"],
-  xai: ["XAI_API_KEY"], openrouter: ["OPENROUTER_API_KEY"],
+  groq: ["GROQ_API_KEY"], cerebras: ["CEREBRAS_API_KEY"], xai: ["XAI_API_KEY"],
+  radius: ["RADIUS_API_KEY"], openrouter: ["OPENROUTER_API_KEY"],
   "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"], zai: ["ZAI_API_KEY"],
-  "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"], opencode: ["OPENCODE_API_KEY"],
-  "opencode-go": ["OPENCODE_API_KEY"], radius: ["RADIUS_API_KEY"],
+  "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"], mistral: ["MISTRAL_API_KEY"],
+  minimax: ["MINIMAX_API_KEY"], "minimax-cn": ["MINIMAX_CN_API_KEY"],
+  moonshotai: ["MOONSHOT_API_KEY"], "moonshotai-cn": ["MOONSHOT_API_KEY"],
   huggingface: ["HF_TOKEN"], fireworks: ["FIREWORKS_API_KEY"], together: ["TOGETHER_API_KEY"],
-  "kimi-coding": ["KIMI_API_KEY"], minimax: ["MINIMAX_API_KEY"], "minimax-cn": ["MINIMAX_CN_API_KEY"],
-  "qwen-token-plan": ["QWEN_TOKEN_PLAN_API_KEY"], "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_CN_API_KEY"],
+  opencode: ["OPENCODE_API_KEY"], "opencode-go": ["OPENCODE_API_KEY"], "kimi-coding": ["KIMI_API_KEY"],
+  "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID"],
+  "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
   xiaomi: ["XIAOMI_API_KEY"], "xiaomi-token-plan-cn": ["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
   "xiaomi-token-plan-ams": ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
   "xiaomi-token-plan-sgp": ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
+  "amazon-bedrock": [
+    "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEDROCK_SKIP_AUTH", "AWS_BEDROCK_FORCE_HTTP1",
+    "AWS_BEDROCK_FORCE_CACHE",
+  ],
 });
 const BASE_WORKER_ENVIRONMENT = [
   "PATH", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ",
@@ -142,22 +148,38 @@ const BASE_WORKER_ENVIRONMENT = [
 const SAFE_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const FORBIDDEN_ENVIRONMENT_NAME = /^(?:HOME|TMPDIR|PI_CODING_AGENT_DIR|PI_CODING_AGENT_SESSION_DIR|PI_PACKAGE_DIR|PI_TELEMETRY|PI_SKIP_VERSION_CHECK|NODE_OPTIONS|BUN_OPTIONS|BUN_CONFIG_.*|BUN_RUNTIME_TRANSPILER_CACHE_PATH|LD_PRELOAD|DYLD_.*)$/;
 
-const credentialEnvironmentNames = (value: unknown): readonly string[] => {
+const configValueEnvironmentNames = (value: string): readonly string[] => {
+  if (value.startsWith("!")) return [];
   const names = new Set<string>();
-  const visit = (item: unknown): void => {
-    if (typeof item === "string") {
-      for (const match of item.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
-        const name = match[1] ?? match[2];
-        if (name && SAFE_ENVIRONMENT_NAME.test(name) && !FORBIDDEN_ENVIRONMENT_NAME.test(name)) names.add(name);
-      }
-      return;
+  let index = 0;
+  while (index < value.length) {
+    const dollar = value.indexOf("$", index);
+    if (dollar < 0) break;
+    const next = value[dollar + 1];
+    if (next === "$" || next === "!") { index = dollar + 2; continue; }
+    if (next === "{") {
+      const end = value.indexOf("}", dollar + 2);
+      if (end < 0) { index = dollar + 1; continue; }
+      const name = value.slice(dollar + 2, end);
+      if (SAFE_ENVIRONMENT_NAME.test(name) && !FORBIDDEN_ENVIRONMENT_NAME.test(name)) names.add(name);
+      index = end + 1;
+      continue;
     }
-    if (Array.isArray(item)) { for (const entry of item) visit(entry); return; }
-    if (typeof item === "object" && item !== null)
-      for (const entry of Object.values(item as Readonly<Record<string, unknown>>)) visit(entry);
-  };
-  visit(value);
-  if (names.size > 32) throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "route credential references too many variables");
+    const match = value.slice(dollar + 1).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+    if (match) {
+      if (!FORBIDDEN_ENVIRONMENT_NAME.test(match[0])) names.add(match[0]);
+      index = dollar + 1 + match[0].length;
+    } else index = dollar + 1;
+  }
+  return [...names];
+};
+
+const credentialEnvironmentNames = (value: unknown): readonly string[] => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+  const credential = value as Readonly<Record<string, unknown>>;
+  if (credential["type"] !== "api_key" || typeof credential["key"] !== "string") return [];
+  const names = configValueEnvironmentNames(credential["key"]);
+  if (names.length > 32) throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "route credential references too many variables");
   return [...names].sort();
 };
 
@@ -259,7 +281,11 @@ const secureRead = async (path: string): Promise<string> => {
       if (read.bytesRead === 0) break;
       offset += read.bytesRead;
     }
-    if (offset !== Number(stat.size)) throw new LiveSuiteError("CHILD_REPORT_INVALID", "child report changed while read");
+    const after = await handle.stat({ bigint: true });
+    if (offset !== Number(stat.size) || after.dev !== stat.dev || after.ino !== stat.ino
+      || after.size !== stat.size || after.mode !== stat.mode || after.uid !== stat.uid || after.gid !== stat.gid
+      || after.nlink !== stat.nlink || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs)
+      throw new LiveSuiteError("CHILD_REPORT_INVALID", "child report changed while read");
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset));
   } catch (error) {
     if (error instanceof LiveSuiteError) throw error;
