@@ -1,10 +1,15 @@
 {
   "name": "pi-rlm",
-  "version": "0.0.2",
+  "version": "0.1.0",
+  "private": true,
   "description": "Recursive Language Model runtime for Pi: a controller model writes bounded JavaScript cells over host-backed long context, calling models, agents, and child RLM frames.",
   "author": "Aditya Kishore",
   "license": "MIT",
   "type": "module",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "bun": ">=1.3.14 <2"
+  },
   "exports": {
     ".": "./index.ts",
     "./core": "./src/core/index.ts",
@@ -32,8 +37,12 @@
   "files": [
     "index.ts",
     "src/**/*.ts",
+    "scripts/**/*",
     "README.md",
-    "docs/**/*.md",
+    "docs/**/*",
+    "tsconfig.json",
+    "bun.lock",
+    "package-lock.json",
     "LICENSE"
   ],
   "scripts": {
@@ -42,7 +51,7 @@
     "test:runtime": "bun test src/runtime",
     "smoke:packed": "bash scripts/smoke-packed-install.sh",
     "test:smoke-isolation": "bash scripts/test-smoke-packed-install-isolation.sh",
-    "acceptance:live": "bun scripts/live-provider-acceptance.ts",
+    "release:check": "bun scripts/check-release-hygiene.ts",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
@@ -50,9 +59,12 @@
       "./index.ts"
     ]
   },
+  "overrides": {
+    "brace-expansion": "5.0.8"
+  },
   "dependencies": {
     "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
-    "acorn": "^8.14.0",
+    "acorn": "8.17.0",
     "quickjs-emscripten-core": "0.32.0"
   },
   "peerDependencies": {

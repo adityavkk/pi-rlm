@@ -6,3 +6,11 @@ dist/
 coverage/
 *.tsbuildinfo
 .rlm-runs/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json

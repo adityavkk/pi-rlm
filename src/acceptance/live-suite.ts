@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, open, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import {
   LIVE_FIXTURE_DIGEST, LIVE_SUITE_DIGEST, MAX_LIVE_REPORT_BYTES,
@@ -28,6 +28,9 @@ export interface LiveChildInput {
   readonly requestPath: string;
   readonly resultPath: string;
   readonly timeoutMs: number;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly cwd: string;
+  readonly bunConfigPath: string;
 }
 export interface LiveSuiteDependencies {
   readonly now?: () => number;
@@ -36,6 +39,8 @@ export interface LiveSuiteDependencies {
   /** Test-only contained worker replacement and tighter timeout. */
   readonly workerPath?: string;
   readonly childTimeoutMs?: number;
+  /** Test-only source environment replacement. */
+  readonly sourceEnvironment?: Readonly<Record<string, string | undefined>>;
 }
 
 export class LiveSuiteError extends Error {
@@ -69,8 +74,12 @@ const boundedDrain = async (stream: ReadableStream<Uint8Array> | null, bound = 4
 
 const defaultRunChild = async (input: LiveChildInput, workerPath?: string): Promise<LiveChildOutcome> => {
   const worker = workerPath ?? new URL("../../scripts/live-provider-worker.ts", import.meta.url).pathname;
-  const child = Bun.spawn([process.execPath, worker, "--request", input.requestPath, "--result", input.resultPath], {
-    env: process.env,
+  const child = Bun.spawn([
+    process.execPath, "--no-env-file", `--config=${input.bunConfigPath}`,
+    worker, "--request", input.requestPath, "--result", input.resultPath,
+  ], {
+    cwd: input.cwd,
+    env: input.environment,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -90,6 +99,140 @@ const defaultRunChild = async (input: LiveChildInput, workerPath?: string): Prom
   const exitCode = await child.exited;
   if (timer) clearTimeout(timer);
   return { exitCode, stdoutBytes: await stdout, stderrBytes: await stderr, timedOut };
+};
+
+const PROVIDER_ENVIRONMENT: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  anthropic: ["ANTHROPIC_API_KEY"],
+  "ant-ling": ["ANT_LING_API_KEY"],
+  "azure-openai-responses": [
+    "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME",
+    "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+  ],
+  openai: ["OPENAI_API_KEY"],
+  "openai-codex": ["OPENAI_API_KEY"],
+  deepseek: ["DEEPSEEK_API_KEY"],
+  nvidia: ["NVIDIA_API_KEY"],
+  google: ["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_APPLICATION_CREDENTIALS"],
+  "amazon-bedrock": [
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEDROCK_SKIP_AUTH", "AWS_BEDROCK_FORCE_HTTP1",
+  ],
+  mistral: ["MISTRAL_API_KEY"], groq: ["GROQ_API_KEY"], cerebras: ["CEREBRAS_API_KEY"],
+  "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
+  "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID"],
+  xai: ["XAI_API_KEY"], openrouter: ["OPENROUTER_API_KEY"],
+  "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"], zai: ["ZAI_API_KEY"],
+  "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"], opencode: ["OPENCODE_API_KEY"],
+  "opencode-go": ["OPENCODE_API_KEY"], radius: ["RADIUS_API_KEY"],
+  huggingface: ["HF_TOKEN"], fireworks: ["FIREWORKS_API_KEY"], together: ["TOGETHER_API_KEY"],
+  "kimi-coding": ["KIMI_API_KEY"], minimax: ["MINIMAX_API_KEY"], "minimax-cn": ["MINIMAX_CN_API_KEY"],
+  "qwen-token-plan": ["QWEN_TOKEN_PLAN_API_KEY"], "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_CN_API_KEY"],
+  xiaomi: ["XIAOMI_API_KEY"], "xiaomi-token-plan-cn": ["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
+  "xiaomi-token-plan-ams": ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
+  "xiaomi-token-plan-sgp": ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
+});
+const BASE_WORKER_ENVIRONMENT = [
+  "PATH", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ",
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "PI_CACHE_RETENTION",
+] as const;
+const SAFE_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const FORBIDDEN_ENVIRONMENT_NAME = /^(?:HOME|TMPDIR|PI_CODING_AGENT_DIR|PI_CODING_AGENT_SESSION_DIR|PI_PACKAGE_DIR|PI_TELEMETRY|PI_SKIP_VERSION_CHECK|NODE_OPTIONS|BUN_OPTIONS|BUN_CONFIG_.*|BUN_RUNTIME_TRANSPILER_CACHE_PATH|LD_PRELOAD|DYLD_.*)$/;
+
+const credentialEnvironmentNames = (value: unknown): readonly string[] => {
+  const names = new Set<string>();
+  const visit = (item: unknown): void => {
+    if (typeof item === "string") {
+      for (const match of item.matchAll(/\$(?:\{([A-Z_][A-Z0-9_]*)\}|([A-Z_][A-Z0-9_]*))/g)) {
+        const name = match[1] ?? match[2];
+        if (name && SAFE_ENVIRONMENT_NAME.test(name) && !FORBIDDEN_ENVIRONMENT_NAME.test(name)) names.add(name);
+      }
+      return;
+    }
+    if (Array.isArray(item)) { for (const entry of item) visit(entry); return; }
+    if (typeof item === "object" && item !== null)
+      for (const entry of Object.values(item as Readonly<Record<string, unknown>>)) visit(entry);
+  };
+  visit(value);
+  if (names.size > 32) throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "route credential references too many variables");
+  return [...names].sort();
+};
+
+const readRouteCredential = async (
+  provider: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): Promise<unknown | undefined> => {
+  const agentDir = environment["PI_CODING_AGENT_DIR"]
+    ? resolve(environment["PI_CODING_AGENT_DIR"]!)
+    : environment["HOME"] ? join(resolve(environment["HOME"]!), ".pi", "agent") : undefined;
+  if (!agentDir) return undefined;
+  const noFollow = constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number") throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "no-follow auth reads are unavailable");
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(join(agentDir, "auth.json"), constants.O_RDONLY | noFollow);
+    const stat = await handle.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!stat.isFile() || stat.nlink !== 1n || (Number(stat.mode) & 0o7777) !== 0o600
+      || uid === undefined || stat.uid !== BigInt(uid) || stat.size > 1024n * 1024n)
+      throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "source auth metadata is invalid");
+    const bytes = new Uint8Array(Number(stat.size) + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await handle.read(bytes, offset, bytes.length - offset, null);
+      if (read.bytesRead === 0) break;
+      offset += read.bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (offset !== Number(stat.size) || after.dev !== stat.dev || after.ino !== stat.ino
+      || after.size !== stat.size || after.mode !== stat.mode || after.uid !== stat.uid || after.nlink !== stat.nlink
+      || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs)
+      throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "source auth changed while read");
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset));
+    const parsed = JSON.parse(text) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "source auth data is invalid");
+    return Object.prototype.hasOwnProperty.call(parsed, provider)
+      ? (parsed as Readonly<Record<string, unknown>>)[provider] : undefined;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error
+      ? (error as { readonly code?: unknown }).code : undefined;
+    if (code === "ENOENT") return undefined;
+    if (error instanceof LiveSuiteError) throw error;
+    throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "source auth could not be filtered");
+  } finally { await handle?.close().catch(() => {}); }
+};
+
+const routeWorkerEnvironment = async (
+  root: string,
+  index: number,
+  provider: string,
+  source: Readonly<Record<string, string | undefined>>,
+): Promise<Readonly<Record<string, string>>> => {
+  const home = join(root, `route-${index + 1}.home`);
+  const agentDir = join(home, ".pi", "agent");
+  const temporary = join(home, "tmp");
+  for (const path of [home, join(home, ".pi"), agentDir, temporary]) await mkdir(path, { mode: 0o700 });
+  await secureWrite(join(home, "bunfig.toml"), "");
+  const credential = await readRouteCredential(provider, source);
+  if (credential !== undefined)
+    await secureWrite(join(agentDir, "auth.json"), canonicalStringify({ [provider]: credential } as JsonValue));
+  const allowed = new Set<string>([
+    ...BASE_WORKER_ENVIRONMENT, ...(PROVIDER_ENVIRONMENT[provider] ?? []),
+    ...credentialEnvironmentNames(credential),
+  ]);
+  const environment: Record<string, string> = {
+    HOME: home, TMPDIR: temporary, PI_CODING_AGENT_DIR: agentDir,
+    PI_TELEMETRY: "0", PI_SKIP_VERSION_CHECK: "1",
+  };
+  for (const name of allowed) {
+    const value = source[name];
+    if (typeof value === "string") environment[name] = value;
+  }
+  return Object.freeze(environment);
 };
 
 const secureWrite = async (path: string, text: string): Promise<void> => {
@@ -156,6 +299,7 @@ export const runLiveProviderAcceptanceSuite = async (
   const root = await (dependencies.makeRoot ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-live-suite-"))))();
   const runChild = dependencies.runChild
     ?? ((childInput: LiveChildInput) => defaultRunChild(childInput, dependencies.workerPath));
+  const sourceEnvironment = dependencies.sourceEnvironment ?? process.env;
   try {
     await chmod(root, 0o700);
     const rootStat = await lstat(root, { bigint: true });
@@ -183,14 +327,17 @@ export const runLiveProviderAcceptanceSuite = async (
       const request: LiveWorkerRequest = {
         version: 1, gitCommit: input.consent.gitCommit,
         suiteDigest: LIVE_SUITE_DIGEST, fixtureDigest: LIVE_FIXTURE_DIGEST,
-        route, routeDigest: liveRouteDigest(route), bounds,
+        route, routeDigestNonce: input.consent.nonce,
+        routeDigest: liveRouteDigest(route, input.consent.nonce), bounds,
       };
       const requestPath = join(root, `route-${index + 1}.request.json`);
       const resultPath = join(root, `route-${index + 1}.report.json`);
       await secureWrite(requestPath, canonicalLiveWorkerRequest(request));
+      const environment = await routeWorkerEnvironment(root, index, route.provider, sourceEnvironment);
       input.verifyRevision?.();
       const child = await runChild({
-        requestPath, resultPath,
+        requestPath, resultPath, environment,
+        cwd: environment["HOME"]!, bunConfigPath: join(environment["HOME"]!, "bunfig.toml"),
         timeoutMs: Math.min(bounds.maxWallTimeMs, dependencies.childTimeoutMs ?? bounds.maxWallTimeMs),
       });
       if (child.timedOut) throw new LiveSuiteError("CHILD_TIMEOUT", "route child exceeded its wall bound");

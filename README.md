@@ -15,9 +15,9 @@ it needs, and does the heavy joining, counting, and fan-out in code.
 
 ## Status
 
-This repository implements the version 1 runtime and Pi extension. The default
-suite remains offline and deterministic. A separate one-shot campaign validates
-configured providers only after exact operator consent.
+Version 0.1.0 is a source code release of the version 1 runtime and Pi extension.
+The default suite remains offline and deterministic. A separate one-shot campaign
+validates configured providers only after exact operator consent.
 
 What works and is tested offline with no provider credentials:
 
@@ -38,7 +38,7 @@ What works and is tested offline with no provider credentials:
   context-file references, approval, cancellation, accounting, caching, and
   credential-free public `AgentSession` acceptance.
 
-Live provider evidence:
+Historical live provider evidence from issue #26:
 
 - Commit `5594641` passed the one-shot campaign on two distinct configured
   OpenAI Codex model routes through Pi 0.80.10.
@@ -60,19 +60,28 @@ live interruption campaign.
 
 ## Install
 
-Requires [bun](https://bun.sh). Try the repository as a Pi package for one
-run:
+Version 0.1.0 requires Bun 1.3.14 or later in the Bun 1.x series and Pi 0.80.10.
+Install the reviewed source tag through Pi's Git package support:
 
 ```bash
-pi -e /path/to/pi-rlm/index.ts
+pi install git:github.com/adityavkk/pi-rlm@v0.1.0
+pi
 ```
 
-Or install the local package through Pi's documented package mechanism. Pi
-records the directory in `~/.pi/agent/settings.json` under `packages` and reads
-the package's `pi.extensions` manifest on later runs:
+Try the same source tag for one run without changing package settings:
 
 ```bash
-pi install /path/to/pi-rlm
+pi -e git:github.com/adityavkk/pi-rlm@v0.1.0
+```
+
+This project does not publish to npm. The unscoped `pi-rlm` package on npm belongs
+to another project. Do not install `npm:pi-rlm` when you want this extension. The
+manifest is private so an npm publish command fails closed.
+
+For local development, Pi can load a reviewed checkout by path:
+
+```bash
+pi install /absolute/path/to/pi-rlm
 pi
 ```
 
@@ -229,10 +238,18 @@ bun run smoke:packed         # packed imports plus both Pi package-loading paths
 bun run test:smoke-isolation # same smoke; caller environment and cleanup check
 ```
 
-Configured-provider acceptance is separate and never runs from `bun test`:
+Configured-provider acceptance is separate and never runs from `bun test`. These
+commands are for a clean source checkout, not an npm package:
 
 ```bash
-bun run acceptance:live --consent /private/consent.json --output /private/report.json
+scripts/run-live-provider-acceptance.sh --consent /private/consent.json --output /private/report.json
+```
+
+An operator can add a one-shot private JSON array of secret canaries:
+
+```bash
+scripts/run-live-provider-acceptance.sh --consent /private/consent.json --output /private/report.json \
+  --canary-file /private/canaries.json
 ```
 
 See [live provider acceptance](docs/live-provider-acceptance.md) before creating
@@ -301,6 +318,9 @@ Direct host tools are outside the version 1 scope. A later version may accept
 an explicit list of host functions, similar to DSPy's `RLM(tools=[...])`. It
 will not discover or execute arbitrary registered Pi tools through private Pi
 internals.
+
+Release process and residual limits are recorded in
+[`docs/release.md`](docs/release.md).
 
 The full design lives in the
 [agent-spells design suite](https://github.com/adityavkk/agent-spells/blob/main/docs/design/pi-rlm.md).

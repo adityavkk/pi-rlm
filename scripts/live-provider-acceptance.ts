@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { open, rename, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
-import { canonicalStringify, type JsonValue } from "../src/core/json.ts";
 import {
   LIVE_FIXTURE_DIGEST,
   LIVE_SUITE_DIGEST,
@@ -15,6 +16,7 @@ import {
   verifyLiveRepositoryRevision,
 } from "../src/acceptance/live-revision.ts";
 import { publishLiveReport } from "../src/acceptance/live-report.ts";
+import { liveRouteDigest } from "../src/acceptance/live-worker-contract.ts";
 
 interface LiveSuiteModule {
   readonly runLiveProviderAcceptanceSuite: (input: {
@@ -36,7 +38,7 @@ export interface LiveRunnerDependencies {
 }
 
 export class LiveRunnerError extends Error {
-  readonly code: "ARGUMENTS_INVALID" | "GIT_COMMIT_INVALID" | "REPORT_AUTHORITY_MISMATCH";
+  readonly code: "ARGUMENTS_INVALID" | "GIT_COMMIT_INVALID" | "REPORT_AUTHORITY_MISMATCH" | "CANARY_FILE_INVALID";
   constructor(code: LiveRunnerError["code"], message: string) {
     super(message);
     this.name = "LiveRunnerError";
@@ -44,23 +46,62 @@ export class LiveRunnerError extends Error {
   }
 }
 
-const parseArgs = (args: readonly string[]): { consentPath: string; outputPath: string } => {
-  if (args.length !== 4 || args[0] !== "--consent" || args[2] !== "--output"
-    || !args[1] || !args[3] || resolve(args[1]) === resolve(args[3]))
-    throw new LiveRunnerError("ARGUMENTS_INVALID", "expected --consent <path> --output <path>");
-  return { consentPath: args[1], outputPath: args[3] };
+const parseArgs = (args: readonly string[]): {
+  consentPath: string; outputPath: string; canaryPath?: string;
+} => {
+  const withCanary = args.length === 6 && args[4] === "--canary-file" && Boolean(args[5]);
+  if ((args.length !== 4 && !withCanary) || args[0] !== "--consent" || args[2] !== "--output"
+    || !args[1] || !args[3])
+    throw new LiveRunnerError("ARGUMENTS_INVALID", "expected exact live acceptance arguments");
+  const paths = [args[1], args[3], ...(withCanary ? [args[5]!] : [])].map((path) => resolve(path));
+  if (new Set(paths).size !== paths.length)
+    throw new LiveRunnerError("ARGUMENTS_INVALID", "live acceptance paths must be distinct");
+  return { consentPath: args[1], outputPath: args[3], ...(withCanary ? { canaryPath: args[5]! } : {}) };
 };
 
-const routeDigest = (route: LiveConsent["routes"][number]): string =>
-  createHash("sha256").update(canonicalStringify(route as unknown as JsonValue)).digest("hex");
+const consumeCanaryFile = async (path: string): Promise<readonly string[]> => {
+  const consumed = `${path}.consumed-${randomBytes(16).toString("hex")}`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await rename(path, consumed);
+    const noFollow = constants.O_NOFOLLOW;
+    if (typeof noFollow !== "number") throw new Error("no-follow unavailable");
+    handle = await open(consumed, constants.O_RDONLY | noFollow);
+    const stat = await handle.stat({ bigint: true });
+    const uid = process.getuid?.();
+    if (!stat.isFile() || stat.nlink !== 1n || (Number(stat.mode) & 0o7777) !== 0o600
+      || uid === undefined || stat.uid !== BigInt(uid) || stat.size > 16_384n) throw new Error("metadata");
+    const bytes = new Uint8Array(Number(stat.size) + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await handle.read(bytes, offset, bytes.length - offset, null);
+      if (read.bytesRead === 0) break;
+      offset += read.bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (offset !== Number(stat.size) || after.dev !== stat.dev || after.ino !== stat.ino
+      || after.size !== stat.size || after.mode !== stat.mode || after.uid !== stat.uid || after.nlink !== stat.nlink
+      || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs) throw new Error("changed");
+    const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset))) as unknown;
+    if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 16
+      || parsed.some((item) => typeof item !== "string" || item.length < 8 || item.length > 1024)
+      || new Set(parsed).size !== parsed.length) throw new Error("shape");
+    return Object.freeze([...parsed] as string[]);
+  } catch {
+    throw new LiveRunnerError("CANARY_FILE_INVALID", "one-shot canary file is invalid");
+  } finally {
+    await handle?.close().catch(() => {});
+    await unlink(consumed).catch(() => {});
+  }
+};
 
 const validateReportAuthority = (reportInput: unknown, consent: LiveConsent): LiveAcceptanceReport => {
   const report = parseLiveReport(reportInput);
   if (report.gitCommit !== consent.gitCommit || report.suiteDigest !== consent.suiteDigest
     || report.fixtureDigest !== consent.fixtureDigest)
     throw new LiveRunnerError("REPORT_AUTHORITY_MISMATCH", "report identity is outside consent authority");
-  if (report.routes[0].routeDigest !== routeDigest(consent.routes[0])
-    || report.routes[1].routeDigest !== routeDigest(consent.routes[1]))
+  if (report.routes[0].routeDigest !== liveRouteDigest(consent.routes[0], consent.nonce)
+    || report.routes[1].routeDigest !== liveRouteDigest(consent.routes[1], consent.nonce))
     throw new LiveRunnerError("REPORT_AUTHORITY_MISMATCH", "report routes are outside consent authority");
   if (report.totals.invocations > consent.bounds.maxInvocations
     || report.totals.aggregateTokens > consent.bounds.maxAggregateTokens
@@ -75,7 +116,7 @@ export const runLiveProviderAcceptance = async (
   args: readonly string[],
   dependencies: LiveRunnerDependencies = {},
 ): Promise<LiveAcceptanceReport> => {
-  const { consentPath, outputPath } = parseArgs(args);
+  const { consentPath, outputPath, canaryPath } = parseArgs(args);
   const gitCommit = (dependencies.gitCommit ?? currentLiveRepositoryRevision)();
   if (!/^[a-f0-9]{40}$/.test(gitCommit))
     throw new LiveRunnerError("GIT_COMMIT_INVALID", "current git commit is invalid");
@@ -89,8 +130,12 @@ export const runLiveProviderAcceptance = async (
     nowMs: dependencies.nowMs,
   }, async (consent) => {
     verifyRevision(gitCommit);
+    const canaries = [
+      ...LIVE_REPORT_CANARIES,
+      ...(canaryPath ? await consumeCanaryFile(canaryPath) : []),
+      ...(dependencies.canaries ?? []),
+    ];
     const suite = await (dependencies.loadSuite ?? (() => import("../src/acceptance/live-suite.ts")))();
-    const canaries = [...LIVE_REPORT_CANARIES, ...(dependencies.canaries ?? [])];
     const report = validateReportAuthority(
       await suite.runLiveProviderAcceptanceSuite({
         consent,
@@ -105,7 +150,7 @@ export const runLiveProviderAcceptance = async (
 };
 
 const CLI_CODES = new Set<string>([
-  "ARGUMENTS_INVALID", "GIT_COMMIT_INVALID", "REPORT_AUTHORITY_MISMATCH",
+  "ARGUMENTS_INVALID", "GIT_COMMIT_INVALID", "REPORT_AUTHORITY_MISMATCH", "CANARY_FILE_INVALID",
   "LIVE_CONTRACT_INVALID", "CONSENT_FILE_INVALID", "CONSENT_EXPIRED", "CONSENT_NOT_YET_VALID",
   "CONSENT_COMMIT_MISMATCH", "CONSENT_SUITE_MISMATCH", "CONSENT_FIXTURE_MISMATCH",
   "CONSENT_CONSUMPTION_FAILED", "REPORT_PUBLICATION_FAILED", "SUITE_NOT_IMPLEMENTED",
