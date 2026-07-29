@@ -55,28 +55,37 @@ const truncationScenario = async (context: RuntimeScenarioContext): Promise<Live
   }
 };
 
-const providerErrorScenario = async (
-  request: LiveWorkerRequest,
-  budget: LiveCallBudget,
-): Promise<LiveCaseReport> => {
-  const runtime = await ModelRuntime.create({ allowModelNetwork: false });
-  const model = runtime.getModel(request.route.provider, request.route.model);
-  if (!model || model.api !== request.route.apiFamily) return caseReport("provider_error", budget, { code: "PROVIDER_ERROR_FAILED" });
-  await runtime.setRuntimeApiKey(request.route.provider, LIVE_FIXTURE_DESCRIPTOR.invalidCredentialCanary);
-  const boundary = instrumentPiBoundary(runtime);
-  const client = budget.client(runtime, `${request.route.provider}/${request.route.model}`, "provider_error");
+const providerErrorScenario = async (context: RuntimeScenarioContext): Promise<LiveCaseReport> => {
+  const before = context.boundary.maxRetriesZeroCalls();
+  let responses = 0;
+  let statusClass = 0;
+  context.boundary.corruptNextPayloadAndObserveResponse((observedStatusClass) => {
+    responses += 1;
+    statusClass = observedStatusClass;
+  });
+  const client = context.budget.client(context.runtime, context.route, "provider_error");
   const started = performance.now();
   try {
-    await client.complete({ prompt: "Return the public word acceptance.", maxOutputTokens: 16 });
-    return caseReport("provider_error", budget, { code: "PROVIDER_ERROR_FAILED", wallDurationMs: performance.now() - started });
+    await client.complete({
+      prompt: `Return the public word acceptance. ${LIVE_FIXTURE_DESCRIPTOR.providerErrorPromptCanary}`,
+      maxOutputTokens: 16,
+    });
+    return caseReport("provider_error", context.budget, {
+      code: "PROVIDER_ERROR_FAILED", wallDurationMs: performance.now() - started,
+    });
   } catch (error) {
-    const expected = piErrorCode(error) === "PROVIDER_ERROR" && boundary.maxRetriesZeroCalls() === 1;
-    return caseReport("provider_error", budget, {
+    const expected = piErrorCode(error) === "PROVIDER_ERROR"
+      && context.boundary.maxRetriesZeroCalls() - before === 1
+      && responses === 1 && statusClass === 4;
+    return caseReport("provider_error", context.budget, {
       code: expected ? "PROVIDER_ERROR" : "PROVIDER_ERROR_FAILED", verdict: expected ? "pass" : "fail",
       wallDurationMs: performance.now() - started,
-      usageCompleteness: expected && budget.accounting("provider_error").aggregateTokens === 0 ? "unavailable" : undefined,
+      usageCompleteness: expected && context.budget.accounting("provider_error").aggregateTokens === 0
+        ? "unavailable" : undefined,
+      providerResponses: expected ? responses : 0,
+      providerStatusClass: expected ? statusClass : 0,
     });
-  } finally { boundary.restore(); }
+  }
 };
 
 export const generateLiveLongSource = (): string => {
@@ -228,7 +237,7 @@ export const runLiveRouteScenarios = async (input: LiveRouteScenarioInput): Prom
       ["fallback", () => fallbackScenario(context)],
       ["truncation", () => truncationScenario(context)],
       ["cancellation", () => cancellationScenario(context)],
-      ["provider_error", () => providerErrorScenario(input.request, budget)],
+      ["provider_error", () => providerErrorScenario(context)],
       ["retry", () => retryScenario(context)],
       ["benchmark_direct", () => benchmarkDirectScenario(context, source)],
       ["benchmark_rlm", () => benchmarkRlmScenario(context, source)],

@@ -32,6 +32,7 @@ const consent = (): LiveConsent => ({
 });
 const zeroCase = (id: typeof LIVE_CASE_IDS[number]): LiveCaseReport => ({
   id, code: "PASS", verdict: "pass", usageCompleteness: "unavailable", correctnessPpm: 1_000_000,
+  providerResponses: 0, providerStatusClass: 0,
   invocations: 0, intents: 0, settlements: 0, attempts: 0, inputTokens: 0, outputTokens: 0,
   aggregateTokens: 0, piCatalogEstimateUsd: 0, providerDurationMs: 0, wallDurationMs: 0,
   outputBytes: 0, maxConcurrency: 0, sourceSentinelHits: 0,
@@ -128,6 +129,16 @@ describe("contained live suite orchestration", () => {
     await expect(runLiveProviderAcceptanceSuite({ consent: authority, canaries: [canary] }, {
       now: () => 1_000, runChild: success,
     })).rejects.toThrow(/canary/);
+  });
+
+  test("kills a real silent worker and removes its orphaned private state", async () => {
+    const root = await privateRoot();
+    await expect(runLiveProviderAcceptanceSuite({ consent: consent(), canaries: [] }, {
+      makeRoot: async () => root,
+      workerPath: join(import.meta.dir, "testing", "hanging-live-worker.ts"),
+      childTimeoutMs: 100,
+    })).rejects.toMatchObject({ code: "CHILD_TIMEOUT" });
+    expect(await Bun.file(root).exists()).toBe(false);
   });
 
   test("fails plan overflow before child and removes private roots after failures", async () => {

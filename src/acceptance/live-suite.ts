@@ -16,6 +16,7 @@ import {
 export interface LiveSuiteInput {
   readonly consent: LiveConsent;
   readonly canaries: readonly string[];
+  readonly verifyRevision?: () => void;
 }
 export interface LiveChildOutcome {
   readonly exitCode: number;
@@ -32,6 +33,9 @@ export interface LiveSuiteDependencies {
   readonly now?: () => number;
   readonly makeRoot?: () => Promise<string>;
   readonly runChild?: (input: LiveChildInput) => Promise<LiveChildOutcome>;
+  /** Test-only contained worker replacement and tighter timeout. */
+  readonly workerPath?: string;
+  readonly childTimeoutMs?: number;
 }
 
 export class LiveSuiteError extends Error {
@@ -63,8 +67,8 @@ const boundedDrain = async (stream: ReadableStream<Uint8Array> | null, bound = 4
   return bytes;
 };
 
-const defaultRunChild = async (input: LiveChildInput): Promise<LiveChildOutcome> => {
-  const worker = new URL("../../scripts/live-provider-worker.ts", import.meta.url).pathname;
+const defaultRunChild = async (input: LiveChildInput, workerPath?: string): Promise<LiveChildOutcome> => {
+  const worker = workerPath ?? new URL("../../scripts/live-provider-worker.ts", import.meta.url).pathname;
   const child = Bun.spawn([process.execPath, worker, "--request", input.requestPath, "--result", input.resultPath], {
     env: process.env,
     stdin: "ignore",
@@ -144,12 +148,14 @@ export const runLiveProviderAcceptanceSuite = async (
   dependencies: LiveSuiteDependencies = {},
 ): Promise<LiveAcceptanceReport> => {
   const now = dependencies.now ?? Date.now;
+  input.verifyRevision?.();
   const startedAtMs = now();
   let plan;
   try { plan = assertLivePlanWithinConsent(input.consent); }
   catch { throw new LiveSuiteError("LIVE_PLAN_OUTSIDE_AUTHORITY", "fixed suite exceeds consent bounds"); }
   const root = await (dependencies.makeRoot ?? (() => mkdtemp(join(tmpdir(), "pi-rlm-live-suite-"))))();
-  const runChild = dependencies.runChild ?? defaultRunChild;
+  const runChild = dependencies.runChild
+    ?? ((childInput: LiveChildInput) => defaultRunChild(childInput, dependencies.workerPath));
   try {
     await chmod(root, 0o700);
     const rootStat = await lstat(root, { bigint: true });
@@ -175,16 +181,22 @@ export const runLiveProviderAcceptanceSuite = async (
       };
       const route = input.consent.routes[index]!;
       const request: LiveWorkerRequest = {
-        version: 1, suiteDigest: LIVE_SUITE_DIGEST, fixtureDigest: LIVE_FIXTURE_DIGEST,
+        version: 1, gitCommit: input.consent.gitCommit,
+        suiteDigest: LIVE_SUITE_DIGEST, fixtureDigest: LIVE_FIXTURE_DIGEST,
         route, routeDigest: liveRouteDigest(route), bounds,
       };
       const requestPath = join(root, `route-${index + 1}.request.json`);
       const resultPath = join(root, `route-${index + 1}.report.json`);
       await secureWrite(requestPath, canonicalLiveWorkerRequest(request));
-      const child = await runChild({ requestPath, resultPath, timeoutMs: bounds.maxWallTimeMs });
+      input.verifyRevision?.();
+      const child = await runChild({
+        requestPath, resultPath,
+        timeoutMs: Math.min(bounds.maxWallTimeMs, dependencies.childTimeoutMs ?? bounds.maxWallTimeMs),
+      });
       if (child.timedOut) throw new LiveSuiteError("CHILD_TIMEOUT", "route child exceeded its wall bound");
       if (child.stdoutBytes !== 0 || child.stderrBytes !== 0) throw new LiveSuiteError("CHILD_OUTPUT", "route child emitted process output");
       if (child.exitCode !== 0) throw new LiveSuiteError("CHILD_FAILED", "route child failed");
+      input.verifyRevision?.();
       const parsed = parseLiveWorkerRouteReportText(await secureRead(resultPath), input.canaries);
       if (parsed.routeDigest !== request.routeDigest) throw new LiveSuiteError("CHILD_REPORT_INVALID", "route child identity mismatch");
       if (parsed.invocations > bounds.maxInvocations || parsed.aggregateTokens > bounds.maxAggregateTokens
@@ -202,6 +214,7 @@ export const runLiveProviderAcceptanceSuite = async (
     }
     const tuple = routes as [LiveRouteReport, LiveRouteReport];
     const durationMs = Math.max(0, Math.floor(now() - startedAtMs));
+    input.verifyRevision?.();
     const report: LiveAcceptanceReport = {
       version: 1, gitCommit: input.consent.gitCommit, suiteDigest: LIVE_SUITE_DIGEST,
       fixtureDigest: LIVE_FIXTURE_DIGEST,
@@ -210,7 +223,17 @@ export const runLiveProviderAcceptanceSuite = async (
     };
     return parseLiveReport(report);
   } finally {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    try {
+      await rm(root, { recursive: true, force: true });
+      await lstat(root);
+      throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "suite root survived cleanup");
+    } catch (error) {
+      if (error instanceof LiveSuiteError) throw error;
+      const code = error && typeof error === "object" && "code" in error
+        ? (error as { readonly code?: unknown }).code : undefined;
+      if (code !== "ENOENT")
+        throw new LiveSuiteError("CHILD_CONTAINMENT_FAILED", "suite root cleanup failed");
+    }
   }
 };
 

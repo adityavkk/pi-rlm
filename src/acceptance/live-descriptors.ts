@@ -56,21 +56,21 @@ export const LIVE_FIXTURE_DESCRIPTOR = {
   recurseValue: 918_273,
   fallbackValue: 624_801,
   retryValue: 517_349,
-  invalidCredentialCanary: "pi-rlm-fixed-invalid-live-runtime-key-v1",
+  providerErrorPromptCanary: "PI_RLM_PROVIDER_ERROR_CANARY_1618033",
   longSourceBytes: 192 * 1_024,
   longSourceSentinel: "FULL_SOURCE_SENTINEL_2718281828",
   longNeedles: ["NEEDLE_A_104729", "NEEDLE_B_209759", "NEEDLE_C_314159"],
 } as const;
 
 export const LIVE_REPORT_CANARIES = [
-  LIVE_FIXTURE_DESCRIPTOR.invalidCredentialCanary,
+  LIVE_FIXTURE_DESCRIPTOR.providerErrorPromptCanary,
   LIVE_FIXTURE_DESCRIPTOR.longSourceSentinel,
 ] as const;
 
 export const liveSuiteDescriptor = (): JsonValue => ({
   version: 1,
-  authorityContractVersion: 1,
-  scenarioImplementationVersion: 3,
+  authorityContractVersion: 2,
+  scenarioImplementationVersion: 4,
   cases: LIVE_CASE_DESCRIPTORS as unknown as JsonValue,
   thresholds: LIVE_BENCHMARK_THRESHOLDS as unknown as JsonValue,
 });

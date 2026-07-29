@@ -54,6 +54,8 @@ export interface LiveCaseReport extends LiveNumericAccounting {
   readonly verdict: typeof VERDICTS[number];
   readonly usageCompleteness: LiveUsageCompleteness;
   readonly correctnessPpm: number;
+  readonly providerResponses: number;
+  readonly providerStatusClass: number;
 }
 
 export type LiveCancellationUsage =
@@ -146,13 +148,18 @@ const RUNTIME_CASES = new Set<LiveCaseId>(["extension", "structured", "batch", "
 const parseCase = (value: JsonValue, index: number): LiveCaseReport => {
   const label = `route.cases[${index}]`;
   const object = liveObject(value, label);
-  liveExactKeys(object, ["id", "code", "verdict", "usageCompleteness", "correctnessPpm", ...ACCOUNTING_KEYS], label);
+  liveExactKeys(object, [
+    "id", "code", "verdict", "usageCompleteness", "correctnessPpm",
+    "providerResponses", "providerStatusClass", ...ACCOUNTING_KEYS,
+  ], label);
   const parsed: LiveCaseReport = {
     id: liveEnum(liveOwn(object, "id"), LIVE_CASE_IDS, `${label}.id`),
     code: liveEnum(liveOwn(object, "code"), LIVE_CASE_CODES, `${label}.code`),
     verdict: liveEnum(liveOwn(object, "verdict"), VERDICTS, `${label}.verdict`),
     usageCompleteness: liveEnum(liveOwn(object, "usageCompleteness"), USAGE_COMPLETENESS, `${label}.usageCompleteness`),
     correctnessPpm: liveInteger(liveOwn(object, "correctnessPpm"), 0, 1_000_000, `${label}.correctnessPpm`),
+    providerResponses: liveInteger(liveOwn(object, "providerResponses"), 0, 2, `${label}.providerResponses`),
+    providerStatusClass: liveInteger(liveOwn(object, "providerStatusClass"), 0, 5, `${label}.providerStatusClass`),
     ...parseAccounting(object, label),
   };
   if (parsed.id !== LIVE_CASE_IDS[index]) liveFail("route cases are not canonical");
@@ -173,6 +180,12 @@ const parseCase = (value: JsonValue, index: number): LiveCaseReport => {
   if (parsed.usageCompleteness === "exact" && RUNTIME_CASES.has(parsed.id)
     && (parsed.invocations !== parsed.intents || parsed.intents !== parsed.settlements || parsed.settlements !== parsed.attempts))
     liveFail(`${label} provider attempts do not reconcile`);
+  if (parsed.id === "provider_error" && parsed.code === "PROVIDER_ERROR" && parsed.verdict === "pass") {
+    if (parsed.providerResponses !== 1 || parsed.providerStatusClass !== 4)
+      liveFail(`${label} provider response boundary does not reconcile`);
+  } else if (parsed.providerResponses !== 0 || parsed.providerStatusClass !== 0) {
+    liveFail(`${label} has an unexpected provider response boundary`);
+  }
   return parsed;
 };
 

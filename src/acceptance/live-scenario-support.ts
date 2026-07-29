@@ -142,6 +142,7 @@ export class LiveScenarioError extends Error {
 export interface PiBoundaryInstrumentation {
   readonly maxRetriesZeroCalls: () => number;
   observeNextStreamStart(callback: () => void): void;
+  corruptNextPayloadAndObserveResponse(callback: (statusClass: number) => void): void;
   restore(): void;
 }
 
@@ -151,8 +152,22 @@ export const instrumentPiBoundary = (runtime: ModelRuntime): PiBoundaryInstrumen
   const originalStream = runtime.streamSimple.bind(runtime);
   let maxRetriesZero = 0;
   let onStart: (() => void) | undefined;
+  let onCorruptResponse: ((statusClass: number) => void) | undefined;
   runtime.completeSimple = (async (model, context, options) => {
     if (options?.maxRetries === 0) maxRetriesZero += 1;
+    const responseProbe = onCorruptResponse;
+    onCorruptResponse = undefined;
+    if (responseProbe) {
+      return originalComplete(model, context, {
+        ...options,
+        transport: "sse",
+        onPayload: () => ({}),
+        onResponse: async (response, responseModel) => {
+          await options?.onResponse?.(response, responseModel);
+          responseProbe(Math.floor(response.status / 100));
+        },
+      });
+    }
     const callback = onStart;
     onStart = undefined;
     if (!callback) return originalComplete(model, context, options);
@@ -163,6 +178,10 @@ export const instrumentPiBoundary = (runtime: ModelRuntime): PiBoundaryInstrumen
   return {
     maxRetriesZeroCalls: () => maxRetriesZero,
     observeNextStreamStart(callback) { onStart = callback; },
+    corruptNextPayloadAndObserveResponse(callback) {
+      if (onCorruptResponse) throw new LiveScenarioError("SCENARIO_FAILED");
+      onCorruptResponse = callback;
+    },
     restore() { runtime.completeSimple = originalComplete as typeof runtime.completeSimple; },
   };
 };
@@ -205,6 +224,8 @@ export interface CaseResultOptions {
   readonly settlements?: number;
   readonly attempts?: number;
   readonly usageCompleteness?: LiveCaseReport["usageCompleteness"];
+  readonly providerResponses?: number;
+  readonly providerStatusClass?: number;
 }
 export const caseReport = (id: LiveCaseId, budget: LiveCallBudget, options: CaseResultOptions): LiveCaseReport => {
   const observed = budget.accounting(id);
@@ -213,6 +234,8 @@ export const caseReport = (id: LiveCaseId, budget: LiveCallBudget, options: Case
     id, code: options.code, verdict,
     usageCompleteness: options.usageCompleteness ?? (observed.invocations === 0 ? "unavailable" : "exact"),
     correctnessPpm: options.correctnessPpm ?? (verdict === "pass" ? 1_000_000 : 0),
+    providerResponses: options.providerResponses ?? 0,
+    providerStatusClass: options.providerStatusClass ?? 0,
     ...ZERO,
     invocations: observed.invocations,
     intents: options.intents ?? 0,

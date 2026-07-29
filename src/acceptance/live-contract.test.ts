@@ -6,7 +6,8 @@ import { canonicalStringify, type JsonValue } from "../core/json.ts";
 import {
   LIVE_ACCEPTANCE_PURPOSE, LIVE_FIXTURE_DIGEST, LIVE_SUITE_DIGEST, MAX_LIVE_REPORT_BYTES,
   buildLiveBenchmark, canonicalLiveReport, parseLiveConsent, parseLiveConsentText,
-  parseLiveReport, parseLiveReportText, type LiveAcceptanceReport, type LiveCaseReport,
+  parseLiveReport, parseLiveReportText, parseLiveWorkerRouteReport,
+  type LiveAcceptanceReport, type LiveCaseReport,
   type LiveRouteReport,
 } from "./live-contract.ts";
 import { digestDescriptor, LIVE_CASE_IDS, liveFixtureDescriptor, liveSuiteDescriptor } from "./live-descriptors.ts";
@@ -29,6 +30,7 @@ const consent = (): Record<string, unknown> => ({
 });
 const zeroCase = (id: typeof LIVE_CASE_IDS[number]): LiveCaseReport => ({
   id, code: "PASS", verdict: "pass", usageCompleteness: "unavailable", correctnessPpm: 1_000_000,
+  providerResponses: 0, providerStatusClass: 0,
   invocations: 0, intents: 0, settlements: 0, attempts: 0, inputTokens: 0, outputTokens: 0,
   aggregateTokens: 0, piCatalogEstimateUsd: 0, providerDurationMs: 0, wallDurationMs: 0,
   outputBytes: 0, maxConcurrency: 0, sourceSentinelHits: 0,
@@ -93,6 +95,22 @@ describe("numeric allowlisted live report", () => {
     expect(text).not.toContain("provider-one");
     expect(text).toContain("unknown_after_cancel");
   });
+  test("requires an observed provider HTTP response for an accepted provider error", () => {
+    const accepted = structuredClone(route("route-1", digest("c"))) as any;
+    const provider = accepted.cases[LIVE_CASE_IDS.indexOf("provider_error")];
+    Object.assign(provider, {
+      code: "PROVIDER_ERROR", providerResponses: 1, providerStatusClass: 4,
+      invocations: 1, attempts: 1, maxConcurrency: 1,
+    });
+    Object.assign(accepted, { invocations: 1, attempts: 1, maxConcurrency: 1 });
+    delete accepted.alias;
+    expect(parseLiveWorkerRouteReport(accepted).cases[LIVE_CASE_IDS.indexOf("provider_error")])
+      .toMatchObject({ code: "PROVIDER_ERROR", providerResponses: 1, providerStatusClass: 4 });
+    provider.providerResponses = 0;
+    provider.providerStatusClass = 0;
+    expect(() => parseLiveWorkerRouteReport(accepted)).toThrow(/response boundary/);
+  });
+
   test("rejects hostile keys, canaries, oversized input, malformed order, and totals", () => {
     for (const key of ["prompt", "source", "error", "provider", "model", "actualCostUsd", "path"]) {
       const hostile = structuredClone(report()) as any;

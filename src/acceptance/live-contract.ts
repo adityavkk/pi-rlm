@@ -37,8 +37,8 @@ export {
 
 export const LIVE_ACCEPTANCE_PURPOSE = "pi-rlm-live-provider-acceptance" as const;
 export const LIVE_ACCEPTANCE_VERSION = 1 as const;
-export const LIVE_SUITE_DIGEST = "a4536fe491b2eabb72eb249eabdd97b2d6d8a60b992ea7636da4d142bca4ba86" as const;
-export const LIVE_FIXTURE_DIGEST = "bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434" as const;
+export const LIVE_SUITE_DIGEST = "6c20457675dc439f5e0ba577f8460873fdf8e5e06b2e3be844bfb91534ee1228" as const;
+export const LIVE_FIXTURE_DIGEST = "af4c961a5d783e60f2116bb749bdef08e75c212190e3824bcb74ffd0b95405fb" as const;
 export const MAX_LIVE_CONSENT_BYTES = 64 * 1024;
 
 const DIGEST = /^[a-f0-9]{64}$/;

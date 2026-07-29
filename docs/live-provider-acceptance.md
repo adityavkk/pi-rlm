@@ -19,8 +19,8 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `a4536fe491b2eabb72eb249eabdd97b2d6d8a60b992ea7636da4d142bca4ba86`
-- `fixtureDigest`: `bae88a4adf91b4adb3f4a3ef9b7dc1586269be7054c82f4a76286223c75b0434`
+- `suiteDigest`: `6c20457675dc439f5e0ba577f8460873fdf8e5e06b2e3be844bfb91534ee1228`
+- `fixtureDigest`: `af4c961a5d783e60f2116bb749bdef08e75c212190e3824bcb74ffd0b95405fb`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
 - `routes`: exactly two `{ provider, model, apiFamily }` objects
@@ -38,11 +38,11 @@ Bounds:
 
 The fixed two-route plan currently requires at least 62 invocations, 1,024 output tokens per invocation, 413,282 estimated aggregate tokens, and 1,650,000 ms wall time. Use a deliberate catalog-estimate ceiling appropriate for the selected routes. The catalog estimate is post-reported from Pi usage metadata, not an actual or billed-cost guarantee.
 
-Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
+Run the campaign from a clean git checkout with the exact pinned Pi dependencies installed. Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates the package repository revision, tracked-file cleanliness, and installed dependency versions before consent, after consent, around each child, and before report publication. Each child repeats revision checks before importing scenarios and before publishing its result. The runner validates consent file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
 
 ## Fixed campaign
 
-Each route runs the same committed fixtures: exact direct nonce; public `AgentSession` `/rlm` extension path; structured leaf; ordered four-item batch at observed concurrency two; one child recurse with one live leaf; provider-backed fallback extraction after deterministic controller exhaustion; low-cap truncation; in-flight cancellation after a Pi stream start; isolated invalid-runtime-key provider error; controller repair accounting; and one 192 KiB direct/RLM long-context pair.
+Each route runs the same committed fixtures: exact direct nonce; public `AgentSession` `/rlm` extension path; structured leaf; ordered four-item batch at observed concurrency two; one child recurse with one live leaf; provider-backed fallback extraction after deterministic controller exhaustion; low-cap truncation; in-flight cancellation after a Pi stream start; one authenticated request whose payload is replaced with a fixed invalid object and must produce an observed HTTP 4xx provider response; controller repair accounting; and one 192 KiB direct/RLM long-context pair.
 
 The long-context threshold is one fixed campaign, not a statistical or p95 claim:
 
@@ -54,11 +54,11 @@ The long-context threshold is one fixed campaign, not a statistical or p95 claim
 - RLM wall time: at most 180 seconds
 - full-source sentinel: present in the direct request and absent from every RLM provider request
 
-The child enforces fixed per-case and route invocation/output caps before calls. If a provider reports more output than requested, `PiModelClient` fails the call as `OUTPUT_TRUNCATED`, charges the reported usage, and the truncation case records the bounded overshoot rather than accepting the text. Every non-cancel runtime case reconciles observed completion boundaries, journal intents/settlements, and ledger attempts/usage. Cancellation may report `unknown_after_cancel`; unsettled provider work is never represented as zero usage.
+The child enforces fixed per-case and route invocation/output caps before calls. If a provider reports more output than requested, `PiModelClient` fails the call as `OUTPUT_TRUNCATED`, charges the reported usage, and the truncation case records the bounded overshoot rather than accepting the text. Every settled runtime case reconciles observed completion boundaries, journal intents/settlements, and ledger attempts/usage. Cancellation may report `unknown_after_cancel`; unsettled provider work is never represented as zero usage. Token totals cover settled Pi-reported usage only. Cost is Pi's catalog estimate, not provider billing.
 
 ## Containment and report
 
-The parent expands and verifies the full plan before spawning. Route children run serially with the current Bun executable, inherited environment, private `0700` roots, private canonical request/report files, bounded silent stdout/stderr drains, wall timeout, kill/reap, strict route binding, and cleanup in `finally`. Any child stdout or stderr byte fails the campaign and is discarded.
+The parent expands and verifies the full plan before spawning. Route children run serially with the current Bun executable, inherited environment, private `0700` roots inside the parent-owned suite tree, private canonical request/report files, bounded silent stdout/stderr drains, wall timeout, kill/reap, strict route binding, and cleanup in `finally`. The parent removes and verifies the complete tree after reaping, including when `SIGKILL` prevents worker cleanup. Any child stdout or stderr byte fails the campaign and is discarded.
 
 The final report is at most 256 KiB, canonical JSON, and published as a same-directory atomic no-clobber `0600` file. It contains only fixed versions, aliases, digests, allowlisted case/code/verdict/usage-completeness values, booleans for committed thresholds, and bounded finite numeric accounting. Per-case records include calls, intents, settlements, attempts, tokens, Pi catalog estimate, provider/wall duration, output bytes, correctness ppm, concurrency, and source-sentinel hits. Provider/model names, prompts, source, raw outputs, errors, paths, URLs, headers, environment values, actual cost, and billed cost are rejected. Supplied secret canaries are checked against child and final canonical reports.
 

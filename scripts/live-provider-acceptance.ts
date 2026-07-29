@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { canonicalStringify, type JsonValue } from "../src/core/json.ts";
 import {
@@ -11,12 +10,17 @@ import {
 } from "../src/acceptance/live-contract.ts";
 import { withConsumedLiveConsent, type LiveConsentDependencies } from "../src/acceptance/live-consent.ts";
 import { LIVE_REPORT_CANARIES } from "../src/acceptance/live-descriptors.ts";
+import {
+  currentLiveRepositoryRevision,
+  verifyLiveRepositoryRevision,
+} from "../src/acceptance/live-revision.ts";
 import { publishLiveReport } from "../src/acceptance/live-report.ts";
 
 interface LiveSuiteModule {
   readonly runLiveProviderAcceptanceSuite: (input: {
     readonly consent: LiveConsent;
     readonly canaries: readonly string[];
+    readonly verifyRevision?: () => void;
   }) => Promise<LiveAcceptanceReport>;
 }
 
@@ -24,6 +28,7 @@ export interface LiveRunnerDependencies {
   readonly gitCommit?: () => string;
   readonly nowMs?: number;
   readonly consent?: LiveConsentDependencies;
+  readonly verifyRevision?: (expected: string) => void;
   /** Provider-capable seam. Called only after consent has been atomically consumed. */
   readonly loadSuite?: () => Promise<LiveSuiteModule>;
   readonly publishReport?: typeof publishLiveReport;
@@ -44,21 +49,6 @@ const parseArgs = (args: readonly string[]): { consentPath: string; outputPath: 
     || !args[1] || !args[3] || resolve(args[1]) === resolve(args[3]))
     throw new LiveRunnerError("ARGUMENTS_INVALID", "expected --consent <path> --output <path>");
   return { consentPath: args[1], outputPath: args[3] };
-};
-
-const currentGitCommit = (): string => {
-  let commit: string;
-  try {
-    commit = execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    throw new LiveRunnerError("GIT_COMMIT_INVALID", "current git commit is unavailable");
-  }
-  if (!/^[a-f0-9]{40}$/.test(commit))
-    throw new LiveRunnerError("GIT_COMMIT_INVALID", "current git commit is invalid");
-  return commit;
 };
 
 const routeDigest = (route: LiveConsent["routes"][number]): string =>
@@ -86,21 +76,30 @@ export const runLiveProviderAcceptance = async (
   dependencies: LiveRunnerDependencies = {},
 ): Promise<LiveAcceptanceReport> => {
   const { consentPath, outputPath } = parseArgs(args);
-  const gitCommit = (dependencies.gitCommit ?? currentGitCommit)();
+  const gitCommit = (dependencies.gitCommit ?? currentLiveRepositoryRevision)();
   if (!/^[a-f0-9]{40}$/.test(gitCommit))
     throw new LiveRunnerError("GIT_COMMIT_INVALID", "current git commit is invalid");
+  const verifyRevision = dependencies.verifyRevision
+    ?? (dependencies.gitCommit ? (() => {}) : verifyLiveRepositoryRevision);
+  verifyRevision(gitCommit);
   return withConsumedLiveConsent(consentPath, {
     gitCommit,
     suiteDigest: LIVE_SUITE_DIGEST,
     fixtureDigest: LIVE_FIXTURE_DIGEST,
     nowMs: dependencies.nowMs,
   }, async (consent) => {
+    verifyRevision(gitCommit);
     const suite = await (dependencies.loadSuite ?? (() => import("../src/acceptance/live-suite.ts")))();
     const canaries = [...LIVE_REPORT_CANARIES, ...(dependencies.canaries ?? [])];
     const report = validateReportAuthority(
-      await suite.runLiveProviderAcceptanceSuite({ consent, canaries }),
+      await suite.runLiveProviderAcceptanceSuite({
+        consent,
+        canaries,
+        verifyRevision: () => verifyRevision(gitCommit),
+      }),
       consent,
     );
+    verifyRevision(gitCommit);
     return (dependencies.publishReport ?? publishLiveReport)(outputPath, report, canaries);
   }, dependencies.consent);
 };

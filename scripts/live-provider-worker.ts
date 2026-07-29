@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { chmod, lstat, mkdtemp, open, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { resolve, join } from "node:path";
+import { dirname, resolve, join } from "node:path";
+import { verifyLiveRepositoryRevision } from "../src/acceptance/live-revision.ts";
 import {
   MAX_LIVE_WORKER_REQUEST_BYTES, canonicalLiveWorkerRouteReport, parseLiveWorkerRequestText,
   type LiveWorkerRequest,
@@ -43,16 +43,21 @@ const writePrivateReport = async (path: string, text: string): Promise<void> => 
 export const runLiveProviderWorker = async (args: readonly string[]): Promise<void> => {
   const paths = exactArgs(args);
   const request = await readPrivateRequest(paths.requestPath);
-  const root = await mkdtemp(join(tmpdir(), "pi-rlm-live-route-"));
+  verifyLiveRepositoryRevision(request.gitCommit);
+  // The parent owns this directory tree and removes it after reaping us, even
+  // if SIGKILL prevents this worker's finally block from running.
+  const root = await mkdtemp(join(dirname(paths.requestPath), ".route-worker-"));
   try {
     await chmod(root, 0o700);
     const stat = await lstat(root, { bigint: true });
     if (!stat.isDirectory() || (Number(stat.mode) & 0o7777) !== 0o700) throw new Error("private root invalid");
     const scenarios = await import("../src/acceptance/live-scenarios.ts");
+    verifyLiveRepositoryRevision(request.gitCommit);
     const report = await scenarios.runLiveRouteScenarios({ request, root });
+    verifyLiveRepositoryRevision(request.gitCommit);
     await writePrivateReport(paths.resultPath, canonicalLiveWorkerRouteReport(report));
   } finally {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    await rm(root, { recursive: true, force: true });
   }
 };
 
