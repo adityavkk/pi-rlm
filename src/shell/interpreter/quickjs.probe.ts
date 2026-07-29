@@ -96,7 +96,7 @@ try {
         sawAbortedSignal = signal.aborted;
         await new Promise((resolve) => setTimeout(resolve, 5));
         return { ok: true };
-      });
+      }, 500);
       console.log(JSON.stringify({ ...result, sawAbortedSignal }));
       break;
     }
