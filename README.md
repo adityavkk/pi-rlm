@@ -232,7 +232,7 @@ not a security boundary.
 ## Testing
 
 ```bash
-bun test                     # full suite (offline, no provider needed)
+bun run test                 # full suite (offline, bounded concurrency)
 bun run typecheck            # strict TypeScript
 bun run smoke:packed         # packed imports plus both Pi package-loading paths
 bun run test:smoke-isolation # same smoke; caller environment and cleanup check

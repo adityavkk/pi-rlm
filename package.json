@@ -46,7 +46,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --max-concurrency=4",
     "test:core": "bun test src/core",
     "test:runtime": "bun test src/runtime",
     "smoke:packed": "bash scripts/smoke-packed-install.sh",
