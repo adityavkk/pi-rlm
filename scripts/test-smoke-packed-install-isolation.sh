@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 host_path=${PATH:?}
+root_network_denial=${PI_RLM_ROOT_NETWORK_DENIAL:-0}
 env_bin=/usr/bin/env
 bash_bin=/bin/bash
 if [[ ! -x "$env_bin" || ! -x "$bash_bin" ]]; then
@@ -70,6 +71,7 @@ snapshot > "$before"
   BUN_INSTALL_GLOBAL_DIR="$sentinel/bun-global" \
   BUN_RUNTIME_TRANSPILER_CACHE_PATH="$sentinel/bun-transpiler-cache" \
   TMPDIR="$smoke_tmp" \
+  PI_RLM_ROOT_NETWORK_DENIAL="$root_network_denial" \
   NODE_OPTIONS=--pi-rlm-smoke-must-strip-caller-node-options \
   "$bash_bin" "$root_dir/scripts/smoke-packed-install.sh"
 

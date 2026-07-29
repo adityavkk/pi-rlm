@@ -7,8 +7,9 @@ source "$root_dir/scripts/smoke-packed-install-args.sh"
 host_path=${PATH:?}
 env_bin=/usr/bin/env
 uname_bin=/usr/bin/uname
-if [[ ! -x "$env_bin" || ! -x "$uname_bin" ]]; then
-  echo "packed smoke requires trusted /usr/bin/env and /usr/bin/uname" >&2
+id_bin=/usr/bin/id
+if [[ ! -x "$env_bin" || ! -x "$uname_bin" || ! -x "$id_bin" ]]; then
+  echo "packed smoke requires trusted env, uname, and id executables" >&2
   exit 1
 fi
 tmp_dir=""
@@ -73,6 +74,41 @@ isolated() {
     "$@"
 }
 
+root_network_denied() {
+  local base=$1
+  shift
+  local sudo_bin=/usr/bin/sudo
+  local unshare_bin=/usr/bin/unshare
+  local setpriv_bin=/usr/bin/setpriv
+  if [[ ! -x "$sudo_bin" || ! -x "$unshare_bin" || ! -x "$setpriv_bin" ]]; then
+    echo "packed smoke root network denial prerequisites are unavailable" >&2
+    return 1
+  fi
+  "$sudo_bin" -n "$unshare_bin" --net -- "$setpriv_bin" \
+    --reuid="$($id_bin -u)" --regid="$($id_bin -g)" --init-groups \
+    "$env_bin" -i \
+      HOME="$base/home" \
+      PATH="$host_path" \
+      XDG_CONFIG_HOME="$base/config" \
+      XDG_CACHE_HOME="$base/cache" \
+      XDG_DATA_HOME="$base/data" \
+      XDG_STATE_HOME="$base/state" \
+      npm_config_cache="$base/npm-cache" \
+      NPM_CONFIG_CACHE="$base/npm-cache" \
+      npm_config_userconfig="$base/npmrc" \
+      NPM_CONFIG_USERCONFIG="$base/npmrc" \
+      npm_config_globalconfig="$base/global-npmrc" \
+      NPM_CONFIG_GLOBALCONFIG="$base/global-npmrc" \
+      npm_config_prefix="$base/npm-prefix" \
+      NPM_CONFIG_PREFIX="$base/npm-prefix" \
+      BUN_INSTALL="$base/bun" \
+      BUN_INSTALL_CACHE_DIR="$base/bun-cache" \
+      BUN_INSTALL_GLOBAL_DIR="$base/bun-global" \
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH="$base/bun-transpiler-cache" \
+      TMPDIR="$base/tmp" \
+      "$@"
+}
+
 runtime_network_denied() {
   local base=$1
   shift
@@ -87,7 +123,9 @@ runtime_network_denied() {
         "$@"
       ;;
     Linux)
-      if command -v bwrap >/dev/null 2>&1; then
+      if [[ ${PI_RLM_ROOT_NETWORK_DENIAL:-0} == 1 ]]; then
+        root_network_denied "$base" "$@"
+      elif command -v bwrap >/dev/null 2>&1; then
         isolated "$base" bwrap --unshare-net --bind / / -- "$@"
       elif command -v unshare >/dev/null 2>&1; then
         isolated "$base" unshare --user --map-root-user --net -- "$@"

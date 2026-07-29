@@ -46,8 +46,9 @@ jobs:
       - run: rm -rf node_modules && npm ci --ignore-scripts --no-audit --no-fund
       - run: npm audit --audit-level=high
       - run: bun run typecheck
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: bun run test:smoke-isolation
+        env:
+          PI_RLM_ROOT_NETWORK_DENIAL: "1"
 
   secrets:
     name: Secret scan
