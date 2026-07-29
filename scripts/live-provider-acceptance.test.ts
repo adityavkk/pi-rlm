@@ -128,6 +128,35 @@ describe("live provider parent runner refusal boundary", () => {
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 
+  test("consumes a private canary file before loading provider-capable code", async () => {
+    const root = await directory();
+    const consentPath = join(root, "consent.json");
+    const outputPath = join(root, "report.json");
+    const canaryPath = join(root, "canaries.json");
+    await writeConsent(consentPath);
+    await writeFile(canaryPath, JSON.stringify(["private-test-canary"]), { mode: 0o600 });
+    await chmod(canaryPath, 0o600);
+    let observed = false;
+    await expect(runLiveProviderAcceptance([
+      "--consent", consentPath, "--output", outputPath, "--canary-file", canaryPath,
+    ], {
+      gitCommit: () => COMMIT,
+      nowMs: 1_500,
+      loadSuite: async () => {
+        expect(await Bun.file(consentPath).exists()).toBe(false);
+        expect(await Bun.file(canaryPath).exists()).toBe(false);
+        return {
+          runLiveProviderAcceptanceSuite: async (input) => {
+            observed = input.canaries.includes("private-test-canary");
+            throw Object.assign(new Error("stop after observation"), { code: "SUITE_NOT_IMPLEMENTED" });
+          },
+        };
+      },
+    })).rejects.toMatchObject({ code: "SUITE_NOT_IMPLEMENTED" });
+    expect(observed).toBe(true);
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+  });
+
   test("valid but undersized authority reaches the suite plan and creates no output", async () => {
     const root = await directory();
     const consentPath = join(root, "consent.json");

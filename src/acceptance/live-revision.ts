@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, readlinkSync,
+} from "node:fs";
+import { join, relative, resolve } from "node:path";
 
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
 const PINNED_PACKAGES = [
@@ -12,6 +15,9 @@ const PINNED_PACKAGES = [
   "typebox",
 ] as const;
 const repository = resolve(import.meta.dir, "..", "..");
+const LIVE_DEPENDENCY_TREE_SHA256: Readonly<Record<string, string>> = Object.freeze({
+  "darwin-arm64": "c4f80a4e1aba3ba5b4cb81ab52928f385b6983381e99bd914408fbb639bc560b",
+});
 
 export class LiveRevisionError extends Error {
   readonly code = "GIT_COMMIT_INVALID" as const;
@@ -39,7 +45,45 @@ const packageVersion = (path: string): string => {
   return (parsed as { readonly version: string }).version;
 };
 
+export const liveDependencyTreeSha256 = (root = resolve(repository, "node_modules")): string => {
+  const hash = createHash("sha256");
+  const visit = (path: string): void => {
+    for (const name of readdirSync(path).sort()) {
+      const absolute = join(path, name);
+      const normalized = relative(root, absolute).split("\\").join("/");
+      const stat = lstatSync(absolute);
+      if (stat.isDirectory()) {
+        hash.update(`d\0${normalized}\0`);
+        visit(absolute);
+      } else if (stat.isFile()) {
+        const noFollow = constants.O_NOFOLLOW;
+        if (typeof noFollow !== "number") throw new LiveRevisionError("no-follow dependency reads are unavailable");
+        const descriptor = openSync(absolute, constants.O_RDONLY | noFollow);
+        try {
+          const before = fstatSync(descriptor, { bigint: true });
+          if (!before.isFile() || before.dev !== BigInt(stat.dev) || before.ino !== BigInt(stat.ino))
+            throw new LiveRevisionError("installed dependency path changed while opened");
+          const bytes = readFileSync(descriptor);
+          const after = fstatSync(descriptor, { bigint: true });
+          if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+            || before.mode !== after.mode || before.uid !== after.uid || before.gid !== after.gid
+            || before.nlink !== after.nlink || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
+            || BigInt(bytes.byteLength) !== after.size)
+            throw new LiveRevisionError("installed dependency changed while read");
+          hash.update(`f\0${normalized}\0${after.size}\0`);
+          hash.update(bytes);
+        } finally { closeSync(descriptor); }
+      } else if (stat.isSymbolicLink()) {
+        hash.update(`l\0${normalized}\0${readlinkSync(absolute)}\0`);
+      } else throw new LiveRevisionError("installed dependency tree contains an unsupported entry");
+    }
+  };
+  visit(root);
+  return hash.digest("hex");
+};
+
 const verifyPinnedDependencies = (): void => {
+  if (Bun.version !== "1.3.14") throw new LiveRevisionError("live acceptance requires Bun 1.3.14");
   const manifest = JSON.parse(readFileSync(resolve(repository, "package.json"), "utf8")) as {
     readonly devDependencies?: Readonly<Record<string, string>>;
   };
@@ -50,9 +94,12 @@ const verifyPinnedDependencies = (): void => {
     const actual = packageVersion(resolve(repository, "node_modules", name, "package.json"));
     if (actual !== expected) throw new LiveRevisionError("installed live dependency does not match its pin");
   }
+  const expectedTree = LIVE_DEPENDENCY_TREE_SHA256[`${process.platform}-${process.arch}`];
+  if (!expectedTree || liveDependencyTreeSha256() !== expectedTree)
+    throw new LiveRevisionError("installed live dependency content does not match the release tree");
 };
 
-/** Verify tracked source and exact installed public-Pi package versions. */
+/** Verify tracked source plus exact installed public-Pi versions and dependency bytes. */
 export const verifyLiveRepositoryRevision = (
   expected: string,
   dependencies: LiveRevisionDependencies = {},

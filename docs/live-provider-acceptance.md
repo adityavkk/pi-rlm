@@ -5,10 +5,17 @@ The live suite is an operator-authorized, one-shot campaign against exactly two 
 ## Invocation
 
 ```sh
-bun run acceptance:live --consent /absolute/path/consent.json --output /absolute/path/report.json
+scripts/run-live-provider-acceptance.sh --consent /absolute/path/consent.json --output /absolute/path/report.json
 ```
 
-Arguments are exact. Extra, reordered, missing, or same-path arguments are rejected. Invalid authority is rejected before the provider-capable suite is dynamically imported. The inherited environment is passed unchanged to route children; the runner never reads or prints credential values.
+An operator may provide a one-shot JSON array with 1 to 16 private canary strings. The file follows the same owner, mode, no-follow, and consumption rules as consent.
+
+```sh
+scripts/run-live-provider-acceptance.sh --consent /absolute/path/consent.json --output /absolute/path/report.json \
+  --canary-file /absolute/path/canaries.json
+```
+
+Arguments are exact. Extra, reordered, missing, or repeated paths are rejected. Use the wrapper, which removes loader injection variables and starts Bun with automatic environment files disabled and an empty config. Invalid authority is rejected before the provider-capable suite is dynamically imported. The parent gives each route a new private home and a filtered copy of only that route's stored credential. It forwards only fixed process settings, the route variables used by Pi 0.80.10's pinned provider resolver, and environment names referenced by the API key template. OAuth token bodies and stored provider environment values are never scanned as templates. It rejects loader injection variables such as `NODE_OPTIONS`, `BUN_OPTIONS`, `LD_PRELOAD`, and `DYLD_*`. The runner never prints credential or canary values.
 
 ## Consent contract
 
@@ -19,7 +26,7 @@ Exact identity fields:
 - `purpose`: `pi-rlm-live-provider-acceptance`
 - `version`: `1`
 - `gitCommit`: lowercase 40-character commit hash
-- `suiteDigest`: `eec3091ee4221054fc92bb34ba2481ff728c204ba1bb40b49295e5627bb28d9b`
+- `suiteDigest`: `77c0a2e427a6d970bf7170e2bcd9e031db3434db67ed795ddaa71abfdb3e5723`
 - `fixtureDigest`: `af4c961a5d783e60f2116bb749bdef08e75c212190e3824bcb74ffd0b95405fb`
 - `issuedAtMs`, `expiresAtMs`: nonnegative safe-integer Unix milliseconds; expiry follows issuance
 - `nonce`: 32 to 128 URL-safe characters
@@ -38,7 +45,7 @@ Bounds:
 
 The fixed two-route plan currently requires at least 62 invocations, 1,024 output tokens per invocation, 413,282 estimated aggregate tokens, and 1,650,000 ms wall time. Use a deliberate catalog-estimate ceiling appropriate for the selected routes. The catalog estimate is post-reported from Pi usage metadata, not an actual or billed-cost guarantee.
 
-Run the campaign from a clean git checkout with the exact pinned Pi dependencies installed. Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates the package repository revision, tracked-file cleanliness, and installed dependency versions before consent, after consent, around each child, and before report publication. Each child repeats revision checks before importing scenarios and before publishing its result. The runner validates consent file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
+Run the campaign from a clean git checkout on the supported release platform with Bun 1.3.14 and the frozen lockfile. Construct consent offline, canonicalize with a trusted local tool, and set mode `0600`. The runner validates Bun 1.3.14, the package repository revision, tracked-file cleanliness, exact installed dependency versions, and a byte-level digest of the complete installed dependency tree. Each private input and report uses a bounded file descriptor read with complete metadata checks before and after the read. Node cannot bind directory traversal to an `openat` capability, so a hostile process running as the same user can still race path entries. Run live acceptance only on a trusted host. The runner performs these checks before consent, after consent, around each child, and before report publication. Each child repeats revision checks before importing scenarios and before publishing its result. The runner validates consent file identity before and after its bounded read, then atomically renames authority away before suite loading. Callback failure or process crash consumes authority. A normal completion removes the renamed file; a crash can leave a hidden consumed file for secure operator deletion. Never reuse or copy nonce-bearing consent.
 
 ## Fixed campaign
 
@@ -58,13 +65,13 @@ The child enforces fixed per-case and route invocation/output caps before calls.
 
 ## Containment and report
 
-The parent expands and verifies the full plan before spawning. Route children run serially with the current Bun executable, inherited environment, private `0700` roots inside the parent-owned suite tree, private canonical request/report files, bounded silent stdout/stderr drains, wall timeout, kill/reap, strict route binding, and cleanup in `finally`. The parent removes and verifies the complete tree after reaping, including when `SIGKILL` prevents worker cleanup. Any child stdout or stderr byte fails the campaign and is discarded.
+The parent expands and verifies the full plan before spawning. Route children run serially with the current Bun executable, route-specific filtered credentials and environment, private `0700` roots inside the parent-owned suite tree, private canonical request/report files, bounded silent stdout/stderr drains, wall timeout, kill/reap, strict route binding, and cleanup in `finally`. The parent removes and verifies the complete tree after reaping, including when `SIGKILL` prevents worker cleanup. Any child stdout or stderr byte fails the campaign and is discarded.
 
-The final report is at most 256 KiB, canonical JSON, and published as a same-directory atomic no-clobber `0600` file. It contains only fixed versions, aliases, digests, allowlisted case/code/verdict/usage-completeness values, booleans for committed thresholds, and bounded finite numeric accounting. Per-case records include calls, intents, settlements, attempts, tokens, Pi catalog estimate, provider/wall duration, output bytes, correctness ppm, concurrency, and source-sentinel hits. Provider/model names, prompts, source, raw outputs, errors, paths, URLs, headers, environment values, actual cost, and billed cost are rejected. Supplied secret canaries are checked against child and final canonical reports.
+The final report is at most 256 KiB, canonical JSON, and published as a same-directory atomic no-clobber `0600` file. It contains only fixed versions, aliases, consent-nonce-salted route digests, allowlisted case/code/verdict/usage-completeness values, booleans for committed thresholds, and bounded finite numeric accounting. Per-case records include calls, intents, settlements, attempts, tokens, Pi catalog estimate, provider/wall duration, output bytes, correctness ppm, concurrency, and source-sentinel hits. Provider/model names, prompts, source, raw outputs, errors, paths, URLs, headers, environment values, actual cost, and billed cost are rejected. Supplied secret canaries are checked against child and final canonical reports.
 
 ## Accepted evidence
 
-Commit `5594641` passed both exact routes in one contained campaign. The report records 34 Pi completion boundaries, 62,234 settled reported tokens, a $0.219819 Pi catalog estimate, one observed HTTP 4xx provider response per route, explicit cancellation usage `unknown_after_cancel`, and every benchmark threshold as true. See [`evidence/live-provider-acceptance-5594641.json`](evidence/live-provider-acceptance-5594641.json).
+The release page for `v0.1.0` carries the numeric report for the exact tagged source commit. Commit `5594641` remains the historical issue #26 campaign and passed both exact routes in one contained campaign. The report records 34 Pi completion boundaries, 62,234 settled reported tokens, a $0.219819 Pi catalog estimate, one observed HTTP 4xx provider response per route, explicit cancellation usage `unknown_after_cancel`, and every benchmark threshold as true. See [`evidence/live-provider-acceptance-5594641.json`](evidence/live-provider-acceptance-5594641.json).
 
 ## CI policy
 

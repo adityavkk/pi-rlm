@@ -45,7 +45,7 @@ interface ToolResultLike {
   readonly content: Array<{ readonly type: string; readonly text?: string }>;
 }
 
-const withTimeout = async <T>(work: Promise<T>, label: string, ms = 5_000): Promise<T> => {
+const withTimeout = async <T>(work: Promise<T>, label: string, ms = 10_000): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([

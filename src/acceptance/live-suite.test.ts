@@ -100,6 +100,129 @@ describe("contained live suite orchestration", () => {
     expect(report.totals.invocations).toBe(1);
   });
 
+  test("gives each route only its filtered credential and allowlisted environment", async () => {
+    const sourceHome = await privateRoot();
+    const sourceAgentDir = join(sourceHome, ".pi", "agent");
+    await mkdir(sourceAgentDir, { recursive: true, mode: 0o700 });
+    await chmod(join(sourceHome, ".pi"), 0o700);
+    await chmod(sourceAgentDir, 0o700);
+    const authPath = join(sourceAgentDir, "auth.json");
+    await writeFile(authPath, JSON.stringify({
+      "provider-one": {
+        type: "api_key",
+        key: "$ROUTE_ONLY_SECRET:${lowercase_route_key}:$$ESCAPED_SECRET:$!LITERAL_BANG:$HOME:$PI_CODING_AGENT_DIR",
+      },
+      "provider-two": { type: "api_key", key: "public-test-value" },
+      unrelated: { type: "api_key", key: "public-unrelated-value" },
+    }), { mode: 0o600 });
+    await chmod(authPath, 0o600);
+    const suiteRoot = await privateRoot();
+    let calls = 0;
+    try {
+      await runLiveProviderAcceptanceSuite({ consent: consent(), canaries: [] }, {
+        makeRoot: async () => suiteRoot,
+        now: () => 1_000,
+        sourceEnvironment: {
+          HOME: sourceHome,
+          PATH: process.env["PATH"],
+          ROUTE_ONLY_SECRET: "private-test-value",
+          lowercase_route_key: "private-lowercase-test-value",
+          ESCAPED_SECRET: "must-not-cross",
+          LITERAL_BANG: "must-not-cross",
+          PI_CODING_AGENT_DIR: sourceAgentDir,
+          UNRELATED_PROVIDER_SECRET: "must-not-cross",
+          NODE_OPTIONS: "must-not-cross",
+        },
+        runChild: async (input) => {
+          calls += 1;
+          expect(input.environment["HOME"]?.startsWith(suiteRoot)).toBe(true);
+          expect(input.environment["UNRELATED_PROVIDER_SECRET"]).toBeUndefined();
+          expect(input.environment["NODE_OPTIONS"]).toBeUndefined();
+          expect(input.environment["ESCAPED_SECRET"]).toBeUndefined();
+          expect(input.environment["LITERAL_BANG"]).toBeUndefined();
+          expect(input.environment["PI_CODING_AGENT_DIR"]).not.toBe(sourceAgentDir);
+          expect(input.environment["ROUTE_ONLY_SECRET"] !== undefined).toBe(calls === 1);
+          expect(input.environment["lowercase_route_key"] !== undefined).toBe(calls === 1);
+          const filtered = JSON.parse(await readFile(
+            join(input.environment["PI_CODING_AGENT_DIR"]!, "auth.json"), "utf8",
+          )) as Record<string, unknown>;
+          expect(Object.keys(filtered)).toEqual([calls === 1 ? "provider-one" : "provider-two"]);
+          return success(input);
+        },
+      });
+      expect(calls).toBe(2);
+      expect(await Bun.file(suiteRoot).exists()).toBe(false);
+    } finally {
+      await rm(sourceHome, { recursive: true, force: true });
+      await rm(suiteRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("mirrors pinned provider environment separation", async () => {
+    const sourceEnvironment = {
+      OPENAI_API_KEY: "private-openai-test-value",
+      ANTHROPIC_OAUTH_TOKEN: "private-anthropic-oauth-test-value",
+      ANTHROPIC_API_KEY: "private-anthropic-key-test-value",
+      COPILOT_GITHUB_TOKEN: "private-copilot-test-value",
+      GEMINI_API_KEY: "private-gemini-test-value",
+      GOOGLE_CLOUD_API_KEY: "private-vertex-key-test-value",
+      GOOGLE_APPLICATION_CREDENTIALS: "/private/vertex-test-file",
+      GOOGLE_CLOUD_PROJECT: "private-project-test-value",
+      GOOGLE_CLOUD_LOCATION: "private-location-test-value",
+    };
+    const routeSets: Array<{
+      routes: LiveConsent["routes"];
+      verify: (call: number, environment: Readonly<Record<string, string>>) => void;
+    }> = [
+      {
+        routes: [
+          { provider: "openai-codex", model: "one", apiFamily: "one" },
+          { provider: "openai", model: "two", apiFamily: "two" },
+        ],
+        verify: (call, environment) => {
+          expect(environment["OPENAI_API_KEY"] !== undefined).toBe(call === 2);
+        },
+      },
+      {
+        routes: [
+          { provider: "google", model: "one", apiFamily: "one" },
+          { provider: "google-vertex", model: "two", apiFamily: "two" },
+        ],
+        verify: (call, environment) => {
+          expect(environment["GEMINI_API_KEY"] !== undefined).toBe(call === 1);
+          expect(environment["GOOGLE_APPLICATION_CREDENTIALS"] !== undefined).toBe(call === 2);
+          expect(environment["GOOGLE_CLOUD_API_KEY"] !== undefined).toBe(call === 2);
+        },
+      },
+      {
+        routes: [
+          { provider: "anthropic", model: "one", apiFamily: "one" },
+          { provider: "github-copilot", model: "two", apiFamily: "two" },
+        ],
+        verify: (call, environment) => {
+          expect(environment["ANTHROPIC_OAUTH_TOKEN"] !== undefined).toBe(call === 1);
+          expect(environment["ANTHROPIC_API_KEY"] !== undefined).toBe(call === 1);
+          expect(environment["COPILOT_GITHUB_TOKEN"] !== undefined).toBe(call === 2);
+        },
+      },
+    ];
+    for (const routeSet of routeSets) {
+      let calls = 0;
+      await runLiveProviderAcceptanceSuite({
+        consent: { ...consent(), routes: routeSet.routes }, canaries: [],
+      }, {
+        now: () => 1_000,
+        sourceEnvironment,
+        runChild: async (input) => {
+          calls += 1;
+          routeSet.verify(calls, input.environment);
+          return success(input);
+        },
+      });
+      expect(calls).toBe(2);
+    }
+  });
+
   test("rejects timeout and any bounded child process output", async () => {
     for (const outcome of [
       { exitCode: 137, stdoutBytes: 0, stderrBytes: 0, timedOut: true },
@@ -125,7 +248,9 @@ describe("contained live suite orchestration", () => {
       })).rejects.toBeDefined();
     }
     const authority = consent();
-    const canary = (await import("./live-worker-contract.ts")).liveRouteDigest(authority.routes[0]);
+    const canary = (await import("./live-worker-contract.ts")).liveRouteDigest(
+      authority.routes[0], authority.nonce,
+    );
     await expect(runLiveProviderAcceptanceSuite({ consent: authority, canaries: [canary] }, {
       now: () => 1_000, runChild: success,
     })).rejects.toThrow(/canary/);
