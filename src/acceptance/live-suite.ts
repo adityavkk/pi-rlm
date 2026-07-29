@@ -146,7 +146,7 @@ const credentialEnvironmentNames = (value: unknown): readonly string[] => {
   const names = new Set<string>();
   const visit = (item: unknown): void => {
     if (typeof item === "string") {
-      for (const match of item.matchAll(/\$(?:\{([A-Z_][A-Z0-9_]*)\}|([A-Z_][A-Z0-9_]*))/g)) {
+      for (const match of item.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
         const name = match[1] ?? match[2];
         if (name && SAFE_ENVIRONMENT_NAME.test(name) && !FORBIDDEN_ENVIRONMENT_NAME.test(name)) names.add(name);
       }
