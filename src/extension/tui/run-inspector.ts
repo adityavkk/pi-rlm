@@ -177,14 +177,14 @@ export const projectRunInspectionItem = (value: unknown): string => {
       const segments = ["summary"];
       const status = enumValue(item["status"], SUMMARY_STATUS);
       if (status) segments.push(status);
-      addFrame(segments, "root", item["rootFrameId"]);
-      addNumber(segments, "events", item["eventCount"]);
+      const mode = enumValue(item["completionMode"], COMPLETION_MODE);
+      if (mode) segments.push(mode);
       addNumber(segments, "frames", item["frames"]);
       addNumber(segments, "cells", item["cells"]);
       addNumber(segments, "calls", item["committedCalls"]);
       addNumber(segments, "attempts", item["observedProviderAttempts"]);
-      const mode = enumValue(item["completionMode"], COMPLETION_MODE);
-      if (mode) segments.push(mode);
+      addNumber(segments, "events", item["eventCount"]);
+      addFrame(segments, "root", item["rootFrameId"]);
       const error = errorIdentity(item["error"]);
       if (error) segments.push(`error ${error}`);
       return sanitizeDisplayText(segments.join(" · "));

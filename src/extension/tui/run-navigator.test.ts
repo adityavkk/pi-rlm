@@ -100,7 +100,7 @@ describe("run navigator", () => {
     expect(serialized).not.toContain("SECRET");
     expect(serialized).not.toContain("objective");
     expect(serialized).not.toContain("session");
-    expect(rows.some((row) => row.source === "local+managed")).toBe(true);
+    expect(rows.some((row) => row.source === "local+managed" && row.activity === "owned")).toBe(true);
 
     for (const width of [50, 80, 120, 180]) {
       const lines = renderRunNavigator({ rows, selected: rows.length - 1 }, width);

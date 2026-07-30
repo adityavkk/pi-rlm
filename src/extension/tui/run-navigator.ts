@@ -174,7 +174,7 @@ export const projectRunNavigatorRows = (
         source: "local+managed",
         runId: local.runId ?? retained.runId,
         status: retained.status,
-        activity: retained.activity,
+        activity: "owned",
         bytes: retained.bytes,
         updatedAtMs: retained.updatedAtMs,
         inspectable: true,
