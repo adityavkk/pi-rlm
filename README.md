@@ -99,6 +99,8 @@ that extension. See [agent delegation](docs/agent-delegation.md).
 pi-rlm runs inside the normal Pi interface and keeps the active theme, model
 profile, skills, prompts, and other extensions. Its workflow view keeps live
 status and accounting visible without filling the conversation with raw metadata.
+This interface is on `main` after the protected `v0.1.0` tag. The walkthrough
+includes the exact commit to install.
 
 ![Active pi-rlm workflow inside a full themed Pi session](docs/images/tui-user-journey/active-run.png)
 
