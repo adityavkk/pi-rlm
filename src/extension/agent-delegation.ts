@@ -63,6 +63,7 @@ export const agentApprovalConfirmationMessage = (
     "",
     "Capability",
     "  This configured pi-subagents agent may receive tools that mutate files.",
+    "",
   ];
   let output = "";
   for (const line of lines) {

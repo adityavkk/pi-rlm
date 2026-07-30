@@ -183,8 +183,6 @@ export const projectRunInspectionItem = (value: unknown): string => {
       addNumber(segments, "cells", item["cells"]);
       addNumber(segments, "calls", item["committedCalls"]);
       addNumber(segments, "attempts", item["observedProviderAttempts"]);
-      addNumber(segments, "events", item["eventCount"]);
-      addFrame(segments, "root", item["rootFrameId"]);
       const error = errorIdentity(item["error"]);
       if (error) segments.push(`error ${error}`);
       return sanitizeDisplayText(segments.join(" · "));
