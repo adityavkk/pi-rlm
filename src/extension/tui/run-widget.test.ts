@@ -63,7 +63,8 @@ describe("RunWidget", () => {
       ]);
       const lines = widget.render(120);
       expect(timerCalls).toBe(0);
-      expect(lines[0]).toContain("cancelling");
+      expect(lines[1]).toContain("◐");
+      expect(lines[1]).toContain("#ncelling");
       expect(lines.join("\n")).not.toMatch(/session-must-not-render|hidden|provider/u);
       widget.dispose();
       expect(timerCalls).toBe(0);
@@ -78,7 +79,7 @@ describe("RunWidget", () => {
       active("rlm_one", "running", 1),
       active("rlm_two", "cancelling", 2),
     ]);
-    expect(widget.render(59)).toEqual(["RLM: 2 active, 1 cancelling · /rlm runs"]);
-    expect(widget.render(60)).toHaveLength(3);
+    expect(widget.render(59)).toEqual(["◐ RLM · 2 active · 1 cancelling"]);
+    expect(widget.render(60)).toHaveLength(5);
   });
 });

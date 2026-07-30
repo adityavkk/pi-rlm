@@ -1,16 +1,27 @@
 /** Bounded, inspect-only managed run navigator with a pure display projection. */
 
 import { isProxy } from "node:util/types";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ManagedRunListing } from "../../runtime/run-retention.ts";
 import type { CoordinatedRun } from "../run-coordinator.ts";
 import { sanitizeDisplayText, truncateDisplayLine } from "../run-display.ts";
+import {
+  compactBytes,
+  fitStyledLine,
+  padStyledLine,
+  plainVisualStyle,
+  renderPanel,
+  statusGlyph,
+  visualStyleForTheme,
+  type VisualStatus,
+  type VisualStyle,
+} from "./visual-style.ts";
 
 export const RUN_NAVIGATOR_MAX_LOCAL = 16;
 const RUN_NAVIGATOR_MAX_LOCAL_INPUT = 48;
 export const RUN_NAVIGATOR_MAX_MANAGED = 200;
-export const RUN_NAVIGATOR_MAX_VISIBLE = 12;
+export const RUN_NAVIGATOR_MAX_VISIBLE = 8;
 
 const RUN_NAME = /^run-[a-f0-9]{32}$/;
 const RUN_ID = /^run_[a-f0-9]{64}$/;
@@ -163,7 +174,7 @@ export const projectRunNavigatorRows = (
         source: "local+managed",
         runId: local.runId ?? retained.runId,
         status: retained.status,
-        activity: retained.activity,
+        activity: "owned",
         bytes: retained.bytes,
         updatedAtMs: retained.updatedAtMs,
         inspectable: true,
@@ -193,26 +204,63 @@ export interface RunNavigatorState {
   readonly loadFailed?: boolean;
 }
 
-const bytesLabel = (bytes: number): string => `${bytes} bytes`;
-const identitySuffix = (runId: string): string => runId.slice(-8);
+const identitySuffix = (value: string): string => value.slice(-8);
 
-export const renderRunNavigatorRow = (row: RunNavigatorRow, selected: boolean, width: number): string => {
-  const segments = [
-    `${selected ? ">" : " "} ${row.source}`,
-    row.localAlias,
-    row.runName,
-    row.runId ? `#${identitySuffix(row.runId)}` : undefined,
-    row.state,
-    row.status,
-    row.activity,
-    row.bytes === undefined ? undefined : bytesLabel(row.bytes),
-    row.inspectable ? "inspect" : "unbound",
-  ].filter((value): value is string => value !== undefined);
-  return truncateDisplayLine(sanitizeDisplayText(segments.join(" · ")), width);
+const rowStatus = (row: RunNavigatorRow): VisualStatus => {
+  if (row.state === "running" || row.state === "cancelling") return row.state;
+  if (row.status === "completed" || row.status === "failed" || row.status === "cancelled") return row.status;
+  return "inactive";
 };
 
-/** Deterministic width-bounded rendering; no theme or terminal cache. */
-export const renderRunNavigator = (state: RunNavigatorState, width: number): string[] => {
+const rowState = (row: RunNavigatorRow): string =>
+  row.state ?? row.status ?? (row.inspectable ? "retained" : "unbound");
+
+const rowIdentity = (row: RunNavigatorRow): string => {
+  if (row.localAlias) return sanitizeDisplayText(row.localAlias, 128);
+  if (row.runId) return `run #${identitySuffix(row.runId)}`;
+  if (row.runName) return `run #${identitySuffix(row.runName)}`;
+  return "unbound run";
+};
+
+const sourceLabel = (source: RunNavigatorRow["source"]): string =>
+  source === "local" ? "session" : source === "managed" ? "retained" : "both";
+
+export const renderRunNavigatorRow = (
+  row: RunNavigatorRow,
+  selected: boolean,
+  width: number,
+  style: VisualStyle = plainVisualStyle,
+): string => {
+  const limit = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
+  if (limit === 0) return "";
+  const selection = selected ? style.selected("›") : " ";
+  const marker = statusGlyph(rowStatus(row), style);
+  const identity = selected ? style.selected(rowIdentity(row)) : style.tone("text", rowIdentity(row));
+  const state = style.tone(rowStatus(row) === "failed" ? "error" : "muted", rowState(row));
+  const activity = style.tone("muted", row.activity ?? (row.state ? "owned" : "inactive"));
+  const stored = style.tone("muted", row.bytes === undefined ? "" : compactBytes(row.bytes));
+  const source = style.tone("muted", sourceLabel(row.source));
+
+  if (limit < 58)
+    return fitStyledLine(`${selection} ${marker} ${identity}  ${state}`, limit);
+  if (limit < 84)
+    return fitStyledLine(`${selection} ${marker} ${padStyledLine(identity, 24)} ${padStyledLine(state, 11)} ${padStyledLine(stored, 9, "right")}`, limit);
+  return fitStyledLine([
+    `${selection} ${marker}`,
+    padStyledLine(identity, 26),
+    padStyledLine(state, 11),
+    padStyledLine(activity, 10),
+    padStyledLine(stored, 9, "right"),
+    source,
+  ].join("  "), limit);
+};
+
+/** Deterministic width-bounded rendering with one responsive container. */
+export const renderRunNavigator = (
+  state: RunNavigatorState,
+  width: number,
+  style: VisualStyle = plainVisualStyle,
+): string[] => {
   const limit = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
   if (limit === 0) return [];
   const rows = state.rows.slice(0, RUN_NAVIGATOR_MAX_LOCAL + RUN_NAVIGATOR_MAX_MANAGED);
@@ -222,14 +270,35 @@ export const renderRunNavigator = (state: RunNavigatorState, width: number): str
     Math.max(0, rows.length - RUN_NAVIGATOR_MAX_VISIBLE),
   ));
   const visible = rows.slice(start, start + RUN_NAVIGATOR_MAX_VISIBLE);
-  const lines = ["RLM runs"];
-  if (state.loading) lines.push("loading managed metadata");
-  else if (state.loadFailed) lines.push("managed listing unavailable");
-  else if (rows.length === 0) lines.push("no runs");
-  visible.forEach((row, offset) => lines.push(renderRunNavigatorRow(row, start + offset === selected, limit)));
-  if (rows.length > RUN_NAVIGATOR_MAX_VISIBLE) lines.push(`${selected + 1}/${rows.length}`);
-  lines.push("↑/↓ select · enter inspect · r refresh · esc close");
-  return lines.map((line) => truncateDisplayLine(sanitizeDisplayText(line), limit));
+  const active = rows.filter((row) => row.state === "running" || row.state === "cancelling" || row.status === "active").length;
+  const completed = rows.filter((row) => row.status === "completed").length;
+  const failed = rows.filter((row) => row.status === "failed").length;
+  const title = [
+    "RLM runs",
+    `${active} active`,
+    `${completed} completed`,
+    ...(failed ? [`${failed} failed`] : []),
+  ].join(" · ");
+  const bodyWidth = Math.max(0, limit - 6);
+  const body: string[] = [];
+  if (bodyWidth >= 78) body.push(style.tone("muted", [
+    "  ", padStyledLine("Run", 26), padStyledLine("State", 11), padStyledLine("Activity", 10),
+    padStyledLine("Stored", 9, "right"), "Source",
+  ].join("  ")));
+  if (state.loading) body.push(`${statusGlyph("running", style)} ${style.tone("muted", "Refreshing managed metadata")}`);
+  else if (state.loadFailed) body.push(`${statusGlyph("failed", style)} ${style.tone("error", "Managed listing unavailable")}`);
+  else if (rows.length === 0) body.push(`${statusGlyph("inactive", style)} ${style.tone("muted", "No retained or active runs")}`);
+  visible.forEach((row, offset) => body.push(renderRunNavigatorRow(row, start + offset === selected, bodyWidth, style)));
+  if (rows.length > RUN_NAVIGATOR_MAX_VISIBLE)
+    body.push(style.tone("muted", `  ${selected + 1} of ${rows.length}`));
+  return renderPanel({
+    title,
+    body,
+    width: limit,
+    style,
+    surface: true,
+    footer: "↑↓ select · enter inspect · r refresh · esc close",
+  });
 };
 
 export type RunNavigatorResult =
@@ -241,6 +310,7 @@ export class RunNavigator implements Component {
   private disposed = false;
   private completed = false;
   private refreshing = false;
+  private readonly style: VisualStyle;
   private readonly abortListener = (): void => { this.complete({ type: "close" }); };
 
   constructor(
@@ -249,8 +319,10 @@ export class RunNavigator implements Component {
     private readonly requestRender: () => void = () => {},
     private readonly reload?: () => Promise<readonly RunNavigatorRow[]>,
     private readonly signal: AbortSignal = new AbortController().signal,
+    theme?: Theme,
   ) {
     this.state = { rows: rows.slice(0, RUN_NAVIGATOR_MAX_LOCAL + RUN_NAVIGATOR_MAX_MANAGED), selected: 0 };
+    this.style = visualStyleForTheme(theme);
     if (signal.aborted) this.complete({ type: "close" });
     else signal.addEventListener("abort", this.abortListener, { once: true });
   }
@@ -295,7 +367,7 @@ export class RunNavigator implements Component {
     if (row?.inspectable && row.runName) this.complete({ type: "inspect", runName: row.runName });
   }
 
-  render(width: number): string[] { return this.disposed ? [] : renderRunNavigator(this.state, width); }
+  render(width: number): string[] { return this.disposed ? [] : renderRunNavigator(this.state, width, this.style); }
   invalidate(): void {}
   dispose(): void {
     if (this.disposed) return;
@@ -361,13 +433,13 @@ export const openRunNavigator = async (
     let rawResult: unknown;
     try {
       if (!current()) return;
-      rawResult = await ctx.ui.custom<unknown>((tui: TUI, _theme, _keys, done) =>
+      rawResult = await ctx.ui.custom<unknown>((tui: TUI, theme, _keys, done) =>
         new RunNavigator(rows, done as (result: RunNavigatorResult) => void, () => tui.requestRender(),
           async () => {
             const refreshed = await loadRows(host, current);
             rows = refreshed;
             return refreshed;
-          }, signal), { overlay: true });
+          }, signal, theme));
       if (!current()) return;
     } catch {
       if (current()) try { ctx.ui.notify(truncateDisplayLine("RLM navigator UI is unavailable.", 160), "error"); } catch {}
