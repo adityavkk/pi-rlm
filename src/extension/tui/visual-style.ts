@@ -77,14 +77,17 @@ export const renderPanel = ({
 }: PanelOptions): string[] => {
   const limit = widthLimit(width);
   if (limit === 0) return [];
-  if (limit < 24) {
+  // Leave the terminal's last column untouched. Writing it can trigger autowrap
+  // before the host moves to the next component row.
+  const panelWidth = Math.max(1, limit - 1);
+  if (panelWidth < 24) {
     const compact = [style.strong(title), ...body, ...(footer ? [style.tone("muted", footer)] : [])]
-      .map((line) => fitStyledLine(line, limit))
+      .map((line) => fitStyledLine(line, panelWidth))
       .filter((line) => line.length > 0);
     return compact;
   }
 
-  const inner = limit - 2;
+  const inner = panelWidth - 2;
   const titleWidth = Math.max(1, inner - 3);
   const safeTitle = fitStyledLine(title, titleWidth);
   const topUsed = 2 + visibleWidth(safeTitle);
@@ -99,7 +102,7 @@ export const renderPanel = ({
   });
   const bottom = style.tone("border", `╰${"─".repeat(inner)}╯`);
   const framed = [top, ...framedBody, bottom].map((line) => {
-    const padded = padStyledLine(line, limit);
+    const padded = padStyledLine(line, panelWidth);
     return surface ? style.surface(padded) : padded;
   });
   if (!footer) return framed;

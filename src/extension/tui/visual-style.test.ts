@@ -9,10 +9,10 @@ import {
 
 describe("workflow visual primitives", () => {
   test("renders one closed width-exact panel and an external footer", () => {
-    for (const width of [24, 40, 80, 120]) {
+    for (const width of [25, 40, 80, 120]) {
       const lines = renderPanel({ title: "RLM runs · 1 active", body: ["● #12345678 controller"], width, footer: "esc close" });
       expect(lines).toHaveLength(4);
-      expect(lines.slice(0, -1).every((line) => visibleWidth(line) === width)).toBe(true);
+      expect(lines.slice(0, -1).every((line) => visibleWidth(line) === width - 1)).toBe(true);
       expect(lines.at(0)?.startsWith("╭─ ")).toBe(true);
       expect(lines.at(-2)?.startsWith("╰")).toBe(true);
       expect(lines.at(-1)?.trim()).toBe("esc close");
