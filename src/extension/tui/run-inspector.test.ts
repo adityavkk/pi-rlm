@@ -174,10 +174,11 @@ describe("run inspector", () => {
     };
     const component = new RunInspector(projected("summary", "cursor_2"), loader, () => {});
     for (let page = 2; page <= 40; page += 1) { component.handleInput("n"); await flush(); }
-    expect(component.render(100).join("\n")).toContain("page 40 · previous available");
+    expect(component.render(100).join("\n")).toContain("page 40");
+    expect(component.render(100).join("\n")).toContain("p previous");
     for (let page = 0; page < 32; page += 1) { component.handleInput("p"); await flush(); }
     expect(component.render(100).join("\n")).toContain("page 8");
-    expect(component.render(100).join("\n")).not.toContain("previous available");
+    expect(component.render(100).join("\n")).not.toContain("p previous");
     const before = loads.length;
     component.handleInput("p");
     await flush();

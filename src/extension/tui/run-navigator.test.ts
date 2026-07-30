@@ -104,7 +104,7 @@ describe("run navigator", () => {
 
     for (const width of [50, 80, 120, 180]) {
       const lines = renderRunNavigator({ rows, selected: rows.length - 1 }, width);
-      expect(lines.length).toBeLessThanOrEqual(16);
+      expect(lines.length).toBeLessThanOrEqual(14);
       expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
       expect(lines.join("\n")).not.toContain("SECRET");
     }
@@ -123,7 +123,7 @@ describe("run navigator", () => {
     await flush();
     expect(reloads).toBe(1);
     expect(renders).toBeGreaterThan(1);
-    expect(component.render(80).join("\n")).toContain(name("c"));
+    expect(component.render(80).join("\n")).toContain("run #cccccccc");
     component.handleInput("\r");
     expect(results).toEqual([{ type: "inspect", runName: name("c") }]);
     component.handleInput("\u001b");

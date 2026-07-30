@@ -1,5 +1,6 @@
 /** Bounded rlm_run call/result rendering without answer or error text. */
 
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { BudgetUsage } from "../../core/index.ts";
 import type { RlmResultMetadata } from "../result.ts";
@@ -8,6 +9,13 @@ import {
   sanitizeDisplayText,
   truncateDisplayLine,
 } from "../run-display.ts";
+import {
+  fitStyledLine,
+  plainVisualStyle,
+  statusGlyph,
+  visualStyleForTheme,
+  type VisualStyle,
+} from "./visual-style.ts";
 
 const SAFE_CODE = /^[A-Z][A-Z0-9_-]{0,63}$/;
 const SAFE_RUN_ID = /^run_[a-f0-9]{64}$/;
@@ -114,21 +122,30 @@ const projectMetadata = (value: unknown): ResultDisplayModel => {
   } catch { return invalidModel(); }
 };
 
-const statusText = (metadata: ResultDisplayModel): string => {
-  const identity = metadata.runId ? ` #${displayIdentitySuffix("", metadata.runId)}` : "";
+const statusText = (metadata: ResultDisplayModel, style: VisualStyle): string => {
+  const identity = metadata.runId
+    ? style.tone("accent", `#${displayIdentitySuffix("", metadata.runId)}`)
+    : "";
   if (metadata.status === "completed") {
     const mode = metadata.mode === "fallback_extract" ? "fallback extract" : "answer";
-    return `RLM completed${identity} · ${mode}`;
+    return [statusGlyph("completed", style), style.strong("RLM completed"), identity, style.tone("muted", mode)]
+      .filter(Boolean).join("  ");
   }
-  if (metadata.status === "cancelled") return `RLM cancelled${identity}`;
-  return `RLM failed${identity} · ${code(metadata.errorCode, "RLM_RUN_FAILED")}`;
+  if (metadata.status === "cancelled")
+    return [statusGlyph("cancelled", style), style.strong("RLM cancelled"), identity].filter(Boolean).join("  ");
+  return [
+    statusGlyph("failed", style),
+    style.strong("RLM failed"),
+    identity,
+    style.tone("error", code(metadata.errorCode, "RLM_RUN_FAILED")),
+  ].filter(Boolean).join("  ");
 };
 
 const usageText = (usage: BudgetUsage): string => {
   const segments = [
-    `usage calls ${integer(usage.logicalCalls)}`,
+    `calls ${integer(usage.logicalCalls)}`,
     `frames ${integer(usage.framesOpened)}`,
-    `tokens ${compact(usage.tokensUsed)}`,
+    `${compact(usage.tokensUsed)} tok`,
   ];
   const cost = finite(usage.costUsd);
   if (cost > 0) segments.push(`$${cost.toFixed(4)}`);
@@ -137,14 +154,18 @@ const usageText = (usage: BudgetUsage): string => {
   return segments.join(" · ");
 };
 
-const renderModel = (safe: ResultDisplayModel, width: number): string[] => {
-  const lines = [statusText(safe)];
-  if (safe.usage) lines.push(usageText(safe.usage));
+const renderModel = (
+  safe: ResultDisplayModel,
+  width: number,
+  style: VisualStyle = plainVisualStyle,
+): string[] => {
+  const lines = [statusText(safe, style)];
+  if (safe.usage) lines.push(`  ${style.tone("muted", usageText(safe.usage))}`);
   if (safe.warningCodes.length > 0)
-    lines.push(`warnings ${safe.warningCodes.length}: ${safe.warningCodes.join(", ")}`);
+    lines.push(`  ${statusGlyph("approval", style)} ${style.tone("warning", `${safe.warningCodes.length} warnings`)}  ${style.tone("muted", safe.warningCodes.join(", "))}`);
   if (safe.truncation.truncated)
-    lines.push(`result truncated · ${compact(safe.truncation.originalBytes)} bytes · ${compact(safe.truncation.omittedBytes)} omitted`);
-  return lines.map((line) => truncateDisplayLine(line, width)).filter((line) => line.length > 0);
+    lines.push(`  ${statusGlyph("approval", style)} ${style.tone("warning", "Result truncated")}  ${style.tone("muted", `${compact(safe.truncation.originalBytes)} bytes · ${compact(safe.truncation.omittedBytes)} omitted`)}`);
+  return lines.map((line) => fitStyledLine(line, width)).filter((line) => line.length > 0);
 };
 
 /** Render result details from bounded metadata only, never content/error text or output refs. */
@@ -155,23 +176,29 @@ export const renderRlmRunCall = (width: number): string[] =>
   [truncateDisplayLine("RLM run", width)].filter((line) => line.length > 0);
 
 export class RlmRunCallComponent implements Component {
-  render(width: number): string[] { return renderRlmRunCall(width); }
+  private readonly style: VisualStyle;
+  constructor(theme?: Theme) { this.style = visualStyleForTheme(theme); }
+  render(width: number): string[] { return [fitStyledLine(this.style.strong("RLM run"), width)].filter(Boolean); }
   invalidate(): void {}
 }
 
 export class RlmRunResultComponent implements Component {
   private readonly metadata: ResultDisplayModel;
-  constructor(metadata: unknown) { this.metadata = projectMetadata(metadata); }
-  render(width: number): string[] { return renderModel(this.metadata, width); }
+  private readonly style: VisualStyle;
+  constructor(metadata: unknown, theme?: Theme) {
+    this.metadata = projectMetadata(metadata);
+    this.style = visualStyleForTheme(theme);
+  }
+  render(width: number): string[] { return renderModel(this.metadata, width, this.style); }
   invalidate(): void {}
 }
 
-export const renderRlmRunCallComponent = (): Component => new RlmRunCallComponent();
-export const renderRlmRunResultComponent = (metadata: unknown): Component =>
-  new RlmRunResultComponent(metadata);
+export const renderRlmRunCallComponent = (theme?: Theme): Component => new RlmRunCallComponent(theme);
+export const renderRlmRunResultComponent = (metadata: unknown, theme?: Theme): Component =>
+  new RlmRunResultComponent(metadata, theme);
 
 /** No-throw Pi adapter. It never accesses result.content and never permits raw fallback. */
-export const renderRlmToolResultComponent = (result: unknown): Component => {
-  try { return new RlmRunResultComponent(own(result, "details")); }
-  catch { return new RlmRunResultComponent(undefined); }
+export const renderRlmToolResultComponent = (result: unknown, theme?: Theme): Component => {
+  try { return new RlmRunResultComponent(own(result, "details"), theme); }
+  catch { return new RlmRunResultComponent(undefined, theme); }
 };

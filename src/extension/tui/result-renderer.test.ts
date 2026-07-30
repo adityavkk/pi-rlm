@@ -48,20 +48,20 @@ describe("rlm result renderer", () => {
     expect(states).toMatchInlineSnapshot(`
       {
         "answer": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
         ],
         "cancelled": [
-          "RLM cancelled #aaaaaaaa",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
+          "-  RLM cancelled  #aaaaaaaa",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
         ],
         "failed": [
-          "RLM failed #aaaaaaaa · BUDGET_CALLS",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
+          "×  RLM failed  #aaaaaaaa  BUDGET_CALLS",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
         ],
         "fallback": [
-          "RLM completed #aaaaaaaa · fallback extract",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
+          "✓  RLM completed  #aaaaaaaa  fallback extract",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
         ],
       }
     `);
@@ -81,47 +81,47 @@ describe("rlm result renderer", () => {
     expect(snapshots).toMatchInlineSnapshot(`
       {
         "100": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
         "120": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
         "180": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
         "50": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345…",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_…",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · prov\x1B[0m…\x1B[0m",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENT\x1B[0m…\x1B[0m",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
         "60": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provide…",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FA…",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENTION_CLEANU\x1B[0m…\x1B[0m",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
         "80": [
-          "RLM completed #aaaaaaaa · answer",
-          "usage calls 12 · frames 7 · tokens 123k · $1.2345 · provider 12.3s",
-          "warnings 2: RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
-          "result truncated · 100k bytes · 34k omitted",
+          "✓  RLM completed  #aaaaaaaa  answer",
+          "  calls 12 · frames 7 · 123k tok · $1.2345 · provider 12.3s",
+          "  ! 2 warnings  RETENTION_METADATA_FAILED, RETENTION_CLEANUP_FAILED",
+          "  ! Result truncated  100k bytes · 34k omitted",
         ],
       }
     `);
     for (const [width, lines] of Object.entries(snapshots))
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(Number(width));
-    expect(snapshots[180]!.join("\n")).toMatch(/warnings 2:.*RETENTION_METADATA_FAILED/u);
-    expect(snapshots[180]!.join("\n")).toContain("usage calls 12");
+    expect(snapshots[180]!.join("\n")).toMatch(/2 warnings.*RETENTION_METADATA_FAILED/u);
+    expect(snapshots[180]!.join("\n")).toContain("calls 12");
     expect(snapshots[180]!.join("\n")).toContain("100k bytes · 34k omitted");
   });
 
@@ -147,16 +147,16 @@ describe("rlm result renderer", () => {
   test("hostile details and usage cannot throw into Pi raw-content fallback", () => {
     const throwing = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error("raw secret"); } });
     expect(() => renderRlmRunResult(throwing, 80)).not.toThrow();
-    expect(renderRlmRunResult(throwing, 80)).toEqual(["RLM failed · RLM_RESULT_INVALID"]);
+    expect(renderRlmRunResult(throwing, 80)).toEqual(["×  RLM failed  RLM_RESULT_INVALID"]);
     expect(() => renderRlmToolResultComponent(throwing).render(80)).not.toThrow();
-    expect(renderRlmToolResultComponent(throwing).render(80)).toEqual(["RLM failed · RLM_RESULT_INVALID"]);
+    expect(renderRlmToolResultComponent(throwing).render(80)).toEqual(["×  RLM failed  RLM_RESULT_INVALID"]);
 
     const getter = Object.defineProperty({}, "details", { get: () => { throw new Error("raw answer"); } });
-    expect(renderRlmToolResultComponent(getter).render(80)).toEqual(["RLM failed · RLM_RESULT_INVALID"]);
+    expect(renderRlmToolResultComponent(getter).render(80)).toEqual(["×  RLM failed  RLM_RESULT_INVALID"]);
     const hostileUsage = Object.defineProperty({}, "tokensUsed", { get: () => { throw new Error("raw path"); } });
     const withUsage = { ...base(), usage: hostileUsage };
     expect(renderRlmRunResult(withUsage, 80).join("\n")).not.toMatch(/raw|path/u);
-    expect(renderRlmRunResult({ ...base(), mode: null }, 80)[0]).toBe("RLM failed #aaaaaaaa · RLM_RESULT_INVALID");
+    expect(renderRlmRunResult({ ...base(), mode: null }, 80)[0]).toBe("×  RLM failed  #aaaaaaaa  RLM_RESULT_INVALID");
   });
 
   test("public-root components and adapters are pure width-aware renderers", () => {

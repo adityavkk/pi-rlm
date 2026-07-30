@@ -1,7 +1,7 @@
 /** Bounded inspect-only TUI projection for authenticated managed-run pages. */
 
 import { isProxy } from "node:util/types";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
 import {
   DEFAULT_RUN_INSPECTION_PAGE_SIZE,
@@ -11,10 +11,20 @@ import {
   type RunInspectionView,
 } from "../../runtime/run-inspection-types.ts";
 import { sanitizeDisplayText, truncateDisplayLine } from "../run-display.ts";
+import { visualStyleForTheme, type VisualStyle } from "./visual-style.ts";
+import {
+  renderRunInspector,
+  RUN_INSPECTOR_VIEWS,
+  type RunInspectionProjection,
+  type RunInspectorState,
+} from "./run-inspector-view.ts";
+export {
+  renderRunInspector,
+  RUN_INSPECTOR_MAX_VISIBLE,
+  RUN_INSPECTOR_VIEWS,
+} from "./run-inspector-view.ts";
+export type { RunInspectionProjection, RunInspectorState } from "./run-inspector-view.ts";
 
-export const RUN_INSPECTOR_VIEWS: readonly RunInspectionView[] = Object.freeze([
-  "summary", "frames", "cells", "calls", "budget", "errors",
-]);
 export const RUN_INSPECTOR_PAGE_SIZE = 50;
 export const RUN_INSPECTOR_MAX_CURSOR_HISTORY = 32;
 
@@ -270,17 +280,6 @@ export const projectRunInspectionItem = (value: unknown): string => {
   return "invalid metadata item";
 };
 
-export interface RunInspectionProjection {
-  readonly runName: string;
-  readonly runId: string;
-  readonly manifestHash: string;
-  readonly journalPrefixSha256: string;
-  readonly eventCount: number;
-  readonly view: RunInspectionView;
-  readonly rows: readonly string[];
-  readonly nextCursor?: string;
-}
-
 /** Bound the page cache to 50 safe rendered identities and one bounded cursor. */
 export const projectRunInspectionPage = (
   raw: RunInspectionPage,
@@ -320,33 +319,6 @@ export const projectRunInspectionPage = (
   } catch { throw new TypeError("invalid managed inspection page projection"); }
 };
 
-export interface RunInspectorState {
-  readonly page: RunInspectionProjection;
-  readonly pageNumber: number;
-  readonly hasPrevious?: boolean;
-  readonly loading?: boolean;
-  readonly loadFailed?: boolean;
-}
-
-export const renderRunInspector = (state: RunInspectorState, width: number): string[] => {
-  const limit = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
-  if (limit === 0) return [];
-  const page = state.page;
-  const tabs = RUN_INSPECTOR_VIEWS.map((view) => view === page.view ? `[${view}]` : view).join(" · ");
-  const lines = [
-    `RLM inspect ${page.runName}`,
-    tabs,
-    `run #${page.runId.slice(-8)} · manifest ${page.manifestHash.slice(0, 12)} · journal ${page.journalPrefixSha256.slice(0, 12)} · events ${page.eventCount}`,
-  ];
-  if (state.loading) lines.push("loading inspection page");
-  else if (state.loadFailed) lines.push("inspection page unavailable");
-  if (page.rows.length === 0) lines.push("no metadata items");
-  else page.rows.slice(0, RUN_INSPECTOR_PAGE_SIZE).forEach((row, index) => lines.push(`${index + 1}. ${row}`));
-  lines.push(`page ${state.pageNumber}${state.hasPrevious ? " · previous available" : ""}${page.nextCursor ? " · next available" : ""}`);
-  lines.push("←/→ tabs · n/p available pages · r refresh · backspace/esc back");
-  return lines.map((line) => truncateDisplayLine(sanitizeDisplayText(line), limit));
-};
-
 export type RunInspectorLoader = (view: RunInspectionView, cursor?: string) => Promise<RunInspectionProjection>;
 interface BackCursor { readonly cursor?: string; readonly pageNumber: number }
 
@@ -357,6 +329,7 @@ export class RunInspector implements Component {
   private disposed = false;
   private completed = false;
   private generation = 0;
+  private readonly style: VisualStyle;
   private readonly abortListener = (): void => { this.complete(); };
 
   constructor(
@@ -365,8 +338,10 @@ export class RunInspector implements Component {
     private readonly done: () => void,
     private readonly requestRender: () => void = () => {},
     private readonly signal: AbortSignal = new AbortController().signal,
+    theme?: Theme,
   ) {
-    this.state = { page, pageNumber: 1, hasPrevious: false };
+    this.state = { page, pageNumber: 1, selected: 0, hasPrevious: false };
+    this.style = visualStyleForTheme(theme);
     if (signal.aborted) this.complete();
     else signal.addEventListener("abort", this.abortListener, { once: true });
   }
@@ -392,7 +367,7 @@ export class RunInspector implements Component {
       if (this.disposed || this.completed || this.signal.aborted || generation !== this.generation) return;
       this.backCursors = backCursors.slice(-RUN_INSPECTOR_MAX_CURSOR_HISTORY);
       this.currentCursor = cursor;
-      this.state = { page, pageNumber, hasPrevious: this.backCursors.length > 0 };
+      this.state = { page, pageNumber, selected: 0, hasPrevious: this.backCursors.length > 0 };
     }, () => {
       if (this.disposed || this.completed || this.signal.aborted || generation !== this.generation) return;
       this.state = { ...this.state, loading: false, loadFailed: true };
@@ -405,6 +380,13 @@ export class RunInspector implements Component {
     const current = RUN_INSPECTOR_VIEWS.indexOf(this.state.page.view);
     const view = RUN_INSPECTOR_VIEWS[(current + delta + RUN_INSPECTOR_VIEWS.length) % RUN_INSPECTOR_VIEWS.length]!;
     this.request(view, undefined, [], 1);
+  }
+  private move(delta: number): void {
+    const length = this.state.page.rows.length;
+    if (length === 0) return;
+    const selected = ((this.state.selected ?? 0) + delta + length) % length;
+    this.state = { ...this.state, selected };
+    this.renderRequested();
   }
   private next(): void {
     const cursor = this.state.page.nextCursor;
@@ -426,13 +408,15 @@ export class RunInspector implements Component {
     }
     if (matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"))) { this.switchView(-1); return; }
     if (matchesKey(data, Key.right) || matchesKey(data, Key.tab)) { this.switchView(1); return; }
+    if (matchesKey(data, Key.up)) { this.move(-1); return; }
+    if (matchesKey(data, Key.down)) { this.move(1); return; }
     if (matchesKey(data, Key.pageDown) || matchesKey(data, "n")) { this.next(); return; }
     if (matchesKey(data, Key.pageUp) || matchesKey(data, "p")) { this.previous(); return; }
     if (matchesKey(data, "r"))
       this.request(this.state.page.view, this.currentCursor, [...this.backCursors], this.state.pageNumber);
   }
 
-  render(width: number): string[] { return this.disposed ? [] : renderRunInspector(this.state, width); }
+  render(width: number): string[] { return this.disposed ? [] : renderRunInspector(this.state, width, this.style); }
   invalidate(): void {}
   dispose(): void {
     if (this.disposed) return;
@@ -488,8 +472,11 @@ export const openRunInspector = async (
   if (!current()) return;
   try {
     if (!current()) return;
-    await ctx.ui.custom<void>((tui: TUI, _theme, _keys, done) =>
-      new RunInspector(page, load, () => done(), () => tui.requestRender(), signal), { overlay: true });
+    await ctx.ui.custom<void>((tui: TUI, theme, _keys, done) =>
+      new RunInspector(page, load, () => done(), () => tui.requestRender(), signal, theme), {
+      overlay: true,
+      overlayOptions: { width: "92%", maxHeight: "82%", anchor: "center", margin: 1 },
+    });
     if (!current()) return;
   } catch {
     if (current()) try { ctx.ui.notify(truncateDisplayLine("RLM inspector UI is unavailable.", 160), "error"); } catch {}

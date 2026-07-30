@@ -113,8 +113,10 @@ import {
 import { truncateDisplayLine } from "./src/extension/run-display.ts";
 import {
   renderRlmRunCallComponent,
+  renderRlmRunResultComponent,
   renderRlmToolResultComponent,
 } from "./src/extension/tui/result-renderer.ts";
+import { renderRlmManagementResultComponent } from "./src/extension/tui/management-renderer.ts";
 
 export const LAUNCH_SNIPPET =
   "pi-rlm runs long-context recursive model/agent workflows in a sandboxed JS controller. " +
@@ -485,6 +487,10 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
+  pi.registerMessageRenderer?.<RlmResultMetadata>("pi-rlm-result", (message, _options, theme) =>
+    renderRlmRunResultComponent(message.details, theme));
+  pi.registerMessageRenderer?.<RlmManagementMetadata>("pi-rlm-management-result", (message, _options, theme) =>
+    renderRlmManagementResultComponent(message.details, theme));
   const extensionAgentDelegation = createExtensionAgentDelegation(pi);
   const now = dependencies.now ?? Date.now;
   const createId = dependencies.createId ?? randomUUID;
@@ -1177,7 +1183,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     widgetContext = ctx;
     let factoryConsumed = false;
     try {
-      ctx.ui.setWidget("pi-rlm-runs", (tui) => {
+      ctx.ui.setWidget("pi-rlm-runs", (tui, theme) => {
         if (factoryConsumed || installation !== widgetInstallation || widgetContext !== ctx || ctx.mode !== "tui") {
           const stale = new RunWidget();
           stale.dispose();
@@ -1190,7 +1196,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
           if (runWidget !== widget) return;
           runWidget = undefined;
           stopWidgetRefresh();
-        });
+        }, theme);
         runWidget = widget;
         syncWidgetRefresh(runCoordinator.list());
         return widget;
@@ -1517,8 +1523,8 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
       "Do not use rlm_run for routine tasks one agent can complete directly.",
     ],
     parameters: RlmRunParams,
-    renderCall: () => renderRlmRunCallComponent(),
-    renderResult: (result) => renderRlmToolResultComponent(result),
+    renderCall: (_args, theme) => renderRlmRunCallComponent(theme),
+    renderResult: (result, _options, theme) => renderRlmToolResultComponent(result, theme),
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<RlmResultMetadata>> {
       const toolSignal = signal ?? new AbortController().signal;
       const callKey = `${ctx.sessionManager.getSessionId()}:${toolCallId}`;

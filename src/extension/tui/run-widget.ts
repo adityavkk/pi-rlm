@@ -1,7 +1,9 @@
 /** Public-root Pi TUI component for the bounded active-run display. */
 
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { CoordinatedRun } from "../run-coordinator.ts";
+import { visualStyleForTheme, type VisualStyle } from "./visual-style.ts";
 import {
   projectRunDisplayItems,
   renderRunDisplay,
@@ -15,15 +17,23 @@ export class RunWidget implements Component {
   private disposed = false;
   private readonly requestRender: RunWidgetRequestRender;
   private readonly onDispose: () => void;
+  private readonly style: VisualStyle;
 
   constructor(requestRender?: RunWidgetRequestRender);
-  constructor(runs?: readonly CoordinatedRun[], requestRender?: RunWidgetRequestRender, onDispose?: () => void);
+  constructor(
+    runs?: readonly CoordinatedRun[],
+    requestRender?: RunWidgetRequestRender,
+    onDispose?: () => void,
+    theme?: Theme,
+  );
   constructor(
     runsOrRequest: readonly CoordinatedRun[] | RunWidgetRequestRender = [],
     requestRender: RunWidgetRequestRender = () => {},
     onDispose: () => void = () => {},
+    theme?: Theme,
   ) {
     this.onDispose = onDispose;
+    this.style = visualStyleForTheme(theme);
     if (typeof runsOrRequest === "function") {
       this.requestRender = runsOrRequest;
     } else {
@@ -40,7 +50,7 @@ export class RunWidget implements Component {
   }
 
   render(width: number): string[] {
-    return this.disposed ? [] : renderRunDisplay(this.runs, width);
+    return this.disposed ? [] : renderRunDisplay(this.runs, width, this.style);
   }
 
   invalidate(): void {

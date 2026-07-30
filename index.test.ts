@@ -94,6 +94,7 @@ const harness = (options: {
 } = {}) => {
   const tools: CapturedTool[] = [];
   const commands = new Map<string, CapturedCommand>();
+  const messageRenderers = new Map<string, (...args: unknown[]) => { render(width: number): string[] } | undefined>();
   const events = new Map<string, EventHandler[]>();
   const audits: Array<{ type: string; data: Record<string, unknown> }> = [];
   const resultEntries: Array<{ type: string; data: Record<string, unknown> }> = [];
@@ -154,6 +155,8 @@ const harness = (options: {
   const pi = {
     registerTool: (definition: CapturedTool) => tools.push(definition),
     registerCommand: (name: string, definition: CapturedCommand) => commands.set(name, definition),
+    registerMessageRenderer: (name: string, renderer: (...args: unknown[]) => { render(width: number): string[] }) =>
+      messageRenderers.set(name, renderer),
     on: (name: string, handler: EventHandler) => events.set(name, [...(events.get(name) ?? []), handler]),
     appendEntry: (type: string, data: Record<string, unknown>) => {
       options.onAppend?.(type, data);
@@ -203,6 +206,7 @@ const harness = (options: {
   return {
     tools,
     commands,
+    messageRenderers,
     audits,
     resultEntries,
     resultMessages,
@@ -593,8 +597,32 @@ describe("pi-rlm extension wiring", () => {
       getOwnPropertyDescriptor: () => { throw new Error("raw result"); },
     });
     expect(() => tool.renderResult!(result, {}, {}, {}).render(80)).not.toThrow();
-    expect(tool.renderResult!(result, {}, {}, {}).render(80)).toEqual(["RLM failed · RLM_RESULT_INVALID"]);
+    expect(tool.renderResult!(result, {}, {}, {}).render(80)).toEqual(["×  RLM failed  RLM_RESULT_INVALID"]);
     expect(tool.renderResult!({ details: hostile }, {}, {}, {}).render(80).join("\n")).not.toContain("RAW");
+  });
+
+  test("custom result renderers replace raw command JSON with compact bounded summaries", () => {
+    const h = harness();
+    expect([...h.messageRenderers.keys()].sort()).toEqual(["pi-rlm-management-result", "pi-rlm-result"]);
+    const result = h.messageRenderers.get("pi-rlm-result")!({
+      details: {
+        runId: `run_${"a".repeat(64)}`, status: "completed", mode: "answer", usage: null,
+        warningCodes: [], truncation: { truncated: false, originalBytes: 1, omittedBytes: 0 },
+        answer: "RAW ANSWER",
+      },
+    }, {}, {})!.render(100).join("\n");
+    expect(result).toContain("RLM completed");
+    expect(result).not.toContain("RAW ANSWER");
+
+    const management = h.messageRenderers.get("pi-rlm-management-result")!({
+      details: {
+        version: 1, operation: "runs", status: "completed", code: "RLM_RUNS_LISTED",
+        message: "Managed run metadata listed.", counts: { listed: 2 }, rows: ["RAW JSON ROW"], warningCodes: [],
+      },
+    }, {}, {})!.render(100).join("\n");
+    expect(management).toContain("RLM runs");
+    expect(management).toContain("listed 2");
+    expect(management).not.toContain("RAW JSON ROW");
   });
 
   test("widget installs only in TUI mode and disposes on session replacement", async () => {
@@ -613,7 +641,8 @@ describe("pi-rlm extension wiring", () => {
     coordinator.setSession("session-1", 1);
     coordinator.create({ sessionId: "session-1", authorizationGeneration: 1, objective: "active" });
     expect(renders).toBe(1);
-    expect(widget.render(80)[0]).toContain("RLM running");
+    expect(widget.render(80)[0]).toContain("RLM runs · 1 active");
+    expect(widget.render(80).join("\n")).toContain("initializing");
     await tui.emit("session_before_switch");
     expect(widget.render(80)).toEqual([]);
     expect(tui.widgets.at(-1)?.content).toBeUndefined();

@@ -49,15 +49,20 @@ export const agentApprovalConfirmationMessage = (
   requestSha256: string,
 ): string => {
   const lines = [
-    `Agent: ${field(request.agent, 128, "(invalid)")}`,
-    `Call ID: ${field(request.callId, 256, "(invalid)")}`,
-    `Exact approval request SHA-256: ${field(requestSha256, 64, "(invalid)")}`,
-    `Task SHA-256: ${field(request.taskSha256, 64, "(invalid)")}`,
-    `Context routing: ${field(request.context, 16, "(invalid)")}`,
-    `Model routing: ${field(request.model, 256)}`,
-    `Thinking routing: ${field(request.thinking, 256)}`,
-    `Task preview: ${field(request.taskPreview, 1024, "(empty)")}`,
-    "Capability warning: the configured pi-subagents agent may receive tools that mutate files.",
+    "Delegated agent",
+    `  Agent       ${field(request.agent, 128, "(invalid)")}`,
+    `  Routing     ${field(request.model, 256)} · ${field(request.thinking, 256)} · ${field(request.context, 16, "(invalid)")}`,
+    "",
+    "Exact request",
+    `  Call        ${field(request.callId, 256, "(invalid)")}`,
+    `  Request SHA ${field(requestSha256, 64, "(invalid)")}`,
+    `  Task SHA    ${field(request.taskSha256, 64, "(invalid)")}`,
+    "",
+    "Task preview",
+    `  ${field(request.taskPreview, 1024, "(empty)")}`,
+    "",
+    "Capability",
+    "  This configured pi-subagents agent may receive tools that mutate files.",
   ];
   let output = "";
   for (const line of lines) {
@@ -90,7 +95,7 @@ export const createExtensionAgentDelegation = (pi: ExtensionAPI) => {
         try {
           if (!sessionGuard(sessionId, generation, signal, ctx)) return false;
           const approved = await waitForAbort(ctx.ui.confirm(
-            "Approve exact delegated Pi agent request?",
+            "Approve delegated Pi agent?",
             agentApprovalConfirmationMessage(request, requestSha256),
             { signal, timeout: approvalTimeoutMs },
           ), signal);

@@ -347,6 +347,10 @@ describe("opaque-agent confirmation policy", () => {
     expect(message).not.toMatch(/[\u001b\u0007\u202e]/u);
     expect(message).not.toContain("model\nHostile");
     expect(message).not.toContain("safe\nInjected");
-    expect(message.split("\n")).toHaveLength(9);
+    expect(message.split("\n")).toHaveLength(14);
+    expect(message).toContain("Delegated agent\n");
+    expect(message).toContain("Exact request\n");
+    expect(message).toContain("Task preview\n");
+    expect(message).toContain("Capability\n");
   });
 });

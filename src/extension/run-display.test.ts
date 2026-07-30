@@ -82,37 +82,47 @@ describe("responsive run rendering", () => {
     expect(rendered).toMatchInlineSnapshot(`
       {
         "100": [
-          "RLM cancelling #ncel_new · finalizing · calls 2a/123t/4f · frames 3a/12t · elapsed 1h02m",
-          "RLM cancelling #ncel_old · extractor · calls 2a/123t/4f · frames 3a/12t · elapsed 1h02m",
-          "RLM running #22222222 · journal · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "+2 more · /rlm runs · /rlm cancel <id>",
+          "╭─ RLM runs · 5 active · +2 more───────────────────────────────────────────────────────────────────╮",
+          "│ ◐  #ncel_new  finalizing  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m    │",
+          "│ ◐  #ncel_old  extractor  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m     │",
+          "│ ●  #22222222  journal  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m       │",
+          "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+          "  /rlm runs for details",
         ],
         "120": [
-          "RLM cancelling #ncel_new · finalizing · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "RLM cancelling #ncel_old · extractor · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "RLM running #22222222 · journal · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "+2 more · /rlm runs · /rlm cancel <id>",
+          "╭─ RLM runs · 5 active · +2 more───────────────────────────────────────────────────────────────────────────────────────╮",
+          "│ ◐  #ncel_new  finalizing  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                        │",
+          "│ ◐  #ncel_old  extractor  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                         │",
+          "│ ●  #22222222  journal  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                           │",
+          "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+          "  /rlm runs for details",
         ],
         "180": [
-          "RLM cancelling #ncel_new · finalizing · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "RLM cancelling #ncel_old · extractor · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "RLM running #22222222 · journal · calls 2a/123t/4f · frames 3a/12t · tokens 1.2m · elapsed 1h02m",
-          "+2 more · /rlm runs · /rlm cancel <id>",
+          "╭─ RLM runs · 5 active · +2 more───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+          "│ ◐  #ncel_new  finalizing  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                                                                                    │",
+          "│ ◐  #ncel_old  extractor  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                                                                                     │",
+          "│ ●  #22222222  journal  calls 123  2 active  4 failed  frames 12  3 active  1.2m tok  1h02m                                                                                       │",
+          "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+          "  /rlm runs for details",
         ],
         "50": [
-          "RLM: 5 active, 2 cancelling · /rlm runs",
+          "◐ RLM · 5 active · 2 cancelling",
         ],
         "60": [
-          "RLM cancelling #ncel_new · finalizing · elapsed 1h02m",
-          "RLM cancelling #ncel_old · extractor · elapsed 1h02m",
-          "RLM running #22222222 · journal · elapsed 1h02m",
-          "+2 more · /rlm runs · /rlm cancel <id>",
+          "╭─ RLM runs · 5 active · +2 more───────────────────────────╮",
+          "│ ◐  #ncel_new  finalizing  1h02m                          │",
+          "│ ◐  #ncel_old  extractor  1h02m                           │",
+          "│ ●  #22222222  journal  1h02m                             │",
+          "╰──────────────────────────────────────────────────────────╯",
+          "  /rlm runs for details",
         ],
         "80": [
-          "RLM cancelling #ncel_new · finalizing · calls 2a/123t/4f · elapsed 1h02m",
-          "RLM cancelling #ncel_old · extractor · calls 2a/123t/4f · elapsed 1h02m",
-          "RLM running #22222222 · journal · calls 2a/123t/4f · elapsed 1h02m",
-          "+2 more · /rlm runs · /rlm cancel <id>",
+          "╭─ RLM runs · 5 active · +2 more───────────────────────────────────────────────╮",
+          "│ ◐  #ncel_new  finalizing  1h02m                                              │",
+          "│ ◐  #ncel_old  extractor  1h02m                                               │",
+          "│ ●  #22222222  journal  1h02m                                                 │",
+          "╰──────────────────────────────────────────────────────────────────────────────╯",
+          "  /rlm runs for details",
         ],
       }
     `);
@@ -126,11 +136,11 @@ describe("responsive run rendering", () => {
     } as unknown as RunDisplayItem];
     expect(renderRunDisplay(withTerminal, 59)).toHaveLength(1);
     const lines = renderRunDisplay(withTerminal, 120);
-    expect(lines).toHaveLength(4);
-    expect(lines[0]).toContain("ncel_new");
-    expect(lines[1]).toContain("ncel_old");
-    expect(lines[2]).toContain("22222222");
-    expect(lines[3]).toContain("+2 more");
+    expect(lines).toHaveLength(6);
+    expect(lines[1]).toContain("ncel_new");
+    expect(lines[2]).toContain("ncel_old");
+    expect(lines[3]).toContain("22222222");
+    expect(lines[0]).toContain("+2 more");
 
     const many: RunDisplayItem[] = Array.from({ length: 31 }, (_, index) => ({
       localId: `rlm_many_${String(index).padStart(2, "0")}`,
@@ -139,9 +149,9 @@ describe("responsive run rendering", () => {
     }));
     many.push({ localId: "rlm_priority_cancel", state: "cancelling", progress: progress(999) });
     const prioritized = renderRunDisplay(many, 120);
-    expect(prioritized[0]).toContain("y_cancel");
-    expect(prioritized[3]).toContain("+29 more");
-    expect(renderRunDisplay(many, 50)).toEqual(["RLM: 32 active, 1 cancelling · /rlm runs"]);
+    expect(prioritized[1]).toContain("y_cancel");
+    expect(prioritized[0]).toContain("+29 more");
+    expect(renderRunDisplay(many, 50)).toEqual(["◐ RLM · 32 active · 1 cancelling"]);
   });
 
   test("approval rows outrank run rows and expose only safe agent and count", () => {
@@ -159,10 +169,12 @@ describe("responsive run rendering", () => {
       approvalRun,
     ]);
     expect(projection[0]?.pendingApproval).toEqual(pendingApproval);
-    expect(renderRunDisplay(projection, 120)[0]).toContain("RLM approval");
-    expect(renderRunDisplay(projection, 120)[0]).toContain("agent reviewer");
-    expect(renderRunDisplay(projection, 120)[0]).toContain("2 pending");
-    expect(renderRunDisplay(projection, 50)).toEqual(["RLM approval: reviewer · 2 pending"]);
+    const rendered = renderRunDisplay(projection, 120);
+    expect(rendered[0]).toContain("2 approval");
+    expect(rendered[1]).toContain("Approval");
+    expect(rendered[1]).toContain("reviewer");
+    expect(rendered[1]).toContain("2 pending");
+    expect(renderRunDisplay(projection, 50)).toEqual(["! RLM · 5 active · 2 approval · 2 cancelling"]);
     expect(JSON.stringify(projection[0]?.pendingApproval)).not.toMatch(/session|control|objective|taskPreview/u);
   });
 
@@ -172,9 +184,11 @@ describe("responsive run rendering", () => {
     const output = renderCoordinatedRuns(runs, 180).join("\n");
     expect(JSON.stringify(projection)).not.toMatch(/hidden-session|authorization|private|objective/u);
     expect(output).not.toMatch(/hidden-session|private|guest|secret/u);
-    expect(output).toContain("calls 2a/123t/4f");
-    expect(output).toContain("frames 3a/12t");
-    expect(output).toContain("tokens 1.2m");
-    expect(output).toContain("elapsed 1h02m");
+    expect(output).toContain("calls 123");
+    expect(output).toContain("2 active");
+    expect(output).toContain("4 failed");
+    expect(output).toContain("frames 12");
+    expect(output).toContain("1.2m tok");
+    expect(output).toContain("1h02m");
   });
 });

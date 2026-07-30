@@ -175,7 +175,7 @@ const approvalFixture: ExtensionFactory = (pi) => {
     handler: async (_args, ctx) => {
       const controller = new AbortController();
       const approved = await ctx.ui.confirm(
-        "Approve exact delegated Pi agent request?",
+        "Approve delegated Pi agent?",
         agentApprovalConfirmationMessage(APPROVAL_REQUEST, APPROVAL_HASH),
         { signal: controller.signal, timeout: 60_000 },
       );

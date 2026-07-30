@@ -4,6 +4,13 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { CoordinatedRun, CoordinatedRunState } from "./run-coordinator.ts";
 import type { PendingAgentApprovalProjection } from "./agent-approval-coordinator.ts";
 import type { RunProgressSnapshot } from "../runtime/index.ts";
+import {
+  fitStyledLine,
+  plainVisualStyle,
+  renderPanel,
+  statusGlyph,
+  type VisualStyle,
+} from "./tui/visual-style.ts";
 
 export const DISPLAY_TEXT_MAX_BYTES = 4 * 1024;
 export const RUN_DISPLAY_MAX_ROWS = 3;
@@ -156,60 +163,94 @@ const elapsed = (elapsedMs: number | undefined): string => {
   return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 };
 
-const row = (run: RunDisplayItem, width: number): string => {
-  const approval = run.pendingApproval;
-  if (approval) {
-    const count = safeInteger(approval.count);
-    const segments = [
-      `RLM approval #${displayIdentitySuffix(run.localId, run.runId)}`,
-      `agent ${sanitizeDisplayText(approval.agent, 128) || "unknown"}`,
-      approval.context,
-      ...(approval.model ? [`model ${sanitizeDisplayText(approval.model, 256)}`] : []),
-      `task #${displayIdentitySuffix(approval.taskSha256)}`,
-      `${count} pending`,
-    ];
-    return truncateDisplayLine(segments.join(" · "), width);
-  }
+const approvalRow = (run: RunDisplayItem, style: VisualStyle): string => {
+  const approval = run.pendingApproval!;
+  const identity = `#${displayIdentitySuffix(run.localId, run.runId)}`;
+  const agent = sanitizeDisplayText(approval.agent, 128) || "unknown";
+  return [
+    statusGlyph("approval", style),
+    style.tone("accent", identity),
+    style.strong("Approval"),
+    style.tone("text", agent),
+    style.tone("muted", `${safeInteger(approval.count)} pending`),
+  ].join("  ");
+};
+
+const progressRow = (run: RunDisplayItem, width: number, style: VisualStyle): string => {
   const progress = run.progress;
+  const identity = `#${displayIdentitySuffix(run.localId, run.runId)}`;
+  const phase = sanitizeDisplayText(progress?.phase ?? "initializing", 64) || "initializing";
+  const calls = safeInteger(progress?.calls.total);
+  const callsActive = safeInteger(progress?.calls.active);
+  const callsFailed = safeInteger(progress?.calls.failed);
+  const frames = safeInteger(progress?.frames.total);
+  const framesActive = safeInteger(progress?.frames.active);
+  const marker = statusGlyph(run.state, style);
+  const elapsedText = style.tone("muted", elapsed(progress?.elapsedMs));
+  const callText = style.tone("muted", `calls ${calls}`);
+  const frameText = style.tone("muted", `frames ${frames}`);
   const segments = [
-    `RLM ${run.state} #${displayIdentitySuffix(run.localId, run.runId)}`,
-    sanitizeDisplayText(progress?.phase ?? "initializing", 64),
-    `calls ${safeInteger(progress?.calls.active)}a/${safeInteger(progress?.calls.total)}t/${safeInteger(progress?.calls.failed)}f`,
-    `frames ${safeInteger(progress?.frames.active)}a/${safeInteger(progress?.frames.total)}t`,
-    `tokens ${compactNumber(progress?.budgets.tokensUsed)}`,
-    `elapsed ${elapsed(progress?.elapsedMs)}`,
+    marker,
+    style.tone("accent", identity),
+    style.strong(phase),
+    callText,
+    ...(callsActive ? [style.tone("warning", `${callsActive} active`)] : []),
+    ...(callsFailed ? [style.tone("error", `${callsFailed} failed`)] : []),
+    frameText,
+    ...(framesActive ? [style.tone("warning", `${framesActive} active`)] : []),
+    style.tone("muted", `${compactNumber(progress?.budgets.tokensUsed)} tok`),
+    elapsedText,
   ];
-  const omissionOrder = [4, 3, 2, 5, 1];
-  const included = segments.map(() => true);
-  const compose = (): string => segments.filter((_, index) => included[index]).join(" · ");
-  for (const index of omissionOrder) {
-    if (visibleWidth(compose()) <= width) break;
-    included[index] = false;
-  }
-  return truncateDisplayLine(compose(), width);
+  const minimum = [marker, style.tone("accent", identity), style.strong(phase), elapsedText].join("  ");
+  if (visibleWidth(segments.join("  ")) <= width) return segments.join("  ");
+  if (width < 76) return minimum;
+  return [marker, style.tone("accent", identity), style.strong(phase), callText, frameText, elapsedText].join("  ");
 };
 
 const sorted = (runs: readonly RunDisplayItem[]): RunDisplayItem[] => [...runs].sort(priority);
 
-/** Render active runs with a deterministic responsive row and footer bound. */
-export const renderRunDisplay = (runs: readonly RunDisplayItem[], width: number): string[] => {
+/** Render active runs with one hierarchy, bounded rows, and a contextual footer. */
+export const renderRunDisplay = (
+  runs: readonly RunDisplayItem[],
+  width: number,
+  style: VisualStyle = plainVisualStyle,
+): string[] => {
   const limit = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
   const active = sorted(runs.filter((run) => run.state === "running" || run.state === "cancelling"))
     .slice(0, RUN_DISPLAY_MAX_INPUTS);
   if (active.length === 0 || limit === 0) return [];
   const cancelling = active.filter((run) => run.state === "cancelling").length;
-  const approval = active.find((run) => run.pendingApproval)?.pendingApproval;
   const approvalCount = active.reduce((total, run) => total + safeInteger(run.pendingApproval?.count), 0);
   if (limit < RUN_DISPLAY_COMPACT_WIDTH) {
-    const summary = approval
-      ? `RLM approval: ${sanitizeDisplayText(approval.agent, 128) || "unknown"} · ${approvalCount} pending`
-      : `RLM: ${active.length} active${cancelling ? `, ${cancelling} cancelling` : ""} · /rlm runs`;
-    return [truncateDisplayLine(summary, limit)];
+    const marker = approvalCount ? statusGlyph("approval", style)
+      : cancelling ? statusGlyph("cancelling", style) : statusGlyph("running", style);
+    const counts = [
+      `${active.length} active`,
+      ...(approvalCount ? [`${approvalCount} approval`] : []),
+      ...(cancelling ? [`${cancelling} cancelling`] : []),
+    ];
+    return [fitStyledLine(`${marker} ${style.strong("RLM")} · ${counts.join(" · ")}`, limit)];
   }
+
   const shown = active.slice(0, RUN_DISPLAY_MAX_ROWS);
   const hidden = active.length - shown.length;
-  const footer = `${hidden ? `+${hidden} more · ` : ""}/rlm runs · /rlm cancel <id>`;
-  return [...shown.map((run) => row(run, limit)), truncateDisplayLine(footer, limit)];
+  const titleParts = [
+    "RLM runs",
+    `${active.length} active`,
+    ...(approvalCount ? [`${approvalCount} approval`] : []),
+    ...(hidden ? [`+${hidden} more`] : []),
+  ];
+  const bodyWidth = Math.max(0, limit - 6);
+  const body = shown.map((run) => run.pendingApproval
+    ? approvalRow(run, style)
+    : progressRow(run, bodyWidth, style));
+  return renderPanel({
+    title: titleParts.join(" · "),
+    body,
+    width: limit,
+    style,
+    footer: "/rlm runs for details",
+  });
 };
 
 export const renderCoordinatedRuns = (runs: readonly CoordinatedRun[], width: number): string[] =>
