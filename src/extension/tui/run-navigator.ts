@@ -439,10 +439,7 @@ export const openRunNavigator = async (
             const refreshed = await loadRows(host, current);
             rows = refreshed;
             return refreshed;
-          }, signal, theme), {
-        overlay: true,
-        overlayOptions: { width: "90%", maxHeight: "80%", anchor: "center", margin: 1 },
-      });
+          }, signal, theme));
       if (!current()) return;
     } catch {
       if (current()) try { ctx.ui.notify(truncateDisplayLine("RLM navigator UI is unavailable.", 160), "error"); } catch {}

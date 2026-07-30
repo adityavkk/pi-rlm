@@ -473,10 +473,7 @@ export const openRunInspector = async (
   try {
     if (!current()) return;
     await ctx.ui.custom<void>((tui: TUI, theme, _keys, done) =>
-      new RunInspector(page, load, () => done(), () => tui.requestRender(), signal, theme), {
-      overlay: true,
-      overlayOptions: { width: "92%", maxHeight: "82%", anchor: "center", margin: 1 },
-    });
+      new RunInspector(page, load, () => done(), () => tui.requestRender(), signal, theme));
     if (!current()) return;
   } catch {
     if (current()) try { ctx.ui.notify(truncateDisplayLine("RLM inspector UI is unavailable.", 160), "error"); } catch {}
