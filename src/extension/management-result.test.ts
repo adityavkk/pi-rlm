@@ -28,7 +28,8 @@ const listing = {
 describe("management result projection", () => {
   test("list, inspect, and cleanup omit paths, owners, raw errors, and checkpoint content", () => {
     const listed = managementContent(projectRunsManagement(listing));
-    expect(listed).toContain(name);
+    expect(listed).toContain("run #bbbbbbbb");
+    expect(listed).not.toContain(name);
     expect(listed).not.toContain("/private");
     expect(listed).not.toContain("OWNER");
     expect(listed).not.toContain("RAW ERROR");

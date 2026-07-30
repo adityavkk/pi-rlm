@@ -52,15 +52,12 @@ export const agentApprovalConfirmationMessage = (
     "Delegated agent",
     `  Agent       ${field(request.agent, 128, "(invalid)")}`,
     `  Routing     ${field(request.model, 256)} · ${field(request.thinking, 256)} · ${field(request.context, 16, "(invalid)")}`,
-    "",
     "Exact request",
     `  Call        ${field(request.callId, 256, "(invalid)")}`,
     `  Request SHA ${field(requestSha256, 64, "(invalid)")}`,
     `  Task SHA    ${field(request.taskSha256, 64, "(invalid)")}`,
-    "",
     "Task preview",
     `  ${field(request.taskPreview, 1024, "(empty)")}`,
-    "",
     "Capability",
     "  This configured pi-subagents agent may receive tools that mutate files.",
     "",
@@ -96,7 +93,7 @@ export const createExtensionAgentDelegation = (pi: ExtensionAPI) => {
         try {
           if (!sessionGuard(sessionId, generation, signal, ctx)) return false;
           const approved = await waitForAbort(ctx.ui.confirm(
-            "Approve delegated Pi agent?",
+            "Approve exact delegated Pi agent request?",
             agentApprovalConfirmationMessage(request, requestSha256),
             { signal, timeout: approvalTimeoutMs },
           ), signal);

@@ -106,7 +106,7 @@ export const renderPanel = ({
     return surface ? style.surface(padded) : padded;
   });
   if (!footer) return framed;
-  return [...framed, fitStyledLine(`  ${style.tone("muted", footer)}`, limit)];
+  return [...framed, fitStyledLine(`  ${style.tone("muted", footer)}`, panelWidth)];
 };
 
 export type VisualStatus = "running" | "cancelling" | "approval" | "completed" | "failed" | "cancelled" | "inactive";

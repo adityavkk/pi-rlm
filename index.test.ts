@@ -604,15 +604,18 @@ describe("pi-rlm extension wiring", () => {
   test("custom result renderers replace raw command JSON with compact bounded summaries", () => {
     const h = harness();
     expect([...h.messageRenderers.keys()].sort()).toEqual(["pi-rlm-management-result", "pi-rlm-result"]);
+    const resultRunId = `run_${"a".repeat(64)}`;
     const result = h.messageRenderers.get("pi-rlm-result")!({
+      content: JSON.stringify({ status: "completed", runId: resultRunId, answer: "VISIBLE ANSWER" }),
       details: {
-        runId: `run_${"a".repeat(64)}`, status: "completed", mode: "answer", usage: null,
+        runId: resultRunId, status: "completed", mode: "answer", usage: null,
         warningCodes: [], truncation: { truncated: false, originalBytes: 1, omittedBytes: 0 },
-        answer: "RAW ANSWER",
+        answer: "RAW METADATA ANSWER",
       },
-    }, {}, {})!.render(100).join("\n");
+    }, { expanded: false }, {})!.render(100).join("\n");
     expect(result).toContain("RLM completed");
-    expect(result).not.toContain("RAW ANSWER");
+    expect(result).toContain("VISIBLE ANSWER");
+    expect(result).not.toContain("RAW METADATA ANSWER");
 
     const management = h.messageRenderers.get("pi-rlm-management-result")!({
       details: {

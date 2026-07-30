@@ -3,6 +3,7 @@ dist/
 *.log
 .DS_Store
 .tmp/
+.pi-subagents/
 coverage/
 *.tsbuildinfo
 .rlm-runs/

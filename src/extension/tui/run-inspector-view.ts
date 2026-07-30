@@ -83,7 +83,7 @@ export const renderRunInspector = (
   if (bodyWidth >= 90) {
     const railWidth = 16;
     const detailWidth = Math.max(1, bodyWidth - railWidth - 3);
-    const rows = Math.max(RUN_INSPECTOR_VIEWS.length + 1, visible.length);
+    const rows = Math.max(RUN_INSPECTOR_VIEWS.length, visible.length);
     for (let index = 0; index < rows; index += 1) {
       const view = RUN_INSPECTOR_VIEWS[index];
       const rail = view

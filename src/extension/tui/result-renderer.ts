@@ -1,7 +1,7 @@
 /** Bounded rlm_run call/result rendering without answer or error text. */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import { wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import type { BudgetUsage } from "../../core/index.ts";
 import type { RlmResultMetadata } from "../result.ts";
 import {
@@ -20,8 +20,12 @@ import {
 const SAFE_CODE = /^[A-Z][A-Z0-9_-]{0,63}$/;
 const SAFE_RUN_ID = /^run_[a-f0-9]{64}$/;
 const MAX_WARNING_CODES = 8;
+const MAX_RESULT_CONTENT_BYTES = 128 * 1024;
+const COLLAPSED_BODY_LINES = 6;
+const EXPANDED_BODY_LINES = 40;
 
 interface ResultDisplayModel {
+  readonly valid: boolean;
   readonly runId: string | null;
   readonly status: RlmResultMetadata["status"];
   readonly mode: RlmResultMetadata["mode"];
@@ -29,6 +33,11 @@ interface ResultDisplayModel {
   readonly warningCodes: readonly string[];
   readonly usage: BudgetUsage | null;
   readonly truncation: RlmResultMetadata["truncation"];
+}
+
+interface ResultDisplayBody {
+  readonly kind: "answer" | "error";
+  readonly lines: readonly string[];
 }
 
 const own = (value: unknown, key: string): unknown => {
@@ -79,6 +88,7 @@ const copyWarnings = (value: unknown): readonly string[] => {
 };
 
 const invalidModel = (): ResultDisplayModel => Object.freeze({
+  valid: false,
   runId: null,
   status: "failed",
   mode: null,
@@ -100,16 +110,23 @@ const projectMetadata = (value: unknown): ResultDisplayModel => {
       : rawStatus === "cancelled" ? "cancelled" : "failed";
     const truncation = own(value, "truncation");
     const rawErrorCode = own(value, "errorCode");
+    const validRunId = typeof runId === "string" && SAFE_RUN_ID.test(runId);
+    const bindableIdentity = validRunId && (
+      (rawStatus === "completed" && validMode)
+      || ((rawStatus === "failed" || rawStatus === "cancelled") && rawMode === null
+        && typeof rawErrorCode === "string" && SAFE_CODE.test(rawErrorCode))
+    );
     return Object.freeze({
-      runId: typeof runId === "string" && SAFE_RUN_ID.test(runId)
+      valid: bindableIdentity,
+      runId: validRunId
         ? sanitizeDisplayText(runId, 256)
         : null,
       status,
       mode: status === "completed" ? rawMode as ResultDisplayModel["mode"] : null,
-      ...(status === "failed" ? {
+      ...(status !== "completed" ? {
         errorCode: status !== rawStatus
           ? "RLM_RESULT_INVALID"
-          : code(rawErrorCode, "RLM_RUN_FAILED"),
+          : code(rawErrorCode, status === "cancelled" ? "CANCELLED" : "RLM_RUN_FAILED"),
       } : {}),
       warningCodes: copyWarnings(own(value, "warningCodes")),
       usage: copyUsage(own(value, "usage")),
@@ -120,6 +137,57 @@ const projectMetadata = (value: unknown): ResultDisplayModel => {
       }),
     });
   } catch { return invalidModel(); }
+};
+
+const bodyLines = (value: string): readonly string[] => Object.freeze(value
+  .split(/\r\n|\r|\n/u)
+  .slice(0, 256)
+  .map((line) => sanitizeDisplayText(line, 4 * 1024)));
+
+const answerText = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value;
+  if (value === undefined) return undefined;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const keys = Object.keys(value);
+    const answer = own(value, "answer");
+    if (keys.length === 1 && typeof answer === "string") return answer;
+  }
+  try { return JSON.stringify(value, null, 2); }
+  catch { return undefined; }
+};
+
+/** Bind bounded human-readable content to the same status and run identity as metadata. */
+const projectBody = (content: unknown, metadata: ResultDisplayModel): ResultDisplayBody | undefined => {
+  try {
+    if (!metadata.valid || metadata.runId === null) return undefined;
+    if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > MAX_RESULT_CONTENT_BYTES) return undefined;
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    if (own(parsed, "status") !== metadata.status || own(parsed, "runId") !== metadata.runId) return undefined;
+    if (metadata.status === "completed") {
+      const raw = own(parsed, "answer") ?? own(parsed, "answerPreview");
+      const text = answerText(raw);
+      return text === undefined ? undefined : Object.freeze({ kind: "answer", lines: bodyLines(text) });
+    }
+    const error = own(parsed, "error");
+    if (!error || typeof error !== "object" || Array.isArray(error)) return undefined;
+    const rawCode = own(error, "code");
+    const message = own(error, "message");
+    if (typeof message !== "string" || typeof rawCode !== "string"
+      || code(rawCode, "RLM_RUN_FAILED") !== code(metadata.errorCode, "RLM_RUN_FAILED")) return undefined;
+    return Object.freeze({ kind: "error", lines: bodyLines(message) });
+  } catch { return undefined; }
+};
+
+const textContent = (value: unknown): string | undefined => {
+  try {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 8) return undefined;
+    const first = own(value, "0");
+    if (!first || typeof first !== "object" || Array.isArray(first)
+      || own(first, "type") !== "text") return undefined;
+    const text = own(first, "text");
+    return typeof text === "string" ? text : undefined;
+  } catch { return undefined; }
 };
 
 const statusText = (metadata: ResultDisplayModel, style: VisualStyle): string => {
@@ -158,11 +226,24 @@ const renderModel = (
   safe: ResultDisplayModel,
   width: number,
   style: VisualStyle = plainVisualStyle,
+  body?: ResultDisplayBody,
+  expanded = false,
 ): string[] => {
   const lines = [statusText(safe, style)];
   if (safe.usage) lines.push(`  ${style.tone("muted", usageText(safe.usage))}`);
+  if (body) {
+    lines.push(`  ${style.strong(body.kind === "answer" ? "Answer" : "Error")}`);
+    const bodyWidth = Math.max(1, Math.floor(width) - 4);
+    const wrapped = body.lines.flatMap((line) => {
+      const rendered = wrapTextWithAnsi(style.tone("text", line), bodyWidth);
+      return rendered.length > 0 ? rendered : [""];
+    });
+    const lineLimit = expanded ? EXPANDED_BODY_LINES : COLLAPSED_BODY_LINES;
+    wrapped.slice(0, lineLimit).forEach((line) => lines.push(`    ${line}`));
+    if (wrapped.length > lineLimit) lines.push(`    ${style.tone("muted", "… expand to view more")}`);
+  }
   if (safe.warningCodes.length > 0)
-    lines.push(`  ${statusGlyph("approval", style)} ${style.tone("warning", `${safe.warningCodes.length} warnings`)}  ${style.tone("muted", safe.warningCodes.join(", "))}`);
+    lines.push(`  ${statusGlyph("approval", style)} ${style.tone("warning", `${safe.warningCodes.length} warning${safe.warningCodes.length === 1 ? "" : "s"}`)}  ${style.tone("muted", safe.warningCodes.join(", "))}`);
   if (safe.truncation.truncated)
     lines.push(`  ${statusGlyph("approval", style)} ${style.tone("warning", "Result truncated")}  ${style.tone("muted", `${compact(safe.truncation.originalBytes)} bytes · ${compact(safe.truncation.omittedBytes)} omitted`)}`);
   return lines.map((line) => fitStyledLine(line, width)).filter((line) => line.length > 0);
@@ -185,11 +266,17 @@ export class RlmRunCallComponent implements Component {
 export class RlmRunResultComponent implements Component {
   private readonly metadata: ResultDisplayModel;
   private readonly style: VisualStyle;
-  constructor(metadata: unknown, theme?: Theme) {
+  private readonly body?: ResultDisplayBody;
+  private readonly expanded: boolean;
+  constructor(metadata: unknown, theme?: Theme, content?: unknown, expanded = false) {
     this.metadata = projectMetadata(metadata);
     this.style = visualStyleForTheme(theme);
+    this.body = projectBody(content, this.metadata);
+    this.expanded = expanded;
   }
-  render(width: number): string[] { return renderModel(this.metadata, width, this.style); }
+  render(width: number): string[] {
+    return renderModel(this.metadata, width, this.style, this.body, this.expanded);
+  }
   invalidate(): void {}
 }
 
@@ -197,8 +284,28 @@ export const renderRlmRunCallComponent = (theme?: Theme): Component => new RlmRu
 export const renderRlmRunResultComponent = (metadata: unknown, theme?: Theme): Component =>
   new RlmRunResultComponent(metadata, theme);
 
-/** No-throw Pi adapter. It never accesses result.content and never permits raw fallback. */
-export const renderRlmToolResultComponent = (result: unknown, theme?: Theme): Component => {
-  try { return new RlmRunResultComponent(own(result, "details"), theme); }
+/** Custom-message adapter. Human-readable bounded content is identity-bound to details. */
+export const renderRlmMessageResultComponent = (
+  message: unknown,
+  expanded: boolean,
+  theme?: Theme,
+): Component => {
+  try { return new RlmRunResultComponent(own(message, "details"), theme, own(message, "content"), expanded); }
   catch { return new RlmRunResultComponent(undefined, theme); }
+};
+
+/** No-throw Pi adapter. It projects the first bounded text result and never permits raw fallback. */
+export const renderRlmToolResultComponent = (
+  result: unknown,
+  theme?: Theme,
+  expanded = false,
+): Component => {
+  try {
+    return new RlmRunResultComponent(
+      own(result, "details"),
+      theme,
+      textContent(own(result, "content")),
+      expanded,
+    );
+  } catch { return new RlmRunResultComponent(undefined, theme); }
 };

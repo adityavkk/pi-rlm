@@ -112,8 +112,8 @@ import {
 } from "./src/extension/management-result.ts";
 import { truncateDisplayLine } from "./src/extension/run-display.ts";
 import {
+  renderRlmMessageResultComponent,
   renderRlmRunCallComponent,
-  renderRlmRunResultComponent,
   renderRlmToolResultComponent,
 } from "./src/extension/tui/result-renderer.ts";
 import { renderRlmManagementResultComponent } from "./src/extension/tui/management-renderer.ts";
@@ -487,8 +487,8 @@ const RlmRunParams = Type.Object({
 });
 
 export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) => (pi: ExtensionAPI): void => {
-  pi.registerMessageRenderer?.<RlmResultMetadata>("pi-rlm-result", (message, _options, theme) =>
-    renderRlmRunResultComponent(message.details, theme));
+  pi.registerMessageRenderer?.<RlmResultMetadata>("pi-rlm-result", (message, options, theme) =>
+    renderRlmMessageResultComponent(message, options.expanded, theme));
   pi.registerMessageRenderer?.<RlmManagementMetadata>("pi-rlm-management-result", (message, _options, theme) =>
     renderRlmManagementResultComponent(message.details, theme));
   const extensionAgentDelegation = createExtensionAgentDelegation(pi);
@@ -1524,7 +1524,7 @@ export const createRlmExtension = (dependencies: RlmExtensionDependencies = {}) 
     ],
     parameters: RlmRunParams,
     renderCall: (_args, theme) => renderRlmRunCallComponent(theme),
-    renderResult: (result, _options, theme) => renderRlmToolResultComponent(result, theme),
+    renderResult: (result, options, theme) => renderRlmToolResultComponent(result, theme, options.expanded),
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<RlmResultMetadata>> {
       const toolSignal = signal ?? new AbortController().signal;
       const callKey = `${ctx.sessionManager.getSessionId()}:${toolCallId}`;
